@@ -1,0 +1,1884 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fucloudflare Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23f6821f'/%3E%3Cpath d='M9 21h14a3.5 3.5 0 0 0 .5-6.95A5.5 5.5 0 0 0 13 12.5a4 4 0 0 0-3.9 3.1A3 3 0 0 0 9 21z' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root{
+  color-scheme:light;
+  --color-kumo-canvas:#fbfbfb;
+  --color-kumo-elevated:#f7f7f8;
+  --color-kumo-recessed:#f4f4f5;
+  --color-kumo-base:#ffffff;
+  --color-kumo-tint:#f4f4f5;
+  --color-kumo-overlay:#fafafa;
+  --color-kumo-control:#ffffff;
+  --color-kumo-interact:#e4e4e7;
+  --color-kumo-fill:#e4e4e7;
+  --color-kumo-fill-hover:#f4f4f5;
+  --color-kumo-line:rgba(24,24,27,.1);
+  --color-kumo-hairline:#e4e4e7;
+  --color-kumo-brand:#056dff;
+  --color-kumo-brand-hover:#005aeb;
+  --text-color-kumo-default:#18181b;
+  --text-color-kumo-inverse:#fafafa;
+  --text-color-kumo-strong:#09090b;
+  --text-color-kumo-subtle:#52525b;
+  --text-color-kumo-placeholder:#a1a1aa;
+  --text-color-kumo-brand:#f6821f;
+  --text-color-kumo-link:#056dff;
+  --text-color-kumo-success:#065f46;
+  --text-color-kumo-danger:#b91c1c;
+  --text-color-kumo-warning:#b45309;
+  --color-kumo-danger:#d91b24;
+  --color-kumo-danger-hover:#b91c1c;
+  --color-kumo-danger-tint:rgba(217,27,36,.08);
+  --color-kumo-success:#10b981;
+  --color-kumo-success-tint:rgba(16,185,129,.12);
+  --color-kumo-warning:#f59e0b;
+  --color-kumo-warning-tint:rgba(245,158,11,.12);
+  --color-kumo-info:#056dff;
+  --color-kumo-info-tint:rgba(5,109,255,.08);
+  --shadow-card:0 1px 2px rgba(0,0,0,.05);
+  --shadow-lg:0 20px 50px -12px rgba(0,0,0,.22);
+  --scrim:rgba(9,9,11,.45);
+  --s1:#10b981;--s2:#056dff;--s3:#f6821f;--s4:#d91b24;
+  --sidebar-nav-width:260px;
+  --header-height:58px;
+  --r-sm:6px;--r-md:8px;--r-lg:12px;--r-xl:16px;--r-pill:999px;
+  --sans:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Consolas,"Liberation Mono",monospace;
+}
+:root[data-mode="dark"]{
+  color-scheme:dark;
+  --color-kumo-canvas:#0a0a0b;
+  --color-kumo-elevated:#111113;
+  --color-kumo-recessed:#141416;
+  --color-kumo-base:#18181b;
+  --color-kumo-tint:#27272a;
+  --color-kumo-overlay:#27272a;
+  --color-kumo-control:#1f1f23;
+  --color-kumo-interact:#3f3f46;
+  --color-kumo-fill:#27272a;
+  --color-kumo-fill-hover:#3f3f46;
+  --color-kumo-line:rgba(255,255,255,.12);
+  --color-kumo-hairline:#27272a;
+  --color-kumo-brand:#056dff;
+  --color-kumo-brand-hover:#005aeb;
+  --text-color-kumo-default:#f4f4f5;
+  --text-color-kumo-inverse:#18181b;
+  --text-color-kumo-strong:#ffffff;
+  --text-color-kumo-subtle:#a1a1aa;
+  --text-color-kumo-placeholder:#71717a;
+  --text-color-kumo-brand:#f6821f;
+  --text-color-kumo-link:#60a5fa;
+  --text-color-kumo-success:#6ee7b7;
+  --text-color-kumo-danger:#f87171;
+  --text-color-kumo-warning:#fbbf24;
+  --color-kumo-danger:#d91b24;
+  --color-kumo-danger-hover:#ef4444;
+  --color-kumo-danger-tint:rgba(217,27,36,.18);
+  --color-kumo-success:#34d399;
+  --color-kumo-success-tint:rgba(52,211,153,.15);
+  --color-kumo-warning:#fbbf24;
+  --color-kumo-warning-tint:rgba(251,191,36,.15);
+  --color-kumo-info:#60a5fa;
+  --color-kumo-info-tint:rgba(59,130,246,.16);
+  --shadow-card:0 1px 2px rgba(0,0,0,.35);
+  --shadow-lg:0 24px 60px -12px rgba(0,0,0,.7);
+  --scrim:rgba(0,0,0,.65);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scrollbar-color:var(--color-kumo-interact) transparent;overflow-x:hidden}
+body{margin:0;min-height:100dvh;font:14px/1.5 var(--sans);background:var(--color-kumo-canvas);color:var(--text-color-kumo-default);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--text-color-kumo-link);text-decoration:none;cursor:pointer;font-weight:500}
+a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--color-kumo-brand);outline-offset:2px}
+h1,h2,h3,h4,p{margin:0}
+.mono,code{font-family:var(--mono);font-size:12.5px}
+code{display:inline-block;max-width:100%;vertical-align:middle;background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-hairline);padding:1px 6px;border-radius:var(--r-sm);overflow-wrap:anywhere;color:var(--text-color-kumo-strong)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.hint{color:var(--text-color-kumo-subtle);font-size:12.5px;font-weight:400}
+.pad{padding:0 20px 16px}
+.kv.pad{padding:14px 20px}
+
+/* progress bar */
+.bar{position:fixed;inset:0 0 auto 0;height:2px;z-index:100;overflow:hidden;opacity:0;transition:opacity .15s;pointer-events:none}
+.bar::after{content:"";display:block;height:100%;width:35%;background:var(--text-color-kumo-brand);animation:slide 1s ease-in-out infinite}
+body.busy .bar{opacity:1}
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(300%)}}
+
+/* Kumo App-Dash Shell: 260px/57px sidebar + 58px topbar + 1000px track */
+.shell{display:grid;grid-template-columns:var(--sidebar-nav-width) minmax(0,1fr);min-height:100dvh;transition:grid-template-columns .18s ease}
+.shell[data-collapsed="true"]{--sidebar-nav-width:57px}
+[data-sidebar="sidebar"]{position:sticky;top:0;height:100dvh;width:var(--sidebar-nav-width);display:flex;flex-direction:column;background:var(--color-kumo-elevated);border-right:1px solid var(--color-kumo-hairline);overflow:hidden;transition:width .18s ease;z-index:20}
+.sb-head{height:var(--header-height);display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 12px;border-bottom:1px solid var(--color-kumo-hairline);flex:none}
+.brand{display:flex;align-items:center;gap:10px;color:var(--text-color-kumo-strong);font-weight:700;font-size:15px;letter-spacing:-.02em;min-width:0;text-decoration:none}
+.brand:hover{text-decoration:none;color:var(--text-color-kumo-strong)}
+.mark{flex:none;display:grid;place-items:center;width:28px;height:28px;border-radius:var(--r-md);background:var(--text-color-kumo-brand);color:#fff}
+.sb-toggle{flex:none;display:grid;place-items:center;width:28px;height:28px;padding:0;border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-color-kumo-subtle);cursor:pointer}
+.sb-toggle:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong)}
+[data-sidebar="sidebar"] nav{flex:1;min-height:0;padding:10px 8px;overflow-y:auto;scrollbar-width:thin}
+.sb-lbl{padding:8px 10px 4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-color-kumo-subtle);white-space:nowrap}
+.sb-back{display:flex;align-items:center;gap:10px;padding:7px 10px;margin-bottom:6px;border-radius:var(--r-md);color:var(--text-color-kumo-subtle);font-size:13px;font-weight:500;text-decoration:none}
+.sb-back:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong);text-decoration:none}
+.sb-zn{margin:4px 2px 10px;padding:10px 12px;background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-md)}
+.sb-zn b{display:block;font-size:13.5px;font-weight:600;color:var(--text-color-kumo-strong);word-break:break-all}
+.sb-zn span{font-size:12px;color:var(--text-color-kumo-subtle)}
+.nv{display:flex;align-items:center;gap:10px;padding:8px 10px;margin:2px 0;border-radius:var(--r-md);color:var(--text-color-kumo-subtle);font-size:13.5px;font-weight:500;white-space:nowrap;text-decoration:none;transition:background .12s,color .12s}
+.nv svg{flex:none}
+.nv:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong);text-decoration:none}
+.nv.on,.nv.on:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong);font-weight:600;box-shadow:inset 3px 0 0 var(--text-color-kumo-brand)}
+[data-sidebar="sidebar"] hr{border:0;border-top:1px solid var(--color-kumo-hairline);margin:8px 10px}
+.sf{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-top:1px solid var(--color-kumo-hairline);background:var(--color-kumo-recessed);font-size:12px;color:var(--text-color-kumo-subtle)}
+.sf b{display:block;color:var(--text-color-kumo-strong);font-size:12.5px}
+.shell[data-collapsed="true"] .brand-txt,
+.shell[data-collapsed="true"] .sb-lbl,
+.shell[data-collapsed="true"] .nv-lbl,
+.shell[data-collapsed="true"] .sb-zn,
+.shell[data-collapsed="true"] .sf-meta,
+.shell[data-collapsed="true"] .sf .tag{display:none}
+.shell[data-collapsed="true"] .sb-head{justify-content:center;padding:0 6px}
+.shell[data-collapsed="true"] .brand{display:none}
+.shell[data-collapsed="true"] .nv,.shell[data-collapsed="true"] .sb-back{justify-content:center;padding:8px}
+.shell[data-collapsed="true"] .sf{justify-content:center;padding:10px 6px}
+
+.col{min-width:0;max-width:100%;display:flex;flex-direction:column}
+header.top{position:sticky;top:0;z-index:15;height:var(--header-height);min-height:var(--header-height);display:flex;align-items:center;gap:10px;padding:0 20px;background:var(--color-kumo-base);border-bottom:1px solid var(--color-kumo-hairline)}
+.mob-menu{display:none;place-items:center;width:32px;height:32px;padding:0;border:1px solid var(--color-kumo-line);border-radius:var(--r-md);background:var(--color-kumo-control);color:var(--text-color-kumo-default);cursor:pointer}
+.zsel{display:flex;align-items:center;gap:6px;min-width:0;color:var(--text-color-kumo-subtle)}
+.zsel select{width:auto;max-width:260px;height:32px;padding:0 10px;border:1px solid var(--color-kumo-line);border-radius:var(--r-md);background:var(--color-kumo-control);color:var(--text-color-kumo-strong);font-size:13px;font-weight:500}
+.top .sp{flex:1}
+.top .meta{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.who{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:var(--r-md);color:var(--text-color-kumo-default);font-size:13px;font-weight:500}
+.who:hover{background:var(--color-kumo-tint);text-decoration:none}
+
+/* Centered 1000px track */
+main{flex:1;min-width:0;max-width:100%}
+.wrap{max-width:1000px;width:100%;margin:0 auto;padding:28px 20px 72px}
+.ph{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+.ph h1{font-size:24px;font-weight:700;letter-spacing:-.025em;line-height:1.25;color:var(--text-color-kumo-strong);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.ph p{color:var(--text-color-kumo-subtle);margin-top:6px;max-width:72ch;font-size:13.5px}
+.ph .acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* Kumo LayerCard & surfaces */
+.card,[data-kumo-component="Card"]{background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-xl);box-shadow:var(--shadow-card);margin-bottom:18px;overflow:hidden}
+.ch{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--color-kumo-hairline);flex-wrap:wrap}
+.ch h3{font-size:15px;font-weight:600;color:var(--text-color-kumo-strong);margin-right:auto;display:flex;align-items:center;gap:8px}
+.ch input[type="search"]{width:220px;height:32px;font-size:13px}
+.ch a{font-size:13px}
+.cb{padding:18px 20px}
+.cnt{font-size:11.5px;font-weight:600;color:var(--text-color-kumo-subtle);background:var(--color-kumo-tint);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-pill);padding:1px 8px;font-variant-numeric:tabular-nums}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:18px}
+.grid2 .card{margin-bottom:0}
+.note{background:var(--color-kumo-info-tint);border:1px solid color-mix(in srgb,var(--color-kumo-info) 28%,transparent);border-radius:var(--r-lg);padding:12px 16px;margin-bottom:18px;font-size:13.5px;line-height:1.65;color:var(--text-color-kumo-default)}
+.note.warn{background:var(--color-kumo-warning-tint);border-color:color-mix(in srgb,var(--color-kumo-warning) 35%,transparent)}
+.note.bad{background:var(--color-kumo-danger-tint);border-color:color-mix(in srgb,var(--color-kumo-danger) 35%,transparent)}
+.note .hint{display:block;margin-top:4px}
+
+/* Hero status banner (compact Kumo style) */
+.hero{position:relative;display:flex;align-items:center;justify-content:space-between;gap:20px;padding:22px 24px;margin-bottom:18px;background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-left:4px solid var(--text-color-kumo-brand);border-radius:var(--r-xl);box-shadow:var(--shadow-card);flex-wrap:wrap}
+.hero.bad{border-left-color:var(--color-kumo-danger)}
+.eyebrow{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:var(--r-pill);background:color-mix(in srgb,var(--text-color-kumo-brand) 14%,transparent);color:var(--text-color-kumo-brand);font-size:11.5px;font-weight:600}
+.eyebrow.bad{background:var(--color-kumo-danger-tint);color:var(--text-color-kumo-danger)}
+.hero h2{font-size:20px;font-weight:700;letter-spacing:-.02em;color:var(--text-color-kumo-strong);margin:8px 0 4px}
+.hero p{font-size:13.5px;color:var(--text-color-kumo-subtle)}
+.hns{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.hn{display:inline-flex;align-items:center;gap:7px;padding:4px 11px;border-radius:var(--r-pill);background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-hairline);color:var(--text-color-kumo-default);font-weight:500;font-size:12.5px;text-decoration:none}
+.hn:hover{background:var(--color-kumo-tint);text-decoration:none}
+.hn::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--text-color-kumo-placeholder)}
+.hn.ok::before{background:var(--color-kumo-success)}
+.hn.bad::before{background:var(--color-kumo-danger)}
+
+/* KPI tiles */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:18px}
+.tile{display:flex;flex-direction:column;gap:4px;padding:16px 18px;background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-xl);box-shadow:var(--shadow-card);color:inherit;text-decoration:none}
+a.tile:hover{border-color:var(--color-kumo-brand);text-decoration:none}
+.tile-hd{display:flex;align-items:center;justify-content:space-between;color:var(--text-color-kumo-subtle);font-size:12.5px;font-weight:500}
+.tile .ti{color:var(--text-color-kumo-brand)}
+.tile b{font-size:22px;font-weight:700;color:var(--text-color-kumo-strong);letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.tile em{font-style:normal;font-size:12px;color:var(--text-color-kumo-subtle)}
+
+/* Settings rows */
+.set{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 24px;align-items:center;padding:16px 20px;border-top:1px solid var(--color-kumo-hairline)}
+.set:first-child{border-top:0}
+.set h4{font-size:14px;font-weight:600;color:var(--text-color-kumo-strong);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.set p{color:var(--text-color-kumo-subtle);font-size:13px;margin-top:2px;max-width:64ch}
+.set .ctl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.set .ctl select{min-width:220px}
+.set.stack{grid-template-columns:1fr}
+.set.stack .ctl{justify-content:flex-start}
+.card.danger{border-color:color-mix(in srgb,var(--color-kumo-danger) 45%,var(--color-kumo-hairline))}
+
+/* Switches & Checkboxes */
+.sw{position:relative;display:inline-flex;flex:none;cursor:pointer}
+.sw input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+.sw i{width:42px;height:24px;border-radius:var(--r-pill);background:var(--color-kumo-interact);transition:background .15s;position:relative;display:block}
+.sw i::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .16s ease}
+.sw input:checked+i{background:var(--color-kumo-brand)}
+.sw input:checked+i::after{transform:translateX(18px)}
+.chks{display:flex;flex-wrap:wrap;gap:8px}
+.chks label{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:1px solid var(--color-kumo-line);border-radius:var(--r-md);cursor:pointer;font-size:13px;font-weight:500;background:var(--color-kumo-control)}
+.chks label:hover{background:var(--color-kumo-tint)}
+.chks label:has(input:checked){border-color:var(--color-kumo-brand);background:var(--color-kumo-info-tint)}
+.chks input{width:auto;margin:0;accent-color:var(--color-kumo-brand)}
+
+/* Tables */
+.tw{position:relative;overflow-x:auto;max-width:100%}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:11px 14px;vertical-align:middle;border-bottom:1px solid var(--color-kumo-hairline)}
+th:first-child,td:first-child{padding-left:20px}
+th:last-child,td:last-child{padding-right:20px}
+th{font-size:12px;font-weight:600;color:var(--text-color-kumo-subtle);background:var(--color-kumo-elevated);white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--color-kumo-tint)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.act,th.act{text-align:right;white-space:nowrap}
+.sub{display:block;font-size:12px;color:var(--text-color-kumo-subtle);margin-top:2px}
+.expr{font-size:12px;max-width:340px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.empty{padding:36px 20px;text-align:center;color:var(--text-color-kumo-subtle);font-size:13.5px}
+.empty b{display:block;color:var(--text-color-kumo-strong);font-size:14.5px;margin-bottom:4px}
+
+/* Badges & Tags */
+.st,.tag{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:var(--r-pill);font-size:12px;font-weight:500;background:var(--color-kumo-tint);color:var(--text-color-kumo-subtle);white-space:nowrap}
+.st::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.st.ok,.tag.ok{background:var(--color-kumo-success-tint);color:var(--text-color-kumo-success)}
+.st.bad,.tag.bad{background:var(--color-kumo-danger-tint);color:var(--text-color-kumo-danger)}
+.st.warn,.tag.warn{background:var(--color-kumo-warning-tint);color:var(--text-color-kumo-warning)}
+.st.px,.tag.pri{background:color-mix(in srgb,var(--text-color-kumo-brand) 14%,transparent);color:var(--text-color-kumo-brand)}
+.tag.blue{background:var(--color-kumo-info-tint);color:var(--text-color-kumo-link)}
+.chips{display:inline-flex;flex-wrap:wrap;gap:4px}
+
+/* Buttons */
+button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:34px;padding:0 14px;border-radius:var(--r-md);border:1px solid var(--color-kumo-line);background:var(--color-kumo-control);color:var(--text-color-kumo-default);font:500 13.5px/1 var(--sans);cursor:pointer;white-space:nowrap;text-decoration:none;transition:background .12s,border-color .12s}
+button:hover,.btn:hover{background:var(--color-kumo-fill-hover);text-decoration:none}
+button:disabled{opacity:.55;cursor:not-allowed}
+button.pri,.btn.pri{background:var(--color-kumo-brand);border-color:var(--color-kumo-brand);color:#fff}
+button.pri:hover,.btn.pri:hover{background:var(--color-kumo-brand-hover);border-color:var(--color-kumo-brand-hover)}
+button.danger{background:var(--color-kumo-danger);border-color:var(--color-kumo-danger);color:#fff}
+button.danger:hover{background:var(--color-kumo-danger-hover)}
+button.outbad{background:transparent;border-color:var(--color-kumo-danger);color:var(--text-color-kumo-danger)}
+button.outbad:hover{background:var(--color-kumo-danger-tint)}
+button.ghost{border-color:transparent;background:transparent;color:var(--text-color-kumo-subtle);padding:0 10px}
+button.ghost:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong)}
+button.sm{height:28px;padding:0 10px;font-size:12.5px}
+button.lk{height:auto;padding:3px 7px;border:0;background:transparent;color:var(--text-color-kumo-link);font-size:13px}
+button.lk:hover{background:var(--color-kumo-info-tint);text-decoration:underline}
+button.lk.bad{color:var(--text-color-kumo-danger)}
+button.lk.bad:hover{background:var(--color-kumo-danger-tint)}
+button.icon{width:30px;height:30px;padding:0;border:0;background:transparent;color:var(--text-color-kumo-subtle)}
+button.icon:hover{background:var(--color-kumo-tint);color:var(--text-color-kumo-strong)}
+
+/* Form Controls */
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),select,textarea{width:100%;height:36px;padding:0 11px;border:1px solid var(--color-kumo-line);border-radius:var(--r-md);background:var(--color-kumo-control);color:var(--text-color-kumo-default);font:13.5px/1.4 var(--sans)}
+textarea{height:auto;min-height:92px;padding:9px 11px;font-family:var(--mono);font-size:12.5px;resize:vertical}
+textarea.tall{min-height:300px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--color-kumo-brand);box-shadow:0 0 0 2px var(--color-kumo-info-tint)}
+input[readonly]{background:var(--color-kumo-recessed);color:var(--text-color-kumo-subtle)}
+.f{display:flex;flex-direction:column;gap:5px;margin-bottom:14px}
+.f>span,.fl{font-size:13px;font-weight:600;color:var(--text-color-kumo-strong)}
+.f small{font-size:12px;color:var(--text-color-kumo-subtle)}
+.chk{display:flex;align-items:center;gap:10px;cursor:pointer;font-weight:500}
+.ferr{color:var(--text-color-kumo-danger);font-size:13px;min-height:18px;margin-bottom:6px}
+
+/* Key-value lists & Segmented bars */
+.kv{display:grid;grid-template-columns:130px minmax(0,1fr);gap:8px 16px;font-size:13.5px;align-items:baseline}
+.kv dt{color:var(--text-color-kumo-subtle);font-weight:500}
+.kv dd{margin:0;color:var(--text-color-kumo-default);min-width:0;word-break:break-word}
+.seg{display:flex;height:10px;border-radius:var(--r-pill);overflow:hidden;background:var(--color-kumo-recessed);gap:2px}
+.seg i{display:block;min-width:4px}
+.legend{list-style:none;margin:12px 0 0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
+.legend li{display:flex;align-items:center;gap:7px;font-size:12.5px}
+.legend i{width:8px;height:8px;border-radius:2px;flex:none}
+.legend span{color:var(--text-color-kumo-subtle);margin-right:auto}
+.legend b{color:var(--text-color-kumo-strong);font-variant-numeric:tabular-nums}
+.legend em{font-style:normal;color:var(--text-color-kumo-subtle);font-size:11.5px}
+.meter-bar{height:6px;border-radius:var(--r-pill);background:var(--color-kumo-recessed);overflow:hidden;margin-top:4px;max-width:180px}
+.meter-bar i{display:block;height:100%;background:var(--color-kumo-brand)}
+.meter-bar.warn i{background:var(--color-kumo-warning)}
+.meter-bar.bad i{background:var(--color-kumo-danger)}
+
+/* Sub-tabs (for Workers / KV / D1 / Cron) */
+.tabs{display:flex;align-items:center;gap:4px;border-bottom:1px solid var(--color-kumo-hairline);margin-bottom:18px;overflow-x:auto}
+.tab{display:inline-flex;align-items:center;gap:6px;padding:10px 14px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--text-color-kumo-subtle);font-size:13.5px;font-weight:500;height:auto}
+.tab:hover{background:transparent;color:var(--text-color-kumo-strong)}
+.tab.on{color:var(--color-kumo-brand);border-bottom-color:var(--color-kumo-brand);font-weight:600}
+
+/* Fleet nodes & drag-and-drop board */
+.nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;margin-bottom:18px}
+.node{padding:16px 18px}
+.node header{display:flex;align-items:center;gap:10px;padding-bottom:12px;margin-bottom:12px;border-bottom:1px solid var(--color-kumo-hairline)}
+.node header h3{font-size:15px;font-weight:600;margin-right:auto}
+.node .ni{color:var(--text-color-kumo-brand);display:grid;place-items:center}
+.node .lst{margin:0;padding-left:16px;font-family:var(--mono);font-size:12px}
+.node .acts2{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px;padding-top:10px;border-top:1px solid var(--color-kumo-hairline)}
+.board{padding:16px 20px}
+.palette{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.npill{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border-radius:var(--r-pill);background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-line);font-size:12.5px;font-weight:600;cursor:grab;user-select:none}
+.npill .dot{width:7px;height:7px;border-radius:50%;background:var(--color-kumo-success)}
+.npill.warn .dot{background:var(--color-kumo-warning)}
+.npill.bad .dot{background:var(--color-kumo-danger)}
+.npill.off .dot{background:var(--text-color-kumo-placeholder)}
+.npill .meta{font-weight:400;color:var(--text-color-kumo-subtle);font-size:11.5px}
+.npill .x{border:0;background:transparent;color:var(--text-color-kumo-subtle);height:auto;padding:0 2px;font-size:13px;cursor:pointer}
+.npill .x:hover{color:var(--text-color-kumo-danger)}
+.lanes{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+.lane{padding:10px 12px;border-radius:var(--r-lg);background:var(--color-kumo-elevated);border:1px dashed var(--color-kumo-line)}
+.lane.over,.flow-drop.over{border-color:var(--color-kumo-brand);background:var(--color-kumo-info-tint)}
+.lane-hd{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;font-weight:600;margin-bottom:8px}
+.lane-hd .fb{font-weight:400;font-size:11.5px;color:var(--text-color-kumo-subtle)}
+.lane-body{display:flex;flex-wrap:wrap;gap:6px;min-height:28px;align-items:center}
+.flow{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;padding:2px 4px;border-radius:var(--r-md)}
+.arr{color:var(--text-color-kumo-subtle);font-size:12px}
+.fchip .x{border:0;background:transparent;height:auto;padding:0 0 0 4px;color:inherit;font-size:13px}
+
+/* Modals, Drawers & Toasts */
+.ov{position:fixed;inset:0;z-index:60;background:var(--scrim);display:flex;justify-content:flex-end;backdrop-filter:blur(2px)}
+.ov.center{justify-content:center;align-items:center;padding:16px}
+.drawer{width:min(480px,100%);height:100%;background:var(--color-kumo-base);border-left:1px solid var(--color-kumo-hairline);box-shadow:var(--shadow-lg);display:flex;flex-direction:column}
+.drawer.wide{width:min(740px,100%)}
+.drawer form{display:flex;flex-direction:column;height:100%}
+.drawer header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--color-kumo-hairline)}
+.drawer header h2{font-size:16px;font-weight:600;color:var(--text-color-kumo-strong)}
+.dbody{flex:1;overflow-y:auto;padding:18px 20px}
+.drawer footer{padding:14px 20px;border-top:1px solid var(--color-kumo-hairline);display:flex;align-items:center;gap:8px;justify-content:flex-end;background:var(--color-kumo-elevated)}
+.drawer footer .ferr{margin:0 auto 0 0}
+.dialog{width:min(440px,100%);background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-xl);box-shadow:var(--shadow-lg);padding:22px}
+.dialog.wide{width:min(560px,100%)}
+.dialog h2{font-size:17px;font-weight:600;color:var(--text-color-kumo-strong);margin-bottom:8px}
+.dialog p{font-size:13.5px;color:var(--text-color-kumo-subtle);margin-bottom:16px}
+.dialog .btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.boxb{display:flex;flex-direction:column;gap:12px}
+.qr{background:#fff;padding:10px;border-radius:var(--r-md);align-self:center;border:1px solid var(--color-kumo-hairline)}
+.secret{font-family:var(--mono);font-size:13px;padding:10px 12px;background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-md);word-break:break-all;user-select:all}
+.codes{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;font-family:var(--mono);font-size:13px}
+.codes span{padding:6px 10px;background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-sm);text-align:center}
+#toasts{position:fixed;bottom:20px;right:20px;z-index:90;display:flex;flex-direction:column;gap:8px;max-width:360px}
+.toast{padding:10px 14px;border-radius:var(--r-md);background:var(--text-color-kumo-strong);color:var(--text-color-kumo-inverse);font-size:13px;font-weight:500;box-shadow:var(--shadow-lg)}
+.toast.bad{background:var(--color-kumo-danger);color:#fff}
+
+/* Login screen */
+.login{min-height:100dvh;display:grid;place-items:center;padding:20px;background:var(--color-kumo-canvas)}
+.login-card{width:min(440px,100%);background:var(--color-kumo-base);border:1px solid var(--color-kumo-hairline);border-radius:var(--r-xl);box-shadow:var(--shadow-card);padding:28px}
+.login-brand{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.login-card h1{font-size:21px;font-weight:700;color:var(--text-color-kumo-strong);margin-bottom:4px}
+.login-card .sub{font-size:13.5px;color:var(--text-color-kumo-subtle);margin-bottom:18px}
+.login-card form button.pri{width:100%;height:38px;margin-top:4px}
+.oauth-btn{width:100%;height:38px;margin-top:10px;border-color:var(--color-kumo-line);background:var(--color-kumo-elevated);color:var(--text-color-kumo-strong);font-weight:600}
+.oauth-btn:hover{background:var(--color-kumo-tint)}
+.divider{display:flex;align-items:center;gap:10px;margin:14px 0;color:var(--text-color-kumo-subtle);font-size:12px}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--color-kumo-hairline)}
+.alt{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:16px;padding-top:14px;border-top:1px solid var(--color-kumo-hairline);font-size:13px;align-items:center}
+
+/* Responsive mobile (<= 860px, zero overflow at 375px) */
+@media (max-width:860px){
+  .shell{grid-template-columns:minmax(0,1fr)}
+  [data-sidebar="sidebar"]{position:fixed;left:0;top:0;bottom:0;width:260px;transform:translateX(-100%);transition:transform .2s ease;box-shadow:var(--shadow-lg)}
+  .shell.mob-open [data-sidebar="sidebar"]{transform:translateX(0)}
+  .sb-backdrop{display:none;position:fixed;inset:0;background:var(--scrim);z-index:19}
+  .shell.mob-open .sb-backdrop{display:block}
+  .mob-menu{display:grid}
+  .sb-toggle{display:none}
+  header.top{padding:0 12px}
+  .zsel select{max-width:150px}
+  .who span{display:none}
+  .wrap{padding:18px 14px 56px}
+  .set{grid-template-columns:1fr}
+  .set .ctl{justify-content:flex-start}
+  .kv{grid-template-columns:1fr;gap:3px}
+  .grid2,.tiles,.nodes,.lanes{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+<div class="bar"></div>
+<div id="app"></div>
+<div id="modal"></div>
+<div id="toasts" aria-live="polite"></div>
+<script>
+"use strict";
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const CONT = { AF: "非洲", AN: "南极洲", AS: "亚洲", EU: "欧洲", NA: "北美洲", OC: "大洋洲", SA: "南美洲" };
+const IC = (() => {
+  const s = d => `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+  return {
+    globe: s('<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.6 2.3 3.9 5.2 3.9 8.5s-1.3 6.2-3.9 8.5c-2.6-2.3-3.9-5.2-3.9-8.5s1.3-6.2 3.9-8.5z"/>'),
+    server: s('<rect x="4" y="4.5" width="16" height="6" rx="1.5"/><rect x="4" y="13.5" width="16" height="6" rx="1.5"/><path d="M7.5 7.5h.01M7.5 16.5h.01"/>'),
+    route: s('<circle cx="6" cy="6.5" r="2.2"/><circle cx="18" cy="17.5" r="2.2"/><path d="M8.2 6.5H15a2.75 2.75 0 0 1 0 5.5H9a2.75 2.75 0 0 0 0 5.5h6.8"/>'),
+    code: s('<path d="M8.5 7.5 4 12l4.5 4.5M15.5 7.5 20 12l-4.5 4.5M13.5 5l-3 14"/>'),
+    grid: s('<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/>'),
+    list: s('<path d="M8.5 6.5h11M8.5 12h11M8.5 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/>'),
+    lock: s('<rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>'),
+    shield: s('<path d="M12 3.5 5 6v5.5c0 4.2 2.8 7.3 7 9 4.2-1.7 7-4.8 7-9V6z"/>'),
+    sliders: s('<path d="M5 7h9M18 7h1M5 17h1M10 17h9"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>'),
+    network: s('<circle cx="12" cy="5.5" r="2"/><circle cx="5.5" cy="18" r="2"/><circle cx="18.5" cy="18" r="2"/><path d="M11 7.3 6.5 16.2M13 7.3l4.5 8.9M7.5 18h9"/>'),
+    mail: s('<rect x="3.5" y="6" width="17" height="12.5" rx="2"/><path d="m4.5 8.5 7.5 5.8 7.5-5.8"/>'),
+    bolt: s('<path d="M13 3.5 5.5 13.5H11l-1 7 8.5-10.5H13z"/>'),
+    chart: s('<path d="M4.5 19.5h15M7.5 16v-4M12 16V7M16.5 16v-6.5"/>'),
+    gear: s('<circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2M6 6l1.6 1.6M16.4 16.4 18 18M6 18l1.6-1.6M16.4 7.6 18 6"/>'),
+    back: s('<path d="M10.5 6 4.5 12l6 6M5 12h14.5"/>'),
+    close: s('<path d="M6 6l12 12M18 6 6 18"/>'),
+    sun: s('<circle cx="12" cy="12" r="3.8"/><path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6 18 18M6 18l1.4-1.4M16.6 7.4 18 6"/>'),
+    moon: s('<path d="M19.5 14.2A8 8 0 0 1 9.8 4.5a8 8 0 1 0 9.7 9.7z"/>'),
+    auto: s('<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17M12 7.5l5 5M12 12.5l6 3"/>'),
+    exit: s('<path d="M14 4.5h4.5v15H14M10.5 8 14.5 12l-4 4M14 12H4.5"/>'),
+    data: s('<path d="M4.5 16.5 9 11l3.5 3.5 7-8.5M15 6h4.5v4.5"/>'),
+    ban: s('<circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/>'),
+    db: s('<ellipse cx="12" cy="6.5" rx="7" ry="2.8"/><path d="M5 6.5v11c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8v-11"/><path d="M5 12c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8"/>'),
+    key: s('<circle cx="7.5" cy="15.5" r="3.5"/><path d="M10.2 13 19 4.2M16.5 6.7l2.2 2.2M14 9.2l2 2"/>'),
+    proxy: s('<path d="M4 7h10M10 4l4 3-4 3M20 17H10M14 14l-4 3 4 3"/>'),
+    panel: s('<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9.5 4.5v15"/>'),
+    menu: s('<path d="M4 7h16M4 12h16M4 17h16"/>'),
+  };
+})();
+const MARK = '<span class="mark"><svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M6.5 18h11a3.2 3.2 0 0 0 .4-6.37A4.8 4.8 0 0 0 8.8 10.2a3.5 3.5 0 0 0-3.4 2.75A2.7 2.7 0 0 0 6.5 18z"/></svg></span>';
+
+let token = localStorage.getItem("fucf_token") || "";
+let sys = {}, me = {}, loginError = "", seq = 0;
+let AUTH = { step: "start" };
+let S = { view: "overview" };
+const C = {};
+const F = {};
+const WUI = { tab: "scripts", kvNs: "", d1Db: "", d1Sql: "SELECT name, type FROM sqlite_master WHERE type IN ('table','view');", d1Res: null };
+
+// ---------------------------------------------------------------- theme ----
+const THEME_TEXT = { auto: "系统", light: "浅色", dark: "深色" }, THEME_IC = { auto: "auto", light: "sun", dark: "moon" };
+const osDark = matchMedia("(prefers-color-scheme: dark)");
+function getThemePref() {
+  const v = localStorage.getItem("cf_theme_mode") || localStorage.getItem("fucf_theme") || "auto";
+  return v === "light" || v === "dark" || v === "auto" ? v : "auto";
+}
+function applyTheme() {
+  const pref = getThemePref();
+  const resolved = pref === "auto" ? (osDark.matches ? "dark" : "light") : pref;
+  document.documentElement.dataset.mode = resolved;
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved;
+  return pref;
+}
+osDark.addEventListener("change", applyTheme);
+applyTheme();
+
+// ------------------------------------------------------------------ api ----
+async function api(method, path, body, raw) {
+  const headers = { Authorization: "Bearer " + token };
+  if (body !== undefined && !raw) headers["Content-Type"] = "application/json";
+  const r = await fetch("/client/v4" + path, { method, headers, body: body === undefined ? undefined : raw ? body : JSON.stringify(body) });
+  if (r.status === 401 && token) { loginError = "登录已失效，请重新登录。"; logout(); throw new Error("登录已失效"); }
+  if (!(r.headers.get("content-type") || "").includes("json")) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.text();
+  }
+  const d = await r.json();
+  if (!d.success) throw new Error((d.errors && d.errors[0] && d.errors[0].message) || "HTTP " + r.status);
+  return d.result;
+}
+function toast(msg, bad) {
+  const t = document.createElement("div");
+  t.className = "toast" + (bad ? " bad" : "");
+  t.textContent = msg;
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(() => t.remove(), bad ? 6000 : 2500);
+}
+const run = async f => { try { await f(); } catch (e) { toast(e.message, true); } };
+function logout() { token = ""; me = {}; AUTH = { step: "start" }; localStorage.removeItem("fucf_token"); render(); }
+function signIn(r) { token = r.token; me = {}; AUTH = { step: "start" }; loginError = ""; localStorage.setItem("fucf_token", token); render(); }
+function showBox(title, html, okText = "好") {
+  return new Promise(resolve => {
+    const m = document.getElementById("modal");
+    m.innerHTML = `<div class="ov center"><div class="dialog wide" role="dialog" aria-modal="true"><h2>${esc(title)}</h2><div class="boxb">${html}</div>
+      <div class="btns"><button type="button" class="pri" data-x="1">${esc(okText)}</button></div></div></div>`;
+    m.querySelector(".ov").onclick = e => { if (e.target.dataset.x) { m.innerHTML = ""; resolve(); } };
+    m.querySelector('[data-x="1"]').focus();
+  });
+}
+
+// ------------------------------------------------------------- passkeys ----
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+const canPasskey = () => !!(window.PublicKeyCredential && navigator.credentials);
+async function passkeyAssert(challenge, verify) {
+  if (!canPasskey()) throw new Error("这个浏览器（或当前访问方式）不支持通行密钥");
+  let cred;
+  try { cred = await navigator.credentials.get({ publicKey: { challenge: unb64u(challenge), rpId: location.hostname, userVerification: verify ? "required" : "preferred", timeout: 120000 } }); }
+  catch (e) { throw new Error(e.name === "NotAllowedError" ? "已取消，或没有可用的通行密钥" : "通行密钥不可用：" + e.message); }
+  const r = cred.response;
+  return { id: cred.id, client_data: b64u(r.clientDataJSON), authenticator_data: b64u(r.authenticatorData), signature: b64u(r.signature) };
+}
+const busy = on => document.body.classList.toggle("busy", on);
+
+function confirmBox(title, text, okText = "删除", danger = true) {
+  return new Promise(resolve => {
+    const m = document.getElementById("modal");
+    m.innerHTML = `<div class="ov center"><div class="dialog" role="alertdialog" aria-modal="true"><h2>${esc(title)}</h2><p>${esc(text)}</p>
+      <div class="btns"><button type="button" data-x="0">取消</button><button type="button" class="${danger ? "danger" : "pri"}" data-x="1">${esc(okText)}</button></div></div></div>`;
+    const done = v => { m.innerHTML = ""; document.removeEventListener("keydown", key); resolve(v); };
+    const key = e => { if (e.key === "Escape") done(false); };
+    document.addEventListener("keydown", key);
+    const ov = m.querySelector(".ov");
+    ov.onclick = e => { if (e.target.dataset.x) done(e.target.dataset.x === "1"); else if (e.target === ov) done(false); };
+    m.querySelector('[data-x="1"]').focus();
+  });
+}
+
+// ---------------------------------------------------------------- forms ----
+function fieldHtml(f, v) {
+  const name = `name="${esc(f.k)}"`, hint = f.hint ? `<small>${esc(f.hint)}</small>` : "";
+  const pair = o => (Array.isArray(o) ? o : [o, o]);
+  let input;
+  if (f.type === "head") return `<div class="f"><span class="fl">${esc(f.label)}</span>${hint}</div>`;
+  if (f.type === "html") return `<div class="f">${f.html}</div>`;
+  if (f.type === "check") return `<div class="f"><label class="chk"><span class="sw"><input type="checkbox" ${name} ${v ? "checked" : ""}><i></i></span><span>${esc(f.label)}</span></label>${hint}</div>`;
+  if (f.type === "multi") return `<div class="f"><span class="fl">${esc(f.label)}</span><div class="chks">${f.options.map(o => { const [val, text] = pair(o); return `<label><input type="checkbox" ${name} value="${esc(val)}" ${(v || []).includes(val) ? "checked" : ""}>${esc(text)}</label>`; }).join("") || '<span class="hint">（无可选项）</span>'}</div>${hint}</div>`;
+  if (f.type === "select") input = `<select ${name}>${f.options.map(o => { const [val, text] = pair(o); return `<option value="${esc(val)}" ${String(v ?? "") === String(val) ? "selected" : ""}>${esc(text || "（默认）")}</option>`; }).join("")}</select>`;
+  else if (f.type === "textarea") input = `<textarea ${name} class="${f.tall ? "tall" : ""}" spellcheck="false">${esc(v)}</textarea>`;
+  else if (f.type === "json") input = `<textarea ${name} spellcheck="false">${esc(JSON.stringify(v ?? (f.defJson ?? {}), null, 2))}</textarea>`;
+  else if (f.type === "list" || f.type === "numlist") input = `<input ${name} value="${esc((v || []).join(", "))}" autocomplete="off">`;
+  else input = `<input ${name} type="${f.type === "number" ? "number" : f.type === "password" ? "password" : "text"}"${f.step ? ` step="${esc(f.step)}"` : ""}${f.min !== undefined ? ` min="${esc(f.min)}"` : ""}${f.max !== undefined ? ` max="${esc(f.max)}"` : ""} value="${esc(v)}" ${f.readonly ? "readonly" : ""} autocomplete="${f.type === "password" ? (f.auto || "current-password") : "off"}">`;
+  return `<label class="f"><span>${esc(f.label)}</span>${input}${hint}</label>`;
+}
+function collect(fields, form) {
+  const o = {};
+  for (const f of fields) {
+    if (f.type === "head" || f.type === "html") continue;
+    const el = form.querySelector(`[name="${f.k}"]`);
+    if (f.type === "check") o[f.k] = el.checked;
+    else if (f.type === "multi") o[f.k] = [...form.querySelectorAll(`[name="${f.k}"]:checked`)].map(e => e.value);
+    else if (f.type === "number") o[f.k] = el.value === "" ? (f.opt ? null : f.def ?? 0) : Number(el.value);
+    else if (f.type === "list") o[f.k] = el.value.split(/[,\s]+/).filter(Boolean);
+    else if (f.type === "numlist") o[f.k] = el.value.split(/[,\s]+/).filter(Boolean).map(Number);
+    else if (f.type === "json") { try { o[f.k] = JSON.parse(el.value || "{}"); } catch { throw new Error(`“${f.label}”不是合法的 JSON`); } }
+    else o[f.k] = el.value === "" && f.opt ? null : el.value;
+  }
+  return o;
+}
+function openForm(title, fields, values, onSave, wide) {
+  const m = document.getElementById("modal");
+  m.innerHTML = `<div class="ov"><aside class="drawer${wide ? " wide" : ""}" role="dialog" aria-modal="true" aria-label="${esc(title)}"><form novalidate>
+    <header><h2>${esc(title)}</h2><button type="button" class="icon" data-close aria-label="关闭">${IC.close}</button></header>
+    <div class="dbody">${fields.map(f => fieldHtml(f, values[f.k] ?? f.def)).join("")}</div>
+    <footer><p class="ferr" role="alert"></p><button type="button" data-close>取消</button><button class="pri">保存</button></footer></form></aside></div>`;
+  const close = () => { m.innerHTML = ""; document.removeEventListener("keydown", key); };
+  const key = e => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", key);
+  const ov = m.querySelector(".ov"), form = m.querySelector("form"), err = m.querySelector(".ferr"), save = form.querySelector("button.pri");
+  let downOnScrim = false;
+  ov.onmousedown = e => { downOnScrim = e.target === ov; };
+  ov.onclick = e => { if ((e.target === ov && downOnScrim) || e.target.closest("[data-close]")) close(); };
+  form.onsubmit = async e => {
+    e.preventDefault();
+    err.textContent = "";
+    save.disabled = true;
+    try { await onSave(collect(fields, form)); close(); toast("已保存"); render(); }
+    catch (ex) { err.textContent = ex.message; save.disabled = false; }
+  };
+  const first = form.querySelector("input:not([readonly]):not([type=checkbox]),select,textarea");
+  if (first) first.focus();
+}
+
+// ------------------------------------------------------------- building ----
+const num = n => { n = Number(n) || 0; return n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n.toLocaleString("en-US"); };
+const bytes = n => { n = Number(n) || 0; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return (i ? n.toFixed(n < 10 ? 2 : 1) : n) + " " + u[i]; };
+const when = s => { const d = new Date(s); return s && !isNaN(d) ? d.toLocaleString("zh-CN", { hour12: false }) : esc(s || "—"); };
+const dur = s => { s = Number(s) || 0; const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return d ? `${d} 天 ${h} 小时` : h ? `${h} 小时 ${m} 分` : m ? `${m} 分钟` : `${s} 秒`; };
+const meter = (used, total) => { const p = total ? Math.min(100, Math.round(used / total * 100)) : 0; return `${bytes(used)} / ${bytes(total)}（${p}%）<div class="meter-bar ${p > 90 ? "bad" : p > 75 ? "warn" : ""}"><i style="width:${p}%"></i></div>`; };
+function show(v) {
+  if (v === true) return '<span class="st ok">是</span>';
+  if (v === false) return '<span class="st">否</span>';
+  if (v === null || v === undefined || v === "" || (Array.isArray(v) && !v.length)) return '<span class="hint">—</span>';
+  if (typeof v === "object") return esc(Array.isArray(v) ? v.join(", ") : JSON.stringify(v));
+  return esc(v);
+}
+function table(cols, rows, actions, empty, id) {
+  if (!rows.length) return `<div class="empty">${empty || "暂无数据"}</div>`;
+  return `<div class="tw"><table${id ? ` id="${id}"` : ""}><thead><tr>${cols.map(c => `<th class="${c.cls || ""}">${esc(c.label)}</th>`).join("")}${actions ? '<th class="act"><span class="sr">操作</span></th>' : ""}</tr></thead><tbody>${
+    rows.map(r => `<tr>${cols.map(c => `<td class="${c.cls || ""}">${c.fmt ? c.fmt(r) : show(r[c.k])}</td>`).join("")}${actions ? `<td class="act">${actions(r)}</td>` : ""}</tr>`).join("")}</tbody></table></div>`;
+}
+const attrs = data => Object.entries(data || {}).map(([k, v]) => `data-${k}="${esc(v)}"`).join(" ");
+const btn = (act, text, data, cls, extra = "") => `<button type="button" class="${cls || ""}" data-act="${act}" ${attrs(data)} ${extra}>${text}</button>`;
+const lk = (act, text, data, cls) => btn(act, text, data, "lk " + (cls || ""));
+const rowActs = (edit, del, data) => lk(edit, "编辑", data) + lk(del, "删除", data, "bad");
+const card = (title, extra, body, cls) => `<section class="card ${cls || ""}" data-kumo-component="Card">${title ? `<header class="ch"><h3>${title}</h3>${extra || ""}</header>` : ""}${body}</section>`;
+const setRow = (title, desc, control, cls) => `<div class="set ${cls || ""}"><div><h4>${title}</h4>${desc ? `<p>${desc}</p>` : ""}</div><div class="ctl">${control}</div></div>`;
+const sw = (key, on, label) => `<label class="sw"><input type="checkbox" data-set="${key}" ${on ? "checked" : ""} aria-label="${esc(label)}"><i></i></label>`;
+const sel = (key, val, options, label) => `<select data-set="${key}" aria-label="${esc(label)}">${options.map(([v, t]) => `<option value="${v}" ${v === val ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
+const tile = (label, value, note, href, icon) => `<${href ? `a href="${href}"` : "div"} class="tile"><div class="tile-hd"><span>${esc(label)}</span>${icon ? `<i class="ti">${IC[icon]}</i>` : ""}</div><b>${esc(value)}</b>${note ? `<em>${esc(note)}</em>` : ""}</${href ? "a" : "div"}>`;
+const chips = (list, cls) => `<span class="chips">${list.map(x => `<span class="tag ${cls || ""}">${esc(x)}</span>`).join("")}</span>`;
+function segBar(parts, what) {
+  const total = parts.reduce((s, p) => s + p.value, 0);
+  if (!total) return '<div class="hint">还没有请求。</div>';
+  const pct = v => (v / total * 100).toFixed(v / total < 0.1 ? 1 : 0) + "%";
+  return `<div class="seg" role="img" aria-label="${esc(what + "：" + parts.map(p => `${p.label} ${pct(p.value)}`).join("，"))}">${
+    parts.filter(p => p.value).map(p => `<i style="flex-grow:${p.value};background:var(${p.c})" title="${esc(`${p.label}：${num(p.value)}（${pct(p.value)}）`)}"></i>`).join("")}</div>
+    <ul class="legend">${parts.map(p => `<li><i style="background:var(${p.c})"></i><span>${esc(p.label)}</span><b>${num(p.value)}</b><em>${pct(p.value)}</em></li>`).join("")}</ul>`;
+}
+
+// ------------------------------------------------- zone-scoped rule types ----
+const EXPR = { k: "expression", label: "匹配表达式", type: "textarea", hint: '留空匹配全部。例：http.request.uri.path contains "/admin" and ip.geoip.country eq "CN"' };
+const COMMON = [{ k: "priority", label: "优先级（小的先执行）", type: "number" }, { k: "enabled", label: "启用", type: "check", def: true }];
+const DESC = { k: "description", label: "说明" };
+const RULES = {
+  firewall: { path: "firewall/rules", title: "防火墙规则", empty: "<b>还没有防火墙规则</b>按路径、IP、国家或运营商拦截、质询或放行请求。", cols: ["description", "expression", "action", "priority", "enabled"],
+    fields: [DESC, EXPR, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["js_challenge", "JS 质询"], ["log", "仅记录"], ["skip", "放行并跳过后续检查"]] }, ...COMMON] },
+  rate: { path: "rate_limits", title: "限速规则", empty: "<b>还没有限速规则</b>限制单个 IP 在统计周期内的请求数。", cols: ["description", "expression", "threshold", "period", "action", "enabled"],
+    fields: [DESC, EXPR, { k: "threshold", label: "阈值（请求数 / 每 IP）", type: "number", def: 100 }, { k: "period", label: "统计周期（秒）", type: "number", def: 60 }, { k: "mitigation_timeout", label: "超限后封禁时长（秒）", type: "number" }, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["log", "仅记录"]] }, { k: "enabled", label: "启用", type: "check", def: true }] },
+  origin: { path: "origin_rules", title: "回源规则", empty: "<b>还没有回源规则</b>按表达式改写回源地址、端口、协议、Host 头或 SNI。", cols: ["description", "expression", "origin_host", "origin_node", "origin_port", "host_header", "priority", "enabled"],
+    fields: [DESC, EXPR, { k: "origin_host", label: "回源地址（域名或 IP）", opt: 1 }, { k: "origin_node", label: "内部回源节点（可选，如 jp）", opt: 1 }, { k: "origin_port", label: "回源端口", type: "number", opt: 1 }, { k: "origin_scheme", label: "回源协议", type: "select", options: ["", "http", "https"], opt: 1 }, { k: "host_header", label: "Host 头", opt: 1 }, { k: "sni", label: "TLS SNI", opt: 1 }, ...COMMON] },
+  redirect: { path: "redirect_rules", title: "重定向规则", empty: "<b>还没有重定向规则</b>把匹配的请求跳转到另一个 URL。", cols: ["description", "expression", "target_url", "status_code", "enabled"],
+    fields: [DESC, EXPR, { k: "target_url", label: "目标 URL（或以 / 开头的路径）" }, { k: "status_code", label: "状态码", type: "select", options: ["302", "301", "303", "307", "308"], def: 302 }, { k: "preserve_query_string", label: "保留查询串", type: "check" }, ...COMMON],
+    save: v => ({ ...v, status_code: Number(v.status_code) }) },
+  transform: { path: "transform_rules", title: "改写规则", empty: "<b>还没有改写规则</b>重写路径，增删请求头和响应头。", cols: ["description", "expression", "rewrite_path", "priority", "enabled"],
+    fields: [DESC, EXPR, { k: "rewrite_path", label: "重写路径", opt: 1 }, { k: "set_request_headers", label: "设置请求头 (JSON)", type: "json" }, { k: "remove_request_headers", label: "删除请求头", type: "list" }, { k: "set_response_headers", label: "设置响应头 (JSON)", type: "json" }, { k: "remove_response_headers", label: "删除响应头", type: "list" }, ...COMMON] },
+  cache: { path: "cache_rules", title: "缓存规则", empty: "<b>还没有缓存规则</b>默认只缓存静态文件；用规则缓存更多内容或强制不缓存。", cols: ["description", "expression", "cache", "edge_ttl", "priority", "enabled"],
+    fields: [DESC, EXPR, { k: "cache", label: "缓存匹配的响应（关闭 = 强制不缓存）", type: "check", def: true }, { k: "edge_ttl", label: "边缘 TTL（秒，留空遵循源站）", type: "number", opt: 1 }, ...COMMON] },
+  cert: { path: "custom_certificates", title: "边缘证书", empty: "<b>还没有上传证书</b>没有证书的主机名使用即时生成的自签名证书。", cols: ["hosts", "modified_on"],
+    fields: [{ k: "hosts", label: "域名（留空 = 根域 + 通配）", type: "list" }, { k: "certificate", label: "证书链 PEM", type: "textarea" }, { k: "private_key", label: "私钥 PEM（不会回显）", type: "textarea" }] },
+  spectrum: { path: "spectrum/apps", title: "TCP / UDP 转发", empty: "<b>还没有转发应用</b>把边缘上的任意 TCP / UDP 端口转发到源站。", cols: ["protocol", "dns_name", "origin_direct", "proxy_protocol"],
+    fields: [{ k: "protocol", label: "边缘监听", hint: "如 tcp/2222 或 udp/5000" }, { k: "dns_name", label: "域名前缀" }, { k: "origin_direct", label: "源站", type: "list", hint: "如 tcp://192.0.2.1:22，可多个" }, { k: "proxy_protocol", label: "PROXY protocol", type: "select", options: ["off", "v1"] }],
+    load: v => ({ ...v, dns_name: v.dns && v.dns.name }), save: v => ({ ...v, dns: { name: v.dns_name } }) },
+  route: { path: "workers/routes", title: "Worker 路由", empty: "<b>还没有路由</b>把匹配的请求交给一个 Worker 脚本处理。", cols: ["pattern", "script"],
+    fields: [{ k: "pattern", label: "匹配模式", hint: "如 example.com/api/*" }, { k: "script", label: "脚本名（留空 = 此路径不运行 Worker）", opt: 1 }] },
+  email: { path: "email/rules", title: "转发规则", empty: "<b>还没有转发规则</b>把发给这个域名某地址的邮件，转到一个或多个外部邮箱或交给 Email Worker 处理。",
+    cols: ["address", "action", "destinations", "worker", "enabled"],
+    fields: [{ k: "address", label: "地址", hint: "本地名（如 hello）、完整地址，或 * 表示没有专属规则的全部地址" },
+      { k: "action", label: "动作", type: "select", options: [["forward", "转发"], ["worker", "交给 Worker 处理"], ["drop", "收下后丢弃"]], def: "forward" },
+      { k: "destinations", label: "转发到（外部邮箱，逗号或空格分隔，最多 10 个）", type: "list", hint: "动作为“转发”时必填；不能填这个域名自己的地址" },
+      { k: "worker", label: "Worker 脚本名（动作为 Worker 时必填）", opt: 1, hint: "脚本需导出 async email(message, env, ctx)" },
+      DESC, { k: "enabled", label: "启用", type: "check", def: true }] },
+};
+const TONE = { block: "bad", js_challenge: "warn", skip: "ok" };
+const ACT = { block: "拦截", js_challenge: "JS 质询", log: "仅记录", skip: "放行", challenge: "质询", allow: "放行" };
+const SRC = { firewall: "防火墙", waf: "托管 WAF", rate_limit: "限速", ratelimit: "限速" };
+function colFmt(k, f) {
+  if (k === "expression") return r => (r.expression ? `<code class="expr">${esc(r.expression)}</code>` : '<span class="hint">全部请求</span>');
+  if (k === "enabled") return r => (r.enabled ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>');
+  if (k === "modified_on") return r => when(r.modified_on);
+  if (f && f.type === "select" && Array.isArray(f.options[0])) return r => { const o = f.options.find(o => o[0] === r[k]); return `<span class="tag ${TONE[r[k]] || ""}">${esc(o ? o[1].replace(/并.*/, "") : r[k])}</span>`; };
+  if (f && f.type === "number") return r => (r[k] === null || r[k] === undefined ? '<span class="hint">—</span>' : esc(r[k]));
+}
+async function ruleSection(zid, key) {
+  const R = RULES[key];
+  const rows = (await api("GET", `/zones/${zid}/${R.path}?per_page=1000`)).map(r => (R.load ? R.load(r) : r));
+  C[key] = rows;
+  const cols = R.cols.map(k => {
+    const f = R.fields.find(f => f.k === k);
+    return { k, label: (f ? f.label : k === "modified_on" ? "更新时间" : k).replace(/（.*/, ""), fmt: colFmt(k, f), cls: f && f.type === "number" ? "num" : "" };
+  });
+  return card(`${esc(R.title)} <span class="cnt">${rows.length}</span>`, btn("ruleEdit", "添加", { key }, "pri sm"),
+    table(cols, rows, r => rowActs("ruleEdit", "ruleDel", { key, id: r.id }), R.empty));
+}
+
+// ---------------------------------------------------------------- views ----
+const zh = tab => `#/zone/${esc(S.zone)}/${tab}`;
+const protoChips = s => chips(["HTTP/1.1", s.http2 && "HTTP/2", s.http3 && "HTTP/3"].filter(Boolean));
+const modeTag = z => (z.type === "full" ? '<span class="tag pri">完全托管 (NS)</span>' : '<span class="tag">CNAME 接入</span>');
+const stateTag = z => (z.paused ? '<span class="st bad">已暂停</span>' : '<span class="st ok">运行中</span>');
+
+async function viewOverview() {
+  const zones = C.zones || [];
+  const [fl, steer, ...zStats] = await Promise.all([
+    api("GET", "/fleet"),
+    api("GET", "/steering"),
+    ...zones.map(z => api("GET", `/zones/${z.id}/analytics`).catch(() => ({}))),
+  ]);
+  const nodes = fl.nodes || [];
+  const on = nodes.filter(n => !n.config || n.config.enabled !== false);
+  const online = on.filter(n => n.online).length;
+  const healthy = on.filter(n => n.online && n.healthy).length;
+  const versions = [...new Set(nodes.filter(n => n.exe).map(n => n.exe))];
+
+  const tot = { requests: 0, bytes: 0, cached: 0, threats: 0, s2: 0, s3: 0, s4: 0, s5: 0, h1: 0, h2: 0, h3: 0 };
+  const zRows = zones.map((z, i) => {
+    const a = zStats[i] || {};
+    tot.requests += a.requests || 0; tot.bytes += a.bytes || 0; tot.cached += a.cached || 0; tot.threats += a.threats || 0;
+    tot.s2 += a.status_2xx || 0; tot.s3 += a.status_3xx || 0; tot.s4 += a.status_4xx || 0; tot.s5 += a.status_5xx || 0;
+    tot.h1 += a.http1 || 0; tot.h2 += a.http2 || 0; tot.h3 += a.http3 || 0;
+    return { z, a };
+  }).sort((a, b) => (b.a.requests || 0) - (a.a.requests || 0));
+
+  let monthBytes = 0, cacheBytes = 0, cacheObjs = 0, cacheMax = 0;
+  let gfwProbed = 0, gfwV4Tcp = 0, gfwV4Udp = 0, gfwV6Tcp = 0, gfwV6Udp = 0;
+  for (const n of nodes) {
+    const s = n.status || {};
+    monthBytes += (s.usage && s.usage.used_bytes) || 0;
+    if (s.cache) { cacheBytes += s.cache.bytes || 0; cacheObjs += s.cache.objects || 0; cacheMax += s.cache.max_bytes || 0; }
+    const g = s.gfw;
+    if (g && (g.v4_tcp != null || g.v4_udp != null || g.v6_tcp != null || g.v6_udp != null)) {
+      gfwProbed++;
+      if (g.v4_tcp) gfwV4Tcp++; if (g.v4_udp) gfwV4Udp++; if (g.v6_tcp) gfwV6Tcp++; if (g.v6_udp) gfwV6Udp++;
+    }
+  }
+  const hitRate = tot.requests ? (tot.cached / tot.requests * 100).toFixed(1) + "%" : "—";
+  const allGood = on.length > 0 && healthy === on.length && versions.length <= 1;
+
+  const hero = `<section class="hero${!allGood && on.length ? " bad" : ""}"><div><span class="eyebrow${!allGood && on.length ? " bad" : ""}">全局运行总览</span>
+    <h2>${!on.length ? "还没有启用的节点" : healthy === on.length ? `全部 ${healthy} 台节点运行正常` : `${on.length - healthy} 台节点异常`}</h2>
+    <p>${zones.length} 个域名 · ${online}/${on.length} 在线 · ${versions.length <= 1 ? "全集群版本一致" : `存在 ${versions.length} 个版本`} · ${steer.filter(r => r.enabled).length} 条调度规则</p>
+    <div class="hns">${nodes.map(n => `<a class="hn ${n.config && !n.config.enabled ? "" : n.online && n.healthy ? "ok" : "bad"}" href="#/fleet" title="${esc(n.name)}">${esc(n.name)}</a>`).join("")}</div></div></section>`;
+
+  const tiles = `<div class="tiles">${
+    tile("24h 访问量", num(tot.requests), `${zones.length} 个域名合计请求`, "", "chart")}${
+    tile("24h 出站流量", bytes(tot.bytes), `本月全节点累计 ${bytes(monthBytes)}`, "", "data")}${
+    tile("全站缓存命中率", hitRate, `${num(tot.cached)} 次命中 · 缓存 ${bytes(cacheBytes)}`, "", "bolt")}${
+    tile("24h 安全拦截", num(tot.threats), "防火墙、限速与托管 WAF", "", "shield")}</div>
+    <div class="tiles">${
+    tile("节点健康", `${healthy} / ${on.length}`, versions.length <= 1 ? "版本统一 · 同步正常" : `机群有 ${versions.length} 个版本`, "#/fleet", "server")}${
+    tile("大陆 TCP 连通", gfwProbed ? `v4 ${gfwV4Tcp}/${gfwProbed} · v6 ${gfwV6Tcp}/${gfwProbed}` : "待探测", gfwProbed ? `UDP: v4 ${gfwV4Udp}/${gfwProbed} · v6 ${gfwV6Udp}/${gfwProbed}` : "每小时自动监测", "#/fleet", "globe")}${
+    tile("本月 CDN 用量", bytes(monthBytes), `${nodes.filter(n => n.config && n.config.traffic_limit_gb).length} 台节点配置了配额`, "#/fleet", "data")}${
+    tile("边缘缓存池", `${num(cacheObjs)} 对象`, cacheMax ? `${bytes(cacheBytes)} / ${bytes(cacheMax)}` : bytes(cacheBytes), "#/fleet", "bolt")}</div>`;
+
+  const bars = `<div class="grid2">${
+    card("24h 状态码分布", "", `<div class="cb">${segBar([{ label: "2xx 成功", value: tot.s2, c: "--s1" }, { label: "3xx 跳转", value: tot.s3, c: "--s2" }, { label: "4xx 客户端错误", value: tot.s4, c: "--s3" }, { label: "5xx 服务端错误", value: tot.s5, c: "--s4" }], "状态码分布")}</div>`)}${
+    card("24h 协议分布", "", `<div class="cb">${segBar([{ label: "HTTP/1.1", value: tot.h1, c: "--s1" }, { label: "HTTP/2", value: tot.h2, c: "--s2" }, { label: "HTTP/3", value: tot.h3, c: "--s3" }], "协议分布")}</div>`)}</div>`;
+
+  const gfwCell = n => {
+    const g = (n.status || {}).gfw;
+    if (!g || (g.v4_tcp == null && g.v4_udp == null && g.v6_tcp == null && g.v6_udp == null)) return '<span class="hint">待探测</span>';
+    const p = (l, v) => v == null ? "" : `<span class="tag ${v ? "ok" : "bad"}">${l}${v ? "✓" : "✗"}</span>`;
+    return [p("v4T ", g.v4_tcp), p("v4U ", g.v4_udp), p("v6T ", g.v6_tcp), p("v6U ", g.v6_udp)].filter(Boolean).join(" ");
+  };
+  const limitCell = n => {
+    const c = n.config, u = (n.status || {}).usage || {};
+    if (u.used_bytes === undefined) return "—";
+    const cap = c && c.traffic_limit_gb;
+    const tag = u.state === "limited" ? ' <span class="tag bad">509限流</span>'
+      : u.offload_pct > 0 ? ` <span class="tag warn">分流${u.offload_pct}%</span>`
+      : u.state === "throttled" ? ' <span class="tag warn">限速</span>' : "";
+    return (cap ? meter(u.used_bytes, cap * 1e9) : bytes(u.used_bytes)) + tag;
+  };
+  const nodeTable = card(`节点运行状况与大陆被墙检测 <span class="cnt">${nodes.length}</span>`, '<a href="#/fleet">节点管理</a>', table([
+    { label: "节点", fmt: n => `<a href="#/fleet"><b>${esc(n.name)}</b></a>${n.role === "accelerate" ? ' <span class="tag warn">加速</span>' : ' <span class="tag blue">Peer</span>'}${n.self ? ' <span class="tag pri">本机</span>' : ""}` },
+    { label: "状态", fmt: n => (n.config && !n.config.enabled ? '<span class="st">停用</span>' : n.online && n.healthy ? '<span class="st ok">正常</span>' : '<span class="st bad">异常</span>') },
+    { label: "大陆被墙监测 (T=TCP U=UDP)", fmt: gfwCell },
+    { label: "本月 CDN 流量", fmt: limitCell },
+    { label: "边缘缓存", fmt: n => { const ca = (n.status || {}).cache; return ca ? `${num(ca.objects)} · ${bytes(ca.bytes)}` : "—"; } },
+    { label: "内存 / 负载", fmt: n => { const s = n.status || {}; const mem = s.memory_bytes ? bytes(s.memory_bytes) : "—"; const ld = s.load && s.load.length ? s.load[0].toFixed(2) : "—"; return `<span class="mono">${mem} · ${ld}</span>`; } },
+    { label: "运行", fmt: n => { const s = n.status || {}; return s.uptime_seconds !== undefined ? dur(s.uptime_seconds) : "—"; }, cls: "num" },
+  ], nodes, null, "<b>还没有节点</b>"));
+
+  const zoneTable = card(`域名 24h 访问与缓存排行 <span class="cnt">${zones.length}</span>`, '<a href="#/zones">全部域名</a>', table([
+    { label: "域名", fmt: ({ z }) => `<a href="#/zone/${esc(z.id)}/overview"><b>${esc(z.name)}</b></a>` },
+    { label: "状态", fmt: ({ z }) => stateTag(z) },
+    { label: "24h 请求", fmt: ({ a }) => num(a.requests || 0), cls: "num" },
+    { label: "24h 流量", fmt: ({ a }) => bytes(a.bytes || 0), cls: "num" },
+    { label: "缓存命中率", fmt: ({ a }) => (a.requests ? `${(a.cached / a.requests * 100).toFixed(1)}%` : "—"), cls: "num" },
+    { label: "拦截", fmt: ({ a }) => num(a.threats || 0), cls: "num" },
+  ], zRows, ({ z }) => `<a href="#/zone/${esc(z.id)}/analytics">详情</a>`, "<b>还没有域名</b>"));
+
+  return { title: "总览面板", sub: "全集群运行状况、24 小时访问量、流量配额、缓存命中率与大陆被墙监测一览。", acts: btn("retry", "刷新数据", {}, ""), body: hero + tiles + bars + nodeTable + zoneTable };
+}
+
+async function viewZones() {
+  const [nodes, steer] = await Promise.all([api("GET", "/nodes"), api("GET", "/steering")]);
+  const zones = C.zones, on = nodes.filter(n => n.enabled), blocks = steer.filter(r => r.action === "block" && r.enabled).length;
+  const up = on.filter(n => n.healthy).length, paused = zones.filter(z => z.paused).length;
+  const hero = `<section class="hero${on.length && up < on.length ? " bad" : ""}"><div><span class="eyebrow${on.length && up < on.length ? " bad" : ""}">边缘网络</span>
+    <h2>${!on.length ? "还没有启用的节点" : up === on.length ? "全部节点运行正常" : `${on.length - up} 个节点不可达`}</h2>
+    <p>${zones.length} 个域名 · ${up} / ${on.length} 个节点健康 · ${steer.filter(r => r.enabled).length} 条调度规则生效</p>
+    <div class="hns">${nodes.map(n => `<a class="hn ${!n.enabled ? "" : n.healthy ? "ok" : "bad"}" href="#/fleet" title="${!n.enabled ? "已停用" : n.healthy ? "健康" : "不可达"}">${esc(n.name)}</a>`).join("")}</div></div></section>`;
+  const tiles = hero + `<div class="tiles">${tile("域名", zones.length, paused ? `${paused} 个已暂停` : "全部运行中", "", "globe")}${
+    tile("健康节点", `${up} / ${on.length}`, nodes.length - on.length ? `另有 ${nodes.length - on.length} 个已停用` : "启用的节点", "#/fleet", "server")}${
+    tile("调度规则", steer.filter(r => r.action !== "block").length, "按国家、大洲、运营商", "#/steering", "route")}${
+    tile("DNS 屏蔽规则", blocks, blocks ? "命中的访客被拒绝解析" : "未屏蔽任何地区", "#/steering", "ban")}</div>`;
+  const list = card(`域名 <span class="cnt">${zones.length}</span>`, zones.length > 6 ? `<input type="search" placeholder="搜索域名" data-filter="zones" value="${esc(F.zones || "")}" aria-label="搜索域名">` : "", table([
+    { label: "域名", fmt: z => `<a href="#/zone/${esc(z.id)}/overview"><b>${esc(z.name)}</b></a>` },
+    { label: "接入方式", fmt: modeTag }, { label: "状态", fmt: stateTag }, { label: "HTTP 协议", fmt: z => protoChips(z.settings) },
+  ], zones, z => `<a href="#/zone/${esc(z.id)}/overview">管理</a>`,
+    `<b>还没有域名</b>添加一个域名，选择完全托管（NS）或 CNAME 接入。<br><br>${btn("zoneAdd", "添加域名", {}, "pri")}`, "zones"));
+  return { title: "账户主页", sub: "这个边缘平台上托管的域名，以及节点和调度的概况。", acts: btn("zoneAdd", "添加域名", {}, "pri"), body: tiles + list };
+}
+
+const ZNAV = [["overview", "概览", "grid"], ["dns", "DNS 记录", "list"], ["ssl", "SSL/TLS", "lock"], ["security", "安全", "shield"], ["rules", "规则", "sliders"],
+  ["network", "网络与协议", "network"], ["caching", "缓存", "bolt"], ["workers", "Workers 路由", "code"], ["email", "电子邮件", "mail"], ["analytics", "分析与事件", "chart"], ["manage", "域名管理", "gear"]];
+const ZONE = {
+  async overview(z) {
+    const [a, recs] = await Promise.all([api("GET", `/zones/${z.id}/analytics`), api("GET", `/zones/${z.id}/dns_records?per_page=5000`)]);
+    const s = z.settings, base = sys.cname_base;
+    const how = z.type === "full"
+      ? `<p>在域名注册商处把 NS 改为下面的名称服务器，这里的全部记录即对外生效。</p><p style="margin-top:10px">${z.name_servers.map(n => `<code>${esc(n)}</code>`).join(" ")}</p>`
+      : `<p>域名的 DNS 留在原服务商。把要加速的主机名 CNAME 到 <code>主机前缀.${esc(base || "（未配置 cname-base）")}</code>，并在 DNS 记录里添加同名的“已代理”记录填写源站。</p>`;
+    return { sub: "域名的接入状态和本节点的流量概况。", body:
+      `<div class="tiles">${tile("请求数", num(a.requests), "边缘收到的全部请求", "", "chart")}${tile("流量", bytes(a.bytes), "发给访客的响应体", "", "data")}${tile("缓存命中率", a.requests ? (a.cached / a.requests * 100).toFixed(1) + "%" : "—", `${num(a.cached)} 次命中`, "", "bolt")}${tile("已拦截", num(a.threats), "防火墙、限速与 WAF", "", "shield")}</div>
+      <p class="hint" style="margin:-8px 0 16px">最近 24 小时，所有节点合计。</p>
+      <div class="grid2">${card(`接入方式 ${modeTag(z)}`, `<a href="${zh("dns")}">DNS 记录</a>`, `<div class="cb">${how}</div>`)}
+      ${card("当前配置", "", `<div class="cb"><dl class="kv">
+        <dt>DNS 记录</dt><dd><a href="${zh("dns")}">${recs.length} 条</a>，其中 ${recs.filter(r => r.proxied).length} 条已代理</dd>
+        <dt>协议</dt><dd><a href="${zh("network")}">${protoChips(s)}</a></dd>
+        <dt>回源加密</dt><dd><a href="${zh("ssl")}">${esc(s.ssl)}</a>${s.always_use_https ? " · 始终使用 HTTPS" : ""}</dd>
+        <dt>托管 WAF</dt><dd><a href="${zh("security")}">${{ block: "拦截", log: "仅记录", off: "关闭" }[s.waf]}</a></dd>
+        <dt>服务节点</dt><dd><a href="${zh("network")}">${s.edge_nodes.length ? esc(s.edge_nodes.join("、")) : "全部节点，按访客位置调度"}</a></dd></dl></div>`)}</div>
+      ${card("快捷操作", "", setRow("开发模式", "临时绕过边缘缓存，所有请求直接回源。", sw("development_mode", s.development_mode, "开发模式")) +
+        setRow("清除缓存", "清除这个域名在所有节点上的缓存对象。", btn("purge", "清除全部缓存")) +
+        setRow(z.paused ? "恢复域名" : "暂停域名", z.paused ? "域名已暂停：已代理的记录直接解析到源站。" : "停止代理，已代理的记录直接解析到源站，不经过 CDN 与 WAF。", btn("zonePause", z.paused ? "恢复" : "暂停")))}` };
+  },
+  async dns(z) {
+    const [recs, ds] = await Promise.all([api("GET", `/zones/${z.id}/dns_records?per_page=5000`), api("GET", `/zones/${z.id}/dnssec`)]);
+    C.records = recs;
+    const base = sys.cname_base;
+    const how = z.type === "full"
+      ? `<b>完全托管模式</b>：名称服务器为 ${z.name_servers.map(n => `<code>${esc(n)}</code>`).join(" ")}，这里的全部记录即对外生效。`
+      : `<b>CNAME 接入模式</b>：在原 DNS 服务商处把主机名 CNAME 到 <code>主机前缀.${esc(base || "（未配置 cname-base）")}</code>，并在这里添加同名的“已代理”记录填写源站。`;
+    const dsActive = ds && ds.status === "active";
+    const dsBody = dsActive
+      ? `<dl class="kv pad"><dt>状态</dt><dd><span class="st ok">已启用（ECDSAP256SHA256 / Algorithm 13）</span></dd>
+          <dt>Key Tag</dt><dd><code class="mono">${esc(ds.key_tag)}</code></dd>
+          <dt>Algorithm</dt><dd><code class="mono">${esc(ds.algorithm)} (ECDSAP256SHA256)</code></dd>
+          <dt>Digest Type</dt><dd><code class="mono">${esc(ds.digest_type)} (SHA-256)</code></dd>
+          <dt>Digest</dt><dd><code class="mono">${esc(ds.digest)}</code></dd>
+          <dt>DS 记录</dt><dd><code class="mono">${esc(ds.ds)}</code></dd></dl>`
+      : `<div class="empty"><b>DNSSEC 未启用</b>启用后会生成 ECDSA P-256（Algorithm 13）签名密钥并自动为解析记录签发 RRSIG；把生成的 DS 记录填到域名注册商即可生效。</div>`;
+    return { sub: "“已代理”的 A / AAAA / CNAME 记录对外解析到边缘节点，访问经过 CDN 与 WAF；“仅 DNS”按原值解析。", acts: btn("recEdit", "添加记录", {}, "pri"), body:
+      `<div class="note">${how}</div>` + card(`记录 <span class="cnt">${recs.length}</span>`,
+        recs.length ? `<input type="search" placeholder="搜索记录" data-filter="records" value="${esc(F.records || "")}" aria-label="搜索记录">` : "", table([
+        { label: "类型", fmt: r => `<span class="tag blue">${esc(r.type)}</span>` },
+        { label: "名称", fmt: r => `<b>${esc(r.name)}</b>` + (z.type !== "full" && r.proxied && base ? `<span class="sub">CNAME → <span class="mono">${esc((r.name === z.name ? "@" : r.name.slice(0, -z.name.length - 1)) + "." + base)}</span></span>` : "") },
+        { label: "内容 / 源站", fmt: r => `<span class="mono">${esc(r.content)}</span>` + (r.proxied && r.origin ? `<span class="sub">回源${[["sni", "SNI"], ["host_header", "Host"], ["port", "端口"], ["scheme", "协议"]].filter(([k]) => r.origin[k]).map(([k, t]) => ` ${t} <span class="mono">${esc(r.origin[k])}</span>`).join(" ·")}</span>` : "") },
+        { label: "代理状态", fmt: r => (r.proxied ? '<span class="st px">已代理</span>' : '<span class="st">仅 DNS</span>') },
+        { label: "TTL", fmt: r => (r.ttl === 1 ? "自动" : esc(r.ttl)), cls: "num" }, { k: "comment", label: "备注" },
+      ], recs, r => rowActs("recEdit", "recDel", { id: r.id }), "<b>还没有记录</b>添加 A、AAAA 或 CNAME 记录，并选择是否经 CDN 代理。", "records")) +
+      card("DNSSEC", btn("dnssecToggle", dsActive ? "关闭 DNSSEC" : "启用 DNSSEC", { enable: dsActive ? "0" : "1" }, dsActive ? "danger" : "pri"), dsBody) };
+  },
+  async ssl(z) {
+    const s = z.settings;
+    return { sub: "边缘与源站之间的加密方式，以及访客看到的证书。", body:
+      card("加密", "", setRow("回源加密", "flexible：HTTP 回源。full：HTTPS 回源，不验证源站证书。strict：HTTPS 回源并验证证书。",
+        sel("ssl", s.ssl, [["flexible", "flexible：HTTP 回源"], ["full", "full：HTTPS，不验证"], ["strict", "strict：HTTPS，验证证书"]], "回源加密")) +
+        setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS"))) + await ruleSection(z.id, "cert") };
+  },
+  async security(z) {
+    return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
+      card("托管 WAF 规则集", "", setRow("规则集模式", "检测 SQL 注入、XSS、路径穿越等常见攻击特征。", sel("waf", z.settings.waf, [["block", "拦截"], ["log", "仅记录"], ["off", "关闭"]], "托管 WAF 规则集"))) +
+      `<div class="note">按地区或运营商屏蔽：<code>ip.geoip.country in {"RU" "KP"}</code>　<code>ip.geoip.asnum eq 4134</code>　<code>ip.geoip.as_org contains "telecom"</code><span class="hint">要在 DNS 层面拒绝解析，使用账户主页的 <a href="#/steering">调度与 DNS 屏蔽</a>。</span></div>` +
+      await ruleSection(z.id, "firewall") + await ruleSection(z.id, "rate") };
+  },
+  async rules(z) {
+    let body = "";
+    for (const key of ["origin", "redirect", "transform", "cache"]) body += await ruleSection(z.id, key);
+    return { sub: "按表达式改写回源目标、跳转请求、修改请求与响应、控制缓存。每类规则按优先级从小到大执行。", body };
+  },
+  async network(z) {
+    const s = z.settings, nodes = await api("GET", "/nodes");
+    return { sub: "向访客提供的 HTTP 协议、服务这个域名的节点，以及 TCP / UDP 端口转发。", body:
+      card("HTTP 协议", "", setRow("HTTP/2", "关闭后 TLS 连接只协商 HTTP/1.1。", sw("http2", s.http2, "HTTP/2")) +
+        setRow("HTTP/3 (QUIC)", "通过 Alt-Svc 响应头和 HTTPS DNS 记录通告；在高丢包线路上通常更快。", sw("http3", s.http3, "HTTP/3"))) +
+      card("服务节点", "", setRow("指定节点", "不选表示全部节点，按访客位置和调度规则分配；选中后只由这些节点应答。",
+        nodes.length ? `<div class="chks">${nodes.map(n => `<label><input type="checkbox" data-set="edge_nodes" data-multi value="${esc(n.name)}" ${s.edge_nodes.includes(n.name) ? "checked" : ""}>${esc(n.name)}</label>`).join("")}</div>` : '<span class="hint">还没有登记节点。</span>', "stack")) +
+      await ruleSection(z.id, "spectrum") };
+  },
+  async caching(z) {
+    return { sub: "边缘缓存的开关与清除。缓存哪些内容由“规则”里的缓存规则决定。", body:
+      card("缓存", "", setRow("开发模式", "临时绕过边缘缓存，所有请求直接回源。", sw("development_mode", z.settings.development_mode, "开发模式")) +
+        setRow("清除全部缓存", "清除这个域名在所有节点上的缓存对象；其余节点随配置同步清除。", btn("purge", "清除全部缓存")) +
+        setRow("按 URL 清除", "每行一个完整 URL。", `<textarea id="purgeUrls" placeholder="https://${esc(z.name)}/app.js" spellcheck="false" aria-label="要清除的 URL"></textarea>${btn("purgeFiles", "清除这些 URL")}`, "stack")) };
+  },
+  async workers(z) {
+    return { sub: "把匹配的请求交给 Worker 脚本处理。脚本本身在账户主页的 Workers 里管理。", acts: '<a class="btn" href="#/workers">管理脚本</a>', body: await ruleSection(z.id, "route") };
+  },
+  async email(z) {
+    const e = await api("GET", `/zones/${z.id}/email`);
+    const missing = e.needed_records || [];
+    const dns = missing.length
+      ? `<div class="note bad" style="margin:14px 20px">邮件要正常收发，DNS 还缺这些记录：<dl class="kv" style="margin-top:8px">${missing.map(r => `<dt>${esc(r.type)}</dt><dd><code>${esc(r.name)}${r.priority ? " 优先级 " + r.priority : ""} → ${esc(r.content)}</code></dd>`).join("")}</dl><div style="margin-top:10px">${btn("emailDns", "添加这些记录", {}, "pri sm")}</div></div>`
+      : `<div class="note" style="margin:14px 20px">MX：${e.mx.map(m => `<code>${esc(m)}</code>`).join(" ") || "—"}<br>SPF：${e.spf.map(t => `<code>${esc(t)}</code>`).join(" ") || "—"}</div>`;
+    return { sub: "这个域名的收件开关与转发规则；由开启了 SMTP 监听的节点收取并按规则转发。", body:
+      card("邮件路由", "", setRow("接收邮件", `开启后，发件服务器按 MX 记录把 ${esc(z.name)} 的邮件交给本平台节点，按下面的规则处理。`, sw("email_routing", z.settings.email_routing, "接收邮件")) + dns) +
+      await ruleSection(z.id, "email") };
+  },
+  async analytics(z) {
+    const [a, ev] = await Promise.all([api("GET", `/zones/${z.id}/analytics`), api("GET", `/zones/${z.id}/security/events?limit=100`)]);
+    return { sub: "最近 24 小时，所有节点合计。", body:
+      `<div class="tiles">${tile("请求数", num(a.requests), "边缘收到的全部请求", "", "chart")}${tile("流量", bytes(a.bytes), "发给访客的响应体", "", "data")}${tile("缓存命中", num(a.cached), a.requests ? (a.cached / a.requests * 100).toFixed(1) + "% 的请求" : "还没有请求", "", "bolt")}${tile("已拦截", num(a.threats), "防火墙、限速与 WAF", "", "shield")}</div>
+      <div class="grid2">${card("状态码分布", "", `<div class="cb">${segBar([{ label: "2xx 成功", value: a.status_2xx, c: "--s1" }, { label: "3xx 跳转", value: a.status_3xx, c: "--s2" }, { label: "4xx 客户端错误", value: a.status_4xx, c: "--s3" }, { label: "5xx 服务端错误", value: a.status_5xx, c: "--s4" }], "状态码分布")}</div>`)}
+      ${card("协议分布", "", `<div class="cb">${segBar([{ label: "HTTP/1.1", value: a.http1, c: "--s1" }, { label: "HTTP/2", value: a.http2, c: "--s2" }, { label: "HTTP/3", value: a.http3, c: "--s3" }], "协议分布")}</div>`)}</div>` +
+      card(`最近的安全事件 <span class="cnt">${ev.length}</span>`, "", table([{ label: "时间", fmt: e => when(e.occurred_at) }, { label: "来源", fmt: e => esc(SRC[e.source] || e.source) },
+        { label: "动作", fmt: e => `<span class="tag ${TONE[e.action] || ""}">${esc(ACT[e.action] || e.action)}</span>` }, { k: "description", label: "规则" },
+        { label: "客户端", fmt: e => `<span class="mono">${esc(e.client_ip)}</span>` }, { label: "请求", fmt: e => `<span class="mono">${esc(e.method + " " + e.host + e.uri)}</span>` }], ev, null,
+        "<b>没有安全事件</b>被防火墙、限速或托管规则处理的请求会出现在这里。")) };
+  },
+  async manage(z) {
+    return { sub: "接入方式、暂停与删除。", body:
+      card("接入", "", setRow(`接入方式 ${modeTag(z)}`, z.type === "full" ? "完全托管：域名的 NS 指向本平台，全部 DNS 记录在这里管理。" : "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来。", btn("zoneKind", z.type === "full" ? "改为 CNAME 接入" : "改为完全托管 (NS)")) +
+        setRow(z.paused ? "恢复域名" : "暂停域名", z.paused ? "域名已暂停：已代理的记录直接解析到源站。" : "停止代理，已代理的记录直接解析到源站，不经过 CDN 与 WAF。", btn("zonePause", z.paused ? "恢复" : "暂停"))) +
+      card("删除", "", setRow("删除域名", "删除这个域名及其全部记录、规则和证书，无法恢复。", btn("zoneDel", "删除域名", {}, "outbad")), "danger") };
+  },
+};
+async function viewZone() {
+  const z = C.zone = await api("GET", "/zones/" + S.zone);
+  const nav = ZNAV.find(n => n[0] === S.tab) || ZNAV[0];
+  S.tab = nav[0];
+  const v = await ZONE[nav[0]](z);
+  return { ...v, title: nav[0] === "overview" ? `${esc(z.name)} ${stateTag(z)}` : nav[1] };
+}
+
+async function viewSteer() {
+  const [rules, nodes] = await Promise.all([api("GET", "/steering"), api("GET", "/nodes")]);
+  C.steer = rules.sort((a, b) => a.priority - b.priority);
+  C.nodes = nodes;
+  C.nodeNames = nodes.map(n => n.name);
+  const admin = me.role === "admin";
+  const cond = r => [r.countries.length && "国家 " + r.countries.join(" / "), (r.regions || []).length && "省市 " + r.regions.join(" / "), r.continents.length && "大洲 " + r.continents.map(c => CONT[c] || c).join(" / "), r.asns.length && (r.asns.length > 4 ? `AS${r.asns.slice(0, 3).join("、AS")} 等 ${r.asns.length} 个` : "AS" + r.asns.join("、AS")), r.as_orgs.length && "运营商含 " + r.as_orgs.join(" / ")].filter(Boolean);
+  const palette = admin && nodes.length
+    ? `<div class="board"><div class="hint" style="margin-bottom:8px">拖拽下方节点到任意“调度”规则的节点链里即可追加；在同一条规则内拖拽节点标签可调整主备顺序（自动保存）。</div><div class="palette">${
+        nodes.map(n => `<span class="npill ${!n.enabled ? "off" : ""}" draggable="true" data-drag-kind="steer-add" data-node-name="${esc(n.name)}"><i class="dot"></i>${esc(n.name)}<span class="meta">${esc((n.continents || []).join("/") || "兜底")}</span></span>`).join("")
+      }</div></div>` : "";
+  return { title: "调度与 DNS 屏蔽", sub: "按优先级从小到大匹配访客的国家、大洲、运营商（条件之间为“且”）。调度：解析到列表里第一个健康且未被限流分流的节点，其后的节点是故障或超量分流时的备选。屏蔽：拒绝为这类访客解析。", acts: btn("steerEdit", "添加规则", {}, "pri"), body:
+    (palette ? card("拖拽式节点调度栏", "", palette) : "") +
+    card(`规则 <span class="cnt">${C.steer.length}</span>`, "", table([
+      { k: "priority", label: "优先级", cls: "num" }, { label: "名称", fmt: r => `<b>${esc(r.name)}</b>` },
+      { label: "匹配", fmt: r => (cond(r).length ? chips(cond(r)) : '<span class="hint">所有访客</span>') },
+      { label: "动作", fmt: r => (r.action === "block" ? '<span class="tag bad">屏蔽解析</span>' :
+        `<span class="flow flow-drop" data-drop-kind="steer-rule" data-rule-id="${esc(r.id)}">${r.nodes.map((n, i) => `<span class="tag pri fchip" ${admin ? `draggable="true" data-drag-kind="steer-node" data-rule-id="${esc(r.id)}" data-idx="${i}" data-drop-kind="steer-node"` : ""}>${esc(n)}${admin && r.nodes.length > 1 ? `<button type="button" class="x" data-act="steerNodeRm" data-rule-id="${esc(r.id)}" data-idx="${i}" title="从本规则移除">×</button>` : ""}</span>`).join('<span class="arr">→</span>')}</span>`) },
+      { label: "状态", fmt: r => (r.enabled ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
+    ], C.steer, r => rowActs("steerEdit", "steerDel", { id: r.id }), `<b>还没有调度规则</b>访客目前只按节点负责的大洲分配。<br><br>${btn("steerEdit", "添加规则", {}, "pri")}`)) };
+}
+
+// -------------------------------------------- Workers, KV, D1 & Cron (R1) ----
+async function viewWorkers() {
+  if (S.view === "kv") WUI.tab = "kv";
+  else if (S.view === "d1") WUI.tab = "d1";
+
+  const tabsHtml = `<div class="tabs" role="tablist">
+    ${btn("wTab", "Workers 脚本", { tab: "scripts" }, "tab" + (WUI.tab === "scripts" ? " on" : ""))}
+    ${btn("wTab", "Workers KV", { tab: "kv" }, "tab" + (WUI.tab === "kv" ? " on" : ""))}
+    ${btn("wTab", "D1 数据库", { tab: "d1" }, "tab" + (WUI.tab === "d1" ? " on" : ""))}
+    ${btn("wTab", "Cron 定时触发", { tab: "cron" }, "tab" + (WUI.tab === "cron" ? " on" : ""))}
+  </div>`;
+
+  if (WUI.tab === "kv") {
+    const nss = await api("GET", "/kv/namespaces").catch(() => []);
+    C.kvNamespaces = Array.isArray(nss) ? nss : [];
+    if (!WUI.kvNs && C.kvNamespaces.length) WUI.kvNs = C.kvNamespaces[0].id;
+    let browserHtml = "";
+    if (WUI.kvNs && C.kvNamespaces.some(n => n.id === WUI.kvNs)) {
+      const prefix = F.kvPrefix || "";
+      const listRes = await api("GET", `/kv/namespaces/${encodeURIComponent(WUI.kvNs)}/keys?limit=200${prefix ? "&prefix=" + encodeURIComponent(prefix) : ""}`).catch(() => ({ keys: [] }));
+      const keys = Array.isArray(listRes) ? listRes : (listRes.keys || []);
+      C.kvKeys = keys;
+      const curNs = C.kvNamespaces.find(n => n.id === WUI.kvNs);
+      browserHtml = card(`KV 键值浏览器 · ${esc(curNs ? curNs.title : WUI.kvNs)} <span class="cnt">${keys.length}</span>`,
+        `<input type="search" placeholder="前缀过滤" id="kvPrefixInput" value="${esc(prefix)}" aria-label="前缀过滤">` + btn("kvPut", "写入 Key", { ns: WUI.kvNs }, "pri sm"),
+        table([
+          { label: "Key", fmt: k => `<b class="mono">${esc(k.name)}</b>` },
+          { label: "过期时间 (Epoch)", fmt: k => k.expiration ? `<span class="mono">${esc(k.expiration)}</span>` : '<span class="hint">永不过期</span>' },
+          { label: "Metadata", fmt: k => k.metadata ? `<code class="expr">${esc(JSON.stringify(k.metadata))}</code>` : '<span class="hint">—</span>' },
+        ], keys, k => lk("kvView", "查看/编辑", { ns: WUI.kvNs, key: k.name }) + lk("kvDel", "删除", { ns: WUI.kvNs, key: k.name }, "bad"),
+        "<b>当前命名空间暂无 Key</b>点击右上角“写入 Key”添加键值对。"));
+    }
+    return { title: "Workers KV", sub: "全局低延迟边缘键值存储，支持 TTL 与 JSON Metadata，并自动在 Peer 节点间同步。", acts: btn("kvNsAdd", "新建命名空间", {}, "pri"), body:
+      tabsHtml +
+      card(`KV 命名空间 <span class="cnt">${C.kvNamespaces.length}</span>`, "", table([
+        { label: "名称", fmt: n => `<a href="#" data-act="kvSelect" data-id="${esc(n.id)}"><b>${esc(n.title)}</b></a>${n.id === WUI.kvNs ? ' <span class="tag pri">当前</span>' : ""}` },
+        { label: "Namespace ID", fmt: n => `<code class="mono">${esc(n.id)}</code>` },
+      ], C.kvNamespaces, n => lk("kvSelect", "浏览", { id: n.id }) + lk("kvNsRename", "重命名", { id: n.id }) + lk("kvNsDel", "删除", { id: n.id, title: n.title }, "bad"),
+      `<b>还没有 KV 命名空间</b>点击右上角“新建命名空间”创建一个。`)) + browserHtml };
+  }
+
+  if (WUI.tab === "d1") {
+    const dbs = await api("GET", "/d1/database").catch(() => []);
+    C.d1Databases = Array.isArray(dbs) ? dbs : [];
+    if (WUI.d1Db && !C.d1Databases.some(d => (d.uuid || d.id) === WUI.d1Db)) { WUI.d1Db = ""; WUI.d1Res = null; }
+    if (!WUI.d1Db && C.d1Databases.length) WUI.d1Db = C.d1Databases[0].uuid || C.d1Databases[0].id;
+    let consoleHtml = "";
+    if (WUI.d1Db) {
+      const curDb = C.d1Databases.find(d => (d.uuid || d.id) === WUI.d1Db);
+      let resHtml = "";
+      if (WUI.d1Res) {
+        const rows = WUI.d1Res.results || [];
+        const cols = rows.length ? Object.keys(rows[0]).map(k => ({ label: k, fmt: r => show(r[k]) })) : [];
+        const durMs = WUI.d1Res.meta && WUI.d1Res.meta.duration !== undefined ? Number(WUI.d1Res.meta.duration).toFixed(2) + " ms" : "—";
+        resHtml = `<div style="margin-top:14px">
+          <div class="hint" style="margin-bottom:8px">耗时：${esc(durMs)} · 变更行：${esc(WUI.d1Res.meta && WUI.d1Res.meta.changes !== undefined ? WUI.d1Res.meta.changes : 0)} · 返回：${rows.length} 行</div>
+          ${rows.length ? table(cols, rows, null, "") : '<div class="note">语句执行成功，无返回行。</div>'}</div>`;
+      }
+      consoleHtml = card(`SQL 控制台 · ${esc(curDb ? curDb.name : WUI.d1Db)}`, btn("d1Run", "执行 SQL", { db: WUI.d1Db }, "pri sm"),
+        `<div class="cb"><label class="f"><span>SQL 语句（支持多条或单条查询）</span><textarea id="d1SqlBox" spellcheck="false">${esc(WUI.d1Sql)}</textarea></label>${resHtml}</div>`);
+    }
+    return { title: "D1 关系型数据库", sub: "基于内置 SQLite 的边缘关系型数据库，支持 Worker 绑定 env.<DB> 与 Peer 同步。", acts: btn("d1Add", "新建数据库", {}, "pri"), body:
+      tabsHtml +
+      card(`D1 数据库 <span class="cnt">${C.d1Databases.length}</span>`, "", table([
+        { label: "名称", fmt: d => `<a href="#" data-act="d1Select" data-id="${esc(d.uuid || d.id)}"><b>${esc(d.name)}</b></a>${(d.uuid || d.id) === WUI.d1Db ? ' <span class="tag pri">当前</span>' : ""}` },
+        { label: "Database ID", fmt: d => `<code class="mono">${esc(d.uuid || d.id)}</code>` },
+        { label: "创建时间", fmt: d => when(d.created_on || d.created_at) },
+      ], C.d1Databases, d => lk("d1Select", "控制台", { id: d.uuid || d.id }) + lk("d1Del", "删除", { id: d.uuid || d.id, name: d.name }, "bad"),
+      `<b>还没有 D1 数据库</b>点击右上角“新建数据库”创建一个。`)) + consoleHtml };
+  }
+
+  const ws = (await api("GET", "/workers/scripts")) || [];
+  if (WUI.tab === "cron") {
+    const withSettings = await Promise.all(ws.map(async w => {
+      const st = await api("GET", `/workers/scripts/${w.id}/settings`).catch(() => ({ crons: [] }));
+      return { ...w, crons: st.crons || [] };
+    }));
+    C.cronWorkers = withSettings;
+    return { title: "Workers Cron Triggers", sub: "5 段式 UTC Cron 定时触发器，调用 Worker 导出的 scheduled(controller, env, ctx)。", acts: btn("workerEdit", "新建脚本", {}, "pri"), body:
+      tabsHtml +
+      card(`定时触发器配置 <span class="cnt">${withSettings.length}</span>`, "", table([
+        { label: "Worker 脚本", fmt: w => `<b class="mono">${esc(w.id)}</b>` },
+        { label: "Cron 表达式 (UTC)", fmt: w => w.crons.length ? chips(w.crons, "blue") : '<span class="hint">未配置</span>' },
+      ], withSettings, w => lk("cronEdit", "配置 Cron", { name: w.id }) + lk("cronRun", "立即触发 (/__scheduled)", { name: w.id }),
+      "<b>还没有 Worker 脚本</b>请先创建一个 Worker 脚本。")) };
+  }
+
+  return { title: "Workers & 存储", sub: "在边缘节点运行的 JavaScript，支持 fetch / email / scheduled、KV、D1 与 WebCrypto。", acts: btn("workerEdit", "新建脚本", {}, "pri"), body:
+    tabsHtml +
+    card(`脚本 <span class="cnt">${ws.length}</span>`, "", table([{ label: "名称", fmt: w => `<b class="mono">${esc(w.id)}</b>` }, { label: "大小", fmt: w => bytes(w.size), cls: "num" }, { label: "更新时间", fmt: w => when(w.modified_on) }], ws,
+      w => lk("cronRun", "触发 Cron", { name: w.id }) + rowActs("workerEdit", "workerDel", { name: w.id }),
+      `<b>还没有脚本</b>写一个 fetch 处理函数，在边缘直接应答或改写请求。<br><br>${btn("workerEdit", "新建脚本", {}, "pri")}`)) };
+}
+
+// --------------------------------------------- Reverse Proxy (Caddy Repl.) ---
+async function viewProxy() {
+  let rules = [], apiMissing = false;
+  try {
+    const res = await api("GET", "/proxy/rules");
+    rules = Array.isArray(res) ? res : (res.rules || []);
+  } catch (e) {
+    if (/404|No route/i.test(e.message)) apiMissing = true;
+    else throw e;
+  }
+  C.proxyRules = rules;
+  const note = apiMissing
+    ? '<div class="note warn">当前后端节点尚未启用 <code>/client/v4/proxy/rules</code> 接口（M3）。界面已就绪，升级后端后即可实时管理本地反向代理规则与 Hysteria 2 回落。</div>'
+    : '<div class="note">原生 HTTP/1.1 · HTTP/2 · HTTP/3 反向代理（替代 Caddy），支持多上游负载、WebSocket / 流式透传及 Hysteria 2（18480/19480）伪装回落。</div>';
+  return {
+    title: "反向代理 (Caddy 替代)",
+    sub: "管理 LocalProxyRule：监听端口、域名/路径匹配、多上游协议（http / https / h2c / ws / wss）与 Hysteria 2 兜底回落。",
+    acts: btn("proxyEdit", "添加代理规则", {}, "pri"),
+    body: note + card(`代理规则 <span class="cnt">${rules.length}</span>`, "", table([
+      { label: "优先级", k: "priority", cls: "num" },
+      { label: "名称", fmt: r => `<b>${esc(r.name || r.id)}</b>${r.is_fallback ? ' <span class="tag warn">Hy2 回落</span>' : ""}` },
+      { label: "监听端口", fmt: r => r.listen_port ? `<code class="mono">:${esc(r.listen_port)}</code>` : '<span class="hint">全部</span>' },
+      { label: "域名 / 路径", fmt: r => `<div>${(r.hosts && r.hosts.length) ? chips(r.hosts) : '<span class="hint">*</span>'}</div><span class="sub mono">${esc(r.path_prefix || "/")}${r.exact_path ? " (精确)" : ""}</span>` },
+      { label: "上游目标", fmt: r => (r.upstreams || []).map(u => `<code class="mono">${esc(u.url || u)}</code>`).join(" ") || '<span class="hint">—</span>' },
+      { label: "状态", fmt: r => (r.enabled !== false ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
+    ], rules, r => rowActs("proxyEdit", "proxyDel", { id: r.id }), `<b>还没有本地反向代理规则</b>点击右上角“添加代理规则”替代 Caddy vhost 或配置 Hysteria 2 伪装回落。`)),
+  };
+}
+
+// ------------------------------------------------- OAuth / SSO (auth.*) ----
+async function viewOauth() {
+  let clients = [], providers = [], cfg = {}, apiMissing = false;
+  try {
+    const [cRes, pRes, cfgRes] = await Promise.all([
+      api("GET", "/oauth/clients").catch(e => { if (/404|No route/i.test(e.message)) { apiMissing = true; return []; } throw e; }),
+      api("GET", "/oauth/providers").catch(() => []),
+      api("GET", "/oauth/config").catch(() => ({})),
+    ]);
+    clients = Array.isArray(cRes) ? cRes : [];
+    providers = Array.isArray(pRes) ? pRes : [];
+    cfg = cfgRes || {};
+  } catch (e) { throw e; }
+  C.oauthClients = clients;
+  C.oauthProviders = providers;
+  C.oauthConfig = cfg;
+  const infoCard = card("面板 SSO 配置 (/client/v4/oauth/config)", btn("oauthConfigEdit", "编辑面板 SSO", {}, "sm"), `<div class="cb"><dl class="kv">
+    <dt>SSO 状态</dt><dd>${cfg.enabled ? '<span class="st ok">已启用</span>' : '<span class="st">未启用</span>'}</dd>
+    <dt>Issuer URL</dt><dd><code class="mono">${esc(cfg.issuer_url || "未配置")}</code></dd>
+    <dt>Client ID</dt><dd><code class="mono">${esc(cfg.client_id || "未配置")}</code></dd>
+    <dt>自动创建账户</dt><dd>${cfg.auto_provision ? `是（默认角色：${esc(cfg.default_role || "viewer")}）` : "否（仅限已有账户）"}</dd>
+    <dt>面板 SSO 登录</dt><dd><code class="mono">/client/v4/auth/oauth/login</code>（PKCE S256 + 跨节点无状态 Cookie）</dd>
+  </dl></div>`);
+  const warn = apiMissing ? '<div class="note warn">当前后端节点尚未启用 <code>/client/v4/oauth/*</code> 管理接口（M4）。请确认已部署 <code>auth.fucloudflare.com</code> Worker 路由。</div>' : "";
+  return {
+    title: "OAuth 2.0 / SSO",
+    sub: "管理 auth.fucloudflare.com 的 OAuth 2.0 客户端应用与第三方身份源（Passkey、Linux.do Connect 等）。",
+    acts: btn("oauthClientEdit", "添加 OAuth 客户端", {}, "pri"),
+    body: warn + infoCard +
+      card(`OAuth 客户端 <span class="cnt">${clients.length}</span>`, "", table([
+        { label: "名称", fmt: c => `<b>${esc(c.name || c.client_id)}</b>` },
+        { label: "Client ID", fmt: c => `<code class="mono">${esc(c.client_id || c.id)}</code>` },
+        { label: "回调地址 (Redirect URIs)", fmt: c => chips(c.redirect_uris || []) },
+        { label: "Scopes", fmt: c => chips(c.scopes || ["openid", "profile", "email"], "blue") },
+      ], clients, c => rowActs("oauthClientEdit", "oauthClientDel", { id: c.id || c.client_id }), "<b>还没有 OAuth 客户端</b>点击右上角添加一个应用客户端。")) +
+      card(`外部身份源 (Providers) <span class="cnt">${providers.length}</span>`, btn("oauthProvEdit", "添加身份源", {}, "sm"), table([
+        { label: "标识", fmt: p => `<b class="mono">${esc(p.id || p.name)}</b>` },
+        { label: "显示名称", k: "display_name" },
+        { label: "Authorize URL", fmt: p => `<code class="expr">${esc(p.authorize_url)}</code>` },
+        { label: "状态", fmt: p => (p.enabled !== false ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
+      ], providers, p => rowActs("oauthProvEdit", "oauthProvDel", { id: p.id }), "<b>还没有配置第三方 OAuth 提供商</b>支持 Linux.do Connect、GitHub 及自定义 OIDC。")),
+  };
+}
+
+// -------------------------------------------------------------- sign in ----
+async function open(path, body) {
+  const r = await fetch("/client/v4" + path, { method: body === undefined ? "GET" : "POST", headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const d = await r.json();
+  if (!d.success) throw Object.assign(new Error(AUTH_TEXT[d.errors[0].code] || d.errors[0].message), { code: d.errors[0].code, detail: d.errors[0].message });
+  return d.result;
+}
+const AUTH_TEXT = { 2001: "邮箱或密码不对", 2003: "验证码不对（每个只能用一次）", 2004: "超时了，请重新登录", 2005: "这个账户已被停用", 2015: "API 令牌不对", 2013: "面板已经初始化过了，请直接登录" };
+const PW_TEXT = m => (/at least 8/.test(m) ? "密码至少 8 位" : /must not be the e-mail/.test(m) ? "密码不能和邮箱一样" : /not an e-mail/.test(m) ? "邮箱格式不对" : /old one/.test(m) ? "新密码不能和旧密码一样" : /current password/.test(m) ? "当前密码不对" : m);
+async function renderAuth(app) {
+  if (!AUTH.status) {
+    try { AUTH.status = await open("/auth/status"); } catch (e) { AUTH.status = { initialized: true }; loginError = "连不上管理 API：" + e.message; }
+    if (!AUTH.status.initialized && AUTH.step === "start") AUTH.step = "setup";
+  }
+  const theme = getThemePref();
+  const topBrand = `<div class="login-brand"><div class="brand">${MARK}<span>fucloudflare</span></div>${btn("theme", `${IC[THEME_IC[theme]]}<span>${THEME_TEXT[theme]}</span>`, {}, "ghost sm", 'data-mode-toggle aria-label="切换主题"')}</div>`;
+  const err = loginError ? `<p class="ferr" role="alert">${esc(loginError)}</p>` : "";
+  const I = (k, label, type, auto, extra = "") => `<label class="f"><span>${label}</span><input type="${type}" name="${k}" autocomplete="${auto}" ${extra} required></label>`;
+  let form;
+  if (AUTH.step === "setup") form = `<h1>初始化控制面板</h1><p class="sub">创建第一个管理员账户。需要本节点的 API 令牌，证明你是这台机器的主人。</p>
+    <form id="af">${I("email", "邮箱", "email", "username", "autofocus")}${I("password", "密码（至少 8 位）", "password", "new-password")}${I("again", "再输一遍密码", "password", "new-password")}${I("token", "API 令牌", "password", "off")}
+    ${err}<button class="pri">创建并登录</button></form>
+    <p class="hint" style="margin-top:10px">令牌来自启动参数 <code>--api-token</code>，或数据目录下的 <code>api_token</code> 文件。</p><div class="alt"><a data-auth="token">只用 API 令牌登录</a></div>`;
+  else if (AUTH.step === "second") form = `<h1>两步验证</h1><p class="sub">${AUTH.backup ? "输入一个备用验证码。每个只能用一次，用掉就失效。" : "输入验证器 App 里的 6 位验证码。"}</p>
+    <form id="af">${AUTH.backup ? I("backup_code", "备用验证码", "text", "off", 'autofocus placeholder="xxxxx-xxxxx"') : I("code", "验证码", "text", "one-time-code", 'autofocus inputmode="numeric" maxlength="7" placeholder="123456"')}
+    ${err}<button class="pri">验证</button></form>
+    <div class="alt">${AUTH.methods.includes("passkey") && canPasskey() ? '<button type="button" data-auth="second-passkey">改用通行密钥</button>' : ""}
+      <a data-auth="toggle-backup">${AUTH.backup ? "改用验证器 App 的验证码" : "手机不在身边？用备用验证码"}</a><a data-auth="restart">返回重新登录</a></div>`;
+  else if (AUTH.step === "token") form = `<h1>用 API 令牌登录</h1><p class="sub">给运维脚本和应急用：令牌拥有全部权限，不走两步验证。</p>
+    <form id="af">${I("t", "API 令牌", "password", "off", "autofocus")}${err}<button class="pri">登录</button></form>
+    <div class="alt"><a data-auth="restart">返回账户登录</a></div>`;
+  else form = `<h1>登录 fucloudflare</h1><p class="sub">使用邮箱密码、通行密钥或 auth.fucloudflare.com 单点登录。</p>
+    <form id="af">${I("email", "邮箱", "email", "username", "autofocus")}${I("password", "密码", "password", "current-password")}${err}<button class="pri">登录</button></form>
+    <div class="divider">或</div>
+    <a class="btn oauth-btn" href="/client/v4/auth/oauth/login">${IC.key}<span>使用 auth.fucloudflare.com 登录 (OAuth)</span></a>
+    <div class="alt">${canPasskey() ? '<button type="button" data-auth="passkey">用通行密钥登录</button>' : ""}<a data-auth="token">用 API 令牌登录</a>${AUTH.status.initialized ? "" : '<a data-auth="setup">初始化面板</a>'}</div>`;
+  app.innerHTML = `<div class="login"><div class="login-card">${topBrand}${form}</div></div>`;
+  const fail = e => { loginError = e.message; if (e.code === 2004) AUTH = { step: "start", status: AUTH.status }; render(); };
+  const second = body => open("/auth/second_step", { ticket: AUTH.ticket, ...body }).then(signIn, fail);
+  app.querySelector("#af").onsubmit = e => {
+    e.preventDefault();
+    const v = Object.fromEntries(new FormData(e.target));
+    loginError = "";
+    if (AUTH.step === "token") return signIn({ token: v.t.trim() });
+    if (AUTH.step === "second") return second(AUTH.backup ? { backup_code: v.backup_code } : { code: v.code });
+    if (AUTH.step === "setup") {
+      if (v.password !== v.again) return fail(new Error("两次输入的密码不一样"));
+      return open("/auth/setup", { token: v.token, email: v.email, password: v.password }).then(signIn, e => fail(e.code === 2009 || e.code === 2011 ? new Error(PW_TEXT(e.detail)) : e));
+    }
+    e.target.querySelector("button").disabled = true;
+    open("/auth/login", { email: v.email, password: v.password }).then(r => {
+      if (r.token) return signIn(r);
+      AUTH = { step: "second", status: AUTH.status, ticket: r.second_step.ticket, methods: r.second_step.methods, backup: false };
+      render();
+    }, e => fail(e.code === 2002 ? new Error("错误次数太多，账户暂时锁定，" + (e.detail.match(/\d+/) || ["稍"])[0] + " 秒后再试") : e));
+  };
+  app.querySelectorAll("[data-auth]").forEach(el => el.onclick = () => {
+    loginError = "";
+    const a = el.dataset.auth;
+    if (a === "passkey") return open("/auth/passkey/begin", {}).then(r => passkeyAssert(r.challenge, true)).then(x => open("/auth/passkey/finish", x)).then(signIn, fail);
+    if (a === "second-passkey") return passkeyAssert(AUTH.ticket, false).then(x => second({ passkey: x }), fail);
+    if (a === "toggle-backup") AUTH.backup = !AUTH.backup;
+    else AUTH = { step: a === "restart" ? "start" : a, status: AUTH.status };
+    render();
+  });
+}
+function mustChange() {
+  setTimeout(() => {
+    const f = document.getElementById("mc");
+    if (f) f.onsubmit = e => {
+      e.preventDefault();
+      const v = Object.fromEntries(new FormData(f)), err = f.querySelector(".ferr");
+      if (v.new !== v.again) { err.textContent = "两次输入的新密码不一样"; return; }
+      api("POST", "/account/password", { current: v.current, new: v.new }).then(() => { toast("密码已修改"); render(); }, e => { err.textContent = PW_TEXT(e.message); });
+    };
+  });
+  return `<div class="login"><div class="login-card"><div class="login-brand"><div class="brand">${MARK}<span>fucloudflare</span></div></div>
+    <h1>修改初始密码</h1><p class="sub">${esc(me.email)} 现在用的是系统生成的密码，改成只有你知道的才能继续。</p>
+    <form id="mc"><label class="f"><span>当前密码</span><input type="password" name="current" autocomplete="current-password" autofocus required></label>
+    <label class="f"><span>新密码（至少 8 位）</span><input type="password" name="new" autocomplete="new-password" required></label>
+    <label class="f"><span>再输一遍新密码</span><input type="password" name="again" autocomplete="new-password" required></label>
+    <p class="ferr" role="alert"></p><button class="pri">修改并继续</button></form><div class="alt"><a data-act="logout">退出</a></div></div></div>`;
+}
+
+// ------------------------------------------------------- account, users ----
+const ROLE = { admin: "管理员", editor: "编辑", viewer: "只读" };
+const METHOD = { password: "密码", "password+totp": "密码 + 验证码", "password+backup_code": "密码 + 备用验证码", "password+passkey": "密码 + 通行密钥", passkey: "通行密钥", oauth: "OAuth SSO" };
+const agentName = ua => {
+  const b = /Edg\//.test(ua) ? "Edge" : /Chrome\//.test(ua) ? "Chrome" : /Firefox\//.test(ua) ? "Firefox" : /Safari\//.test(ua) ? "Safari" : ua.split("/")[0] || "未知";
+  const o = /Windows/.test(ua) ? "Windows" : /Android/.test(ua) ? "Android" : /iPhone|iPad/.test(ua) ? "iOS" : /Mac OS/.test(ua) ? "macOS" : /Linux/.test(ua) ? "Linux" : "";
+  return o ? `${b} · ${o}` : b;
+};
+const codesHtml = codes => `<p>下面 10 个备用验证码<b>只显示这一次</b>，请抄下来或存进密码管理器。登录时拿不到验证码，就用其中一个代替；每个只能用一次。</p>
+  <div class="codes">${codes.map(c => `<span>${esc(c)}</span>`).join("")}</div><button type="button" data-copy="${esc(codes.join("\n"))}">复制全部</button>`;
+async function viewAccount() {
+  if (me.api_token) return { title: "账户与安全", sub: "当前是用 API 令牌登录的。", body: `<div class="note warn">API 令牌不是账户：没有密码、两步验证和通行密钥。${me.initialized ? "要管理自己的账户，请退出后用邮箱登录。" : "面板还没有账户，退出后可以初始化第一个管理员。"}</div>` };
+  const a = C.me = await api("GET", "/account");
+  const keys = a.passkey_list, ses = a.sessions;
+  return { title: "账户与安全", sub: `${esc(a.email)} · ${ROLE[a.role]}`, body:
+    `<div class="grid2">` +
+    card("密码", btn("pwChange", "修改密码", {}, ""), `<dl class="kv pad"><dt>上次登录</dt><dd>${when(a.last_login_on)}</dd><dt>账户创建</dt><dd>${when(a.created_on)}</dd></dl>
+      <p class="hint pad">修改密码后，其他设备上的登录会全部失效。</p>`) +
+    card("两步验证", a.two_factor ? btn("tfaOff", "关闭", {}, "danger") : btn("tfaOn", "开启", {}, "pri"), `<dl class="kv pad"><dt>状态</dt><dd>${a.two_factor ? '<span class="st ok">已开启</span>（验证器 App，TOTP）' : '<span class="st">未开启</span>'}</dd>
+      <dt>备用验证码</dt><dd>${a.two_factor ? `还剩 <b>${a.backup_codes_left}</b> / 10 个 ${btn("codesNew", "重新生成", {}, "lk")}` : '<span class="hint">开启两步验证后才有</span>'}</dd></dl>
+      <p class="hint pad">开启后，登录除了密码还要验证器 App 里的 6 位验证码。</p>`) + "</div>" +
+    card(`通行密钥 <span class="cnt">${keys.length}</span>`, btn("pkAdd", "添加通行密钥", {}, "pri"), table([
+      { label: "名称", fmt: k => `<b>${esc(k.name)}</b>` }, { label: "算法", fmt: k => ({ "-7": "ES256", "-8": "EdDSA", "-257": "RS256" }[k.alg] || esc(k.alg)) },
+      { label: "添加时间", fmt: k => when(k.created_on) }, { label: "上次使用", fmt: k => (k.last_used_on ? when(k.last_used_on) : '<span class="hint">还没用过</span>') },
+    ], keys, k => lk("pkDel", "删除", { id: k.id, name: k.name }, "bad"), "<b>还没有通行密钥</b>用指纹、面容、设备 PIN 或安全密钥登录。" + (canPasskey() ? "" : "<br>（当前访问方式不支持：需要用 HTTPS 域名打开面板）"))) +
+    card(`登录会话 <span class="cnt">${ses.length}</span>`, "", table([
+      { label: "设备", fmt: s => `<span title="${esc(s.agent)}">${esc(agentName(s.agent))}</span>${s.current ? ' <span class="tag ok">当前</span>' : ""}` }, { label: "IP", fmt: s => `<span class="mono">${esc(s.ip)}</span>` },
+      { label: "登录方式", fmt: s => METHOD[s.method] || esc(s.method) }, { label: "登录时间", fmt: s => when(s.created_on) }, { label: "最近活动", fmt: s => when(s.last_seen_on) },
+    ], ses, s => (s.current ? "" : lk("sesDel", "下线", { id: s.id }, "bad")), "")) };
+}
+const AUDIT = { "user.create": "创建用户", "user.update": "修改用户", "user.delete": "删除用户", login: "登录", "login.failed": "登录失败", "password.change": "修改密码", "two_factor.enable": "开启两步验证", "two_factor.disable": "关闭两步验证",
+  "backup_codes.regenerate": "重新生成备用验证码", "passkey.add": "添加通行密钥", "passkey.remove": "删除通行密钥", "node.action": "节点操作" };
+async function viewUsers() {
+  const [users, audit] = await Promise.all([api("GET", "/users"), api("GET", "/audit")]);
+  C.users = users;
+  return { title: "用户与审计", sub: "谁能登录这个面板、各自能做什么。管理员：全部；编辑：域名、记录、规则、Workers 等配置；只读：只能看。", acts: btn("userAdd", "添加用户", {}, "pri"), body:
+    card(`用户 <span class="cnt">${users.length}</span>`, "", table([
+      { label: "邮箱", fmt: u => `<b>${esc(u.email)}</b>${u.id === me.id ? ' <span class="tag">我</span>' : ""}` }, { label: "角色", fmt: u => `<span class="tag ${u.role === "admin" ? "pri" : ""}">${ROLE[u.role]}</span>` },
+      { label: "两步验证", fmt: u => (u.two_factor ? '<span class="st ok">已开启</span>' : '<span class="st">未开启</span>') }, { label: "通行密钥", fmt: u => u.passkeys || '<span class="hint">—</span>', cls: "num" },
+      { label: "状态", fmt: u => (u.disabled ? '<span class="st bad">已停用</span>' : u.locked ? '<span class="st bad">暂时锁定</span>' : u.must_change_password ? '<span class="st">待改初始密码</span>' : '<span class="st ok">正常</span>') },
+      { label: "上次登录", fmt: u => (u.last_login_on ? when(u.last_login_on) : '<span class="hint">从未</span>') },
+    ], users, u => lk("userEdit", "编辑", { id: u.id }) + lk("userReset", "重置密码", { id: u.id }) + (u.two_factor || u.passkeys ? lk("userTfa", "清除两步验证", { id: u.id }) : "") + (u.id === me.id ? "" : lk("userDel", "删除", { id: u.id }, "bad")), "")) +
+    card(`审计记录 <span class="cnt">${audit.length}</span>`, audit.length ? `<input type="search" placeholder="搜索" data-filter="audit" value="${esc(F.audit || "")}" aria-label="搜索审计记录">` : "", table([
+      { label: "时间", fmt: e => when(e.at) }, { label: "谁", fmt: e => esc(e.actor) }, { label: "做了什么", fmt: e => `<span class="tag ${e.action === "login.failed" ? "bad" : ""}">${AUDIT[e.action] || esc(e.action)}</span>` },
+      { label: "详情", fmt: e => esc(e.detail) }, { label: "IP", fmt: e => `<span class="mono">${esc(e.ip)}</span>` },
+    ], audit, null, "还没有记录", "audit")) };
+}
+
+// ---------------------------------------------------------------- fleet ----
+const PHASE = { idle: "空闲", starting: "主节点刚启动，等副本报到", rolling: "滚动中", updating_primary: "主节点更新中", done: "已完成", rolling_back: "失败，回退中", reverting_primary: "失败，主节点回退中", failed: "已失败并回退" };
+const LIMIT = { ok: "正常", dns_limited: "二档分流/摘除", throttled: "限速中", limited: "已停止服务" };
+const NEARBY = { AS: "OC → EU → NA", OC: "AS → NA → EU", EU: "AF → NA → AS", NA: "SA → EU → OC", SA: "NA → EU → AF", AF: "EU → AS → SA" };
+async function viewFleet() {
+  const f = C.fleet = await api("GET", "/fleet");
+  C.nodes = f.nodes.map(n => n.configured).filter(Boolean);
+  const rel = f.release, tgt = rel.target, admin = me.role === "admin";
+  const short = x => (x ? `<span class="mono" title="${esc(x)}">${esc(String(x).slice(0, 12))}</span>` : '<span class="hint">未上报</span>');
+  const versions = [...new Set(f.nodes.map(n => n.exe).filter(Boolean))];
+  const pillCls = n => {
+    const c = n.configured, u = n.traffic || {};
+    if (c && !c.enabled) return "off";
+    if (!n.online || !n.healthy || u.state === "limited") return "bad";
+    if (u.state && u.state !== "ok") return "warn";
+    return "";
+  };
+  const pillMeta = n => {
+    const c = n.configured, u = n.traffic || {};
+    const parts = [];
+    if (u.used_bytes !== undefined) parts.push(bytes(u.used_bytes));
+    if (u.offload_pct > 0 && u.offload_pct < 100) parts.push(`分流 ${u.offload_pct}%`);
+    else if (u.state === "limited") parts.push("509停服");
+    if (c && c.dns_silent_on_limit && u.state && u.state !== "ok") parts.push("53静默");
+    return parts.join(" · ");
+  };
+  const boardBody = (() => {
+    const cfgNodes = f.nodes.filter(n => n.configured);
+    if (!cfgNodes.length) return '<div class="empty">还没有已登记的边缘节点，点击右上角“添加节点”开始配置。</div>';
+    const palette = cfgNodes.map(n => {
+      const c = n.configured;
+      return `<span class="npill ${pillCls(n)}" ${admin ? `draggable="true" data-drag-kind="fleet-node" data-node-id="${esc(c.id)}"` : ""} title="${esc(n.name)}（可拖拽到下方大洲）"><i class="dot"></i>${esc(n.name)}<span class="meta">${esc(pillMeta(n) || "正常")}</span>${admin ? `<button type="button" class="x" data-act="nodeEdit" data-id="${esc(c.id)}" title="编辑限流与调度">⚙</button>` : ""}</span>`;
+    }).join("");
+    const lanes = ["AS", "OC", "NA", "EU", "AF", "SA"].map(code => {
+      const members = cfgNodes.filter(n => (n.configured.continents || []).includes(code));
+      const chipsHtml = members.length ? members.map(n => {
+        const c = n.configured;
+        return `<span class="npill ${pillCls(n)}" ${admin ? `draggable="true" data-drag-kind="fleet-node" data-node-id="${esc(c.id)}"` : ""}><i class="dot"></i>${esc(n.name)}<span class="meta">${esc(pillMeta(n))}</span>${admin ? `<button type="button" class="x" data-act="nodeContRm" data-id="${esc(c.id)}" data-cont="${code}" title="从此大洲移除">×</button>` : ""}</span>`;
+      }).join("") : '<span class="hint">拖节点到这里</span>';
+      return `<div class="lane" data-drop-kind="fleet-cont" data-cont="${code}"><div class="lane-hd"><span>${esc(CONT[code] || code)}（${code}）</span><span class="fb" title="超量分流时按此顺序回退">回退: ${NEARBY[code] || "全局"}</span></div><div class="lane-body">${chipsHtml}</div></div>`;
+    }).join("");
+    return `<div class="board"><div class="hint" style="margin-bottom:8px">${admin ? "拖拽节点胶囊到下方大洲区域即可分配调度范围；点击 × 移除大洲，点击 ⚙ 快速调整三档流量限流与 53 端口静默策略。" : "当前各节点的大洲调度与限流拓扑（管理员可拖拽编辑）。"}</div><div class="palette">${palette}</div><div class="lanes">${lanes}</div></div>`;
+  })();
+  const nodeCard = n => {
+    const s = n.status || {}, c = n.configured, u = n.traffic || {}, cap = c && (c.traffic_limit_gb || c.traffic_throttle_gb || c.traffic_dns_gb), r = s.releases;
+    const off = c && !c.enabled;
+    const state = off ? '<span class="st">已停用</span>' : !n.online ? '<span class="st bad">离线</span>' : !n.healthy ? '<span class="st bad">探测不可达</span>' : !n.in_sync ? '<span class="st">配置同步中</span>' : '<span class="st ok">在线</span>';
+    const tiers = c ? [
+      c.traffic_dns_gb && (c.dns_offload_mode === "linear" ? `二档概率分流 ${c.traffic_dns_gb}→${c.traffic_limit_gb} GB` : `摘除 DNS ${c.traffic_dns_gb} GB`),
+      c.dns_silent_on_limit && "超一档 53 端口静默",
+      c.traffic_throttle_gb && `限速 ${c.traffic_throttle_gb} GB（${c.rate_limit_mbps} Mbps）`,
+      !c.traffic_throttle_gb && c.rate_limit_mbps && `常驻限速 ${c.rate_limit_mbps} Mbps`,
+      c.traffic_limit_gb && `三档停服 ${c.traffic_limit_gb} GB`,
+    ].filter(Boolean) : [];
+    const period = c ? (c.traffic_period === "day" ? "按日（UTC）" : `按月（每月 ${c.traffic_reset_day || 1} 日 UTC 重置）`) : "";
+    const limitTag = u.state && u.state !== "ok"
+      ? ` <span class="tag ${u.state === "limited" ? "bad" : "warn"}">${LIMIT[u.state] || u.state}${u.offload_pct > 0 && u.offload_pct < 100 ? ` · 分流 ${u.offload_pct}%` : ""}${c && c.dns_silent_on_limit ? " · 53静默" : ""}</span>`
+      : ' <span class="tag ok">正常</span>';
+    const rows = [
+      ["角色", (n.role === "accelerate" ? '<span class="tag warn">加速节点 (accelerate)</span>' : '<span class="tag pri">对等节点 (peer)</span>') + (n.self ? ' <span class="tag ok">本机</span>' : "")],
+      ["地址", c ? `<span class="mono">${esc([c.ipv4, c.ipv6].filter(Boolean).join("　"))}</span>` : '<span class="hint">未登记为边缘节点</span>'],
+      ["负责大洲", c ? (c.continents.length ? chips(c.continents.map(x => CONT[x] || x)) : '<span class="hint">仅作兜底</span>') + (c.enabled ? "" : ' <span class="tag bad">已停用</span>') : "—"],
+      ["分档限流", c ? (tiers.length ? `${chips(tiers)}<span class="hint">　${period}</span>` : '<span class="hint">未设置</span>') : "—"],
+      ["本周期流量", u.used_bytes !== undefined ? (cap ? meter(u.used_bytes, cap * 1e9) : bytes(u.used_bytes) + '<span class="hint">　未设上限</span>') + limitTag : "—"],
+      ["程序版本", `${esc(n.build || "?")} · ${short(n.exe)}${versions.length > 1 && n.exe ? ` <span class="tag warn">机群里有 ${versions.length} 个版本</span>` : ""}`],
+      ["配置同步 (HLC)", `${short(n.config_version)} ${n.in_sync ? '<span class="tag ok">已同步</span>' : '<span class="tag warn">落后</span>'}`],
+      ["运行时长", s.uptime_seconds !== undefined ? `${dur(s.uptime_seconds)}<span class="hint">　启动于 ${when(s.started_at)}</span>` : '<span class="hint">未上报</span>'],
+      ["进程 / 主机内存", `${s.memory_bytes ? bytes(s.memory_bytes) : "—"} / ${s.host_memory_bytes ? bytes(s.host_memory_bytes) : "—"}`],
+      ["负载", s.load && s.load.length ? `${s.load.map(x => x.toFixed(2)).join(" / ")}<span class="hint">　${s.cpus} 核</span>` : "—"],
+      ["边缘缓存", s.cache ? `${num(s.cache.objects)} 个对象 · ` + meter(s.cache.bytes, s.cache.max_bytes) : "—"],
+      ["大陆连通", (() => {
+        const g = s.gfw;
+        if (!g || (g.v4_tcp == null && g.v4_udp == null && g.v6_tcp == null && g.v6_udp == null)) return '<span class="hint">待探测</span>';
+        const pill = (lbl, v) => v == null ? "" : `<span class="tag ${v ? "ok" : "bad"}">${lbl}${v ? "✓" : "✗"}</span>`;
+        return [pill("v4T ", g.v4_tcp), pill("v4U ", g.v4_udp), pill("v6T ", g.v6_tcp), pill("v6U ", g.v6_udp)].filter(Boolean).join(" ");
+      })()],
+    ];
+    const acts = [];
+    if (admin && n.online) { acts.push(lk("nodeAct", "重启 fucf", { node: n.name, action: "restart" }), lk("nodeAct", "清空缓存", { node: n.name, action: "purge_cache" })); }
+    if (admin && c) { acts.push(lk("nodeEdit", "调度与流量设置", { id: c.id }), lk("nodeDel", "删除节点", { id: c.id }, "bad")); }
+    else if (admin && !c) { acts.push(lk("nodeEdit", "登记为边缘节点", { name: n.name })); }
+    return `<article class="card node"><header><i class="ni">${IC.server}</i><h3>${esc(n.name)}</h3>${state}</header>
+      <dl class="kv">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+      ${acts.length ? `<div class="acts2">${acts.join("")}</div>` : ""}</article>`;
+  };
+  const ph = rel.rollout || { phase: "idle" };
+  const relBody = !rel.enabled ? `<div class="empty"><b>本节点没有配置发布公钥</b>配置 <code>--release-key</code> 后，机群才能滚动发布新版本并在失败时自动回退。</div>`
+    : `<dl class="kv pad"><dt>当前发布</dt><dd>${tgt ? `${short(tgt.sha256)}<span class="hint">　${bytes(tgt.size)}，提交于 ${when(tgt.submitted_at)}</span>` : '<span class="hint">没有：各节点运行的是手动安装的版本</span>'}</dd>
+      <dt>进度</dt><dd>${tgt ? `<span class="tag ${ph.phase === "done" ? "ok" : /fail|back|revert/.test(ph.phase) ? "bad" : "warn"}">${PHASE[ph.phase] || esc(ph.phase)}</span>${ph.node ? `　节点 <b>${esc(ph.node)}</b>` : ""}` : "—"}</dd>
+      <dt>试运行期</dt><dd>${rel.trial_seconds} 秒</dd></dl>`;
+  return { title: "机群与节点", sub: `${f.nodes.length} 个节点 · 本机 ${esc(f.node)}（${f.role === "accelerate" ? "加速节点 accelerate" : "对等节点 peer"}）· HLC 配置摘要 ${esc(String(f.config_version).slice(0, 8))} · dashboard.fucloudflare.com 多节点对等托管。`,
+    acts: (admin ? btn("nodeEdit", "添加节点", {}, "pri") : "") + btn("retry", "刷新", {}, ""), body:
+    `<div class="tiles">${tile("在线节点", `${f.nodes.filter(n => n.online).length} / ${f.nodes.length}`, "", "", "server")}${tile("Peer / Accel", `${f.nodes.filter(n => n.role !== "accelerate").length} / ${f.nodes.filter(n => n.role === "accelerate").length}`, "对等写节点 / 只读加速节点", "", "network")}${
+      tile("配置同步", f.nodes.every(n => n.in_sync) ? "全部同步" : `${f.nodes.filter(n => !n.in_sync).length} 个落后`, "HLC/LWW 双向同步", "", "bolt")}${tile("滚动发布", tgt ? PHASE[ph.phase] || ph.phase : "无", tgt ? tgt.sha256.slice(0, 12) : "", "", "code")}</div>` +
+    card("节点调度与限流画布", admin ? `<a class="btn sm" href="#/steering">编辑精细调度规则</a>` : "", boardBody) +
+    `<div class="nodes">${f.nodes.map(nodeCard).join("")}</div>` +
+    card("版本与滚动发布", admin && rel.enabled && f.role !== "accelerate" ? btn("relNew", "发布新版本", {}, "pri sm") + (tgt ? btn("relWithdraw", "撤回并回退", { sha: tgt.sha256 }, "danger sm") + btn("relForget", "仅忘掉这次发布", { sha: tgt.sha256 }, "sm") : "") : "", relBody) };
+}
+
+// ---------------------------------------------------------------- shell ----
+const NAV = [
+  ["overview", "总览面板", "grid"],
+  ["zones", "域名列表", "globe"],
+  ["fleet", "机群与节点", "server"],
+  ["steering", "调度与 DNS 屏蔽", "route"],
+  ["workers", "Workers & 存储", "code"],
+  ["proxy", "反向代理 (Caddy)", "proxy"],
+  ["oauth", "OAuth / SSO", "key"],
+  ["account", "账户与安全", "lock"],
+  ["users", "用户与审计", "shield", "admin"],
+];
+const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, oauth: viewOauth, fleet: viewFleet, account: viewAccount, users: viewUsers };
+function parseHash() {
+  const p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  if (p[0] === "zone" && p[1]) return { view: "zone", zone: p[1], tab: p[2] || "overview" };
+  if (p[0] === "nodes") return { view: "fleet" };
+  if (p[0] === "kv") return { view: "kv" };
+  if (p[0] === "d1") return { view: "d1" };
+  return { view: NAV.some(n => n[0] === p[0]) ? p[0] : "overview" };
+}
+const go = h => { if (location.hash === h) render(); else location.hash = h; };
+function shell(v) {
+  const z = S.view === "zone" && C.zone && C.zone.id === S.zone ? C.zone : null;
+  const collapsed = localStorage.getItem("cf_sidebar_collapsed") === "1";
+  const activeView = (S.view === "kv" || S.view === "d1") ? "workers" : S.view;
+  const side = z
+    ? `<a class="sb-back" href="#/zones" title="账户主页">${IC.back}<span class="nv-lbl">账户主页</span></a><div class="sb-zn"><b>${esc(z.name)}</b><span>${z.type === "full" ? "完全托管" : "CNAME 接入"}${z.paused ? " · 已暂停" : ""}</span></div>` +
+      ZNAV.map(([k, t, i]) => `${k === "manage" ? "<hr>" : ""}<a class="nv ${S.tab === k ? "on" : ""}" href="${zh(k)}" title="${esc(t)}"${S.tab === k ? ' aria-current="page"' : ""}>${IC[i]}<span class="nv-lbl">${t}</span></a>`).join("")
+    : `<div class="sb-lbl">账户导航</div>` + NAV.filter(n => !n[3] || me.role === n[3]).map(([k, t, i]) => `<a class="nv ${activeView === k ? "on" : ""}" href="#/${k}" title="${esc(t)}"${activeView === k ? ' aria-current="page"' : ""}>${IC[i]}<span class="nv-lbl">${t}</span></a>`).join("");
+  const theme = getThemePref();
+  return `<div class="shell" data-collapsed="${collapsed ? "true" : "false"}">
+    <div class="sb-backdrop" data-act="mobMenuClose"></div>
+    <aside class="side" data-sidebar="sidebar" data-state="${collapsed ? "collapsed" : "expanded"}">
+      <div class="sb-head"><a class="brand" href="#/overview">${MARK}<span class="brand-txt">fucloudflare</span></a><button type="button" class="sb-toggle" data-sidebar="trigger" data-act="sidebarToggle" aria-label="折叠侧边栏" title="折叠/展开侧边栏">${IC.panel}</button></div>
+      <nav aria-label="导航">${side}</nav>
+      <div class="sf"><div class="sf-meta"><b>${sys.role === "accelerate" ? "只读加速节点" : "对等节点"}</b><span class="mono" title="配置版本 ${esc(sys.version)}">${esc(String(sys.version || "").slice(0, 8))}</span></div><span class="tag ${sys.role === "accelerate" ? "warn" : "ok"}">${sys.role === "accelerate" ? "只读" : "可写"}</span></div>
+    </aside>
+    <div class="col"><header class="top">
+      <button type="button" class="mob-menu" data-act="mobMenuOpen" aria-label="打开菜单">${IC.menu}</button>
+      <div class="zsel">${IC.globe}<select id="zsw" aria-label="切换域名"><option value="">全部域名</option>${(C.zones || []).map(x => `<option value="${esc(x.id)}" ${z && x.id === z.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></div>
+      <span class="sp"></span>
+      <div class="meta">${btn("theme", `${IC[THEME_IC[theme]]}<span>${THEME_TEXT[theme]}</span>`, {}, "ghost sm", 'data-mode-toggle aria-label="切换主题" title="切换浅色/深色/跟随系统"')}${
+        `<a class="who" href="#/account" title="账户与安全">${IC.lock}<span>${esc(me.api_token ? "API 令牌" : me.email || "")}</span></a>`}${
+        btn("logout", `${IC.exit}<span>退出</span>`, {}, "ghost sm")}</div></header>
+    <main><div class="wrap">${sys.role === "accelerate" ? '<div class="note warn">这是只读加速节点（accelerate），部分写操作请在任意对等节点（peer）执行。</div>' : ""}
+      <header class="ph"><div><h1>${v.title}</h1>${v.sub ? `<p>${v.sub}</p>` : ""}</div>${v.acts ? `<div class="acts">${v.acts}</div>` : ""}</header>${v.body}</div></main></div></div>`;
+}
+function applyFilters() {
+  for (const id in F) {
+    const q = (F[id] || "").trim().toLowerCase();
+    document.querySelectorAll(`#${id} tbody tr`).forEach(tr => { tr.hidden = !!q && !tr.textContent.toLowerCase().includes(q); });
+  }
+}
+async function render() {
+  const qs = new URLSearchParams(location.search);
+  const hs = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const oauthTok = qs.get("oauth_token") || hs.get("oauth_token");
+  const oauthErr = qs.get("oauth_error") || hs.get("oauth_error");
+  if (oauthTok) {
+    token = oauthTok;
+    localStorage.setItem("fucf_token", token);
+    history.replaceState(null, "", location.pathname + "#/overview");
+  } else if (oauthErr) {
+    loginError = "OAuth 登录失败：" + oauthErr;
+    history.replaceState(null, "", location.pathname + (location.hash || ""));
+  }
+  const app = document.getElementById("app");
+  if (!token) return renderAuth(app);
+  const my = ++seq;
+  S = parseHash();
+  busy(true);
+  try {
+    me = await api("GET", "/account");
+    if (my !== seq) return;
+    if (me.must_change_password) { app.innerHTML = mustChange(); return; }
+    [sys, C.zones] = await Promise.all([api("GET", "/system"), api("GET", "/zones?per_page=1000")]);
+    if (my !== seq) return;
+    if (NAV.some(n => n[0] === S.view && n[3] && n[3] !== me.role)) S = { view: "zones" };
+    const v = await VIEWS[S.view]();
+    if (my !== seq) return;
+    app.innerHTML = shell(v);
+    applyFilters();
+  } catch (e) {
+    if (my !== seq || !token) return;
+    app.innerHTML = shell({ title: "加载失败", body: `<div class="note bad">${esc(e.message)}　<a data-act="retry">重试</a> · <a href="#/zones">返回账户主页</a></div>` });
+  } finally { if (my === seq) busy(false); }
+}
+
+// -------------------------------------------------------------- actions ----
+const byId = (list, id) => (C[list] || []).find(x => x.id === id) || {};
+const del = async (path, what) => { if (await confirmBox(`删除${what}？`, "删除后无法恢复。")) { await api("DELETE", path); toast("已删除"); render(); } };
+const A = {
+  retry: render,
+  logout: async () => { loginError = ""; try { await api("POST", "/account/logout"); } catch {} logout(); },
+  theme: () => {
+    const order = ["auto", "light", "dark"];
+    const next = order[(order.indexOf(getThemePref()) + 1) % 3];
+    localStorage.setItem("cf_theme_mode", next);
+    localStorage.setItem("fucf_theme", next);
+    applyTheme();
+    render();
+  },
+  sidebarToggle: () => {
+    const cur = localStorage.getItem("cf_sidebar_collapsed") === "1";
+    localStorage.setItem("cf_sidebar_collapsed", cur ? "0" : "1");
+    const sh = document.querySelector(".shell"), sb = document.querySelector('[data-sidebar="sidebar"]');
+    if (sh) sh.dataset.collapsed = cur ? "false" : "true";
+    if (sb) sb.dataset.state = cur ? "expanded" : "collapsed";
+  },
+  mobMenuOpen: () => { const sh = document.querySelector(".shell"); if (sh) sh.classList.add("mob-open"); },
+  mobMenuClose: () => { const sh = document.querySelector(".shell"); if (sh) sh.classList.remove("mob-open"); },
+  wTab: d => { WUI.tab = d.tab; render(); },
+  kvSelect: d => { WUI.kvNs = d.id; render(); },
+  kvNsAdd: () => openForm("新建 KV 命名空间", [{ k: "title", label: "命名空间名称", hint: "例如 AUTH_SESSIONS" }], {}, v => api("POST", "/kv/namespaces", v)),
+  kvNsRename: d => { const ns = (C.kvNamespaces || []).find(x => x.id === d.id) || {}; openForm("重命名 KV 命名空间", [{ k: "title", label: "新名称" }], ns, v => api("PATCH", `/kv/namespaces/${d.id}`, v)); },
+  kvNsDel: d => del(`/kv/namespaces/${d.id}`, `KV 命名空间“${d.title}”`),
+  kvPut: d => openForm("写入 KV 键值", [
+    { k: "key", label: "Key", hint: "最大 512 字节" },
+    { k: "value", label: "Value", type: "textarea", tall: 1 },
+    { k: "ttl", label: "过期 TTL（秒，>= 60，留空永不过期）", type: "number", opt: 1 },
+    { k: "metadata", label: "Metadata (JSON，可选)", type: "json", defJson: null },
+  ], {}, async v => {
+    const key = String(v.key || "").trim();
+    if (!key) throw new Error("Key 不能为空");
+    const qs = new URLSearchParams();
+    if (v.ttl) qs.set("expiration_ttl", String(v.ttl));
+    if (v.metadata && Object.keys(v.metadata).length) qs.set("metadata", JSON.stringify(v.metadata));
+    const q = qs.toString() ? "?" + qs.toString() : "";
+    await api("PUT", `/kv/namespaces/${encodeURIComponent(d.ns)}/values/${encodeURIComponent(key)}${q}`, v.value || "", true);
+  }),
+  kvView: async d => {
+    const val = await api("GET", `/kv/namespaces/${encodeURIComponent(d.ns)}/values/${encodeURIComponent(d.key)}`).catch(() => "");
+    const item = (C.kvKeys || []).find(x => x.name === d.key) || {};
+    openForm(`编辑 KV · ${d.key}`, [
+      { k: "key", label: "Key", readonly: true },
+      { k: "value", label: "Value", type: "textarea", tall: 1 },
+      { k: "ttl", label: "更新 TTL（秒，>= 60，留空保持）", type: "number", opt: 1 },
+      { k: "metadata", label: "Metadata (JSON)", type: "json" },
+    ], { key: d.key, value: typeof val === "string" ? val : JSON.stringify(val), metadata: item.metadata || {} }, async v => {
+      const qs = new URLSearchParams();
+      if (v.ttl) qs.set("expiration_ttl", String(v.ttl));
+      if (v.metadata && Object.keys(v.metadata).length) qs.set("metadata", JSON.stringify(v.metadata));
+      const q = qs.toString() ? "?" + qs.toString() : "";
+      await api("PUT", `/kv/namespaces/${encodeURIComponent(d.ns)}/values/${encodeURIComponent(d.key)}${q}`, v.value || "", true);
+    });
+  },
+  kvDel: d => del(`/kv/namespaces/${encodeURIComponent(d.ns)}/values/${encodeURIComponent(d.key)}`, `Key “${d.key}”`),
+  d1Select: d => { WUI.d1Db = d.id; WUI.d1Res = null; render(); },
+  d1Add: () => openForm("新建 D1 数据库", [{ k: "name", label: "数据库名称", hint: "例如 auth_db" }], {}, v => api("POST", "/d1/database", v)),
+  d1Del: d => del(`/d1/database/${d.id}`, `D1 数据库“${d.name}”`),
+  d1Run: async d => {
+    const box = document.getElementById("d1SqlBox");
+    const sql = (box ? box.value : WUI.d1Sql).trim();
+    WUI.d1Sql = sql;
+    if (!sql) throw new Error("请输入 SQL 语句");
+    const res = await api("POST", `/d1/database/${d.db}/query`, { sql, params: [] });
+    WUI.d1Res = Array.isArray(res) ? res[0] : res;
+    render();
+  },
+  cronEdit: async d => {
+    const st = await api("GET", `/workers/scripts/${d.name}/settings`);
+    openForm(`配置 Cron Triggers · ${d.name}`, [
+      { k: "crons", label: "5 段式 UTC Cron 表达式（逗号或换行分隔）", type: "textarea", hint: "例如：*/5 * * * *, 0 0 * * *" },
+    ], { crons: (st.crons || []).join("\n") }, v => {
+      const crons = String(v.crons || "").split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+      return api("PATCH", `/workers/scripts/${d.name}/settings`, { crons });
+    });
+  },
+  cronRun: async d => {
+    const r = await api("POST", `/workers/scripts/${d.name}/scheduled`, {});
+    toast(`已触发 ${d.name} (${r.cron || "* * * * *"})`);
+  },
+  proxyEdit: d => {
+    const r = byId("proxyRules", d.id);
+    const upstreams = (r.upstreams || []).map(u => typeof u === "string" ? u : u.url).join("\n");
+    openForm(d.id ? "编辑反向代理规则" : "添加反向代理规则", [
+      { k: "name", label: "规则名称" },
+      { k: "listen_port", label: "监听端口（留空匹配所有端口）", type: "number", opt: 1 },
+      { k: "hosts", label: "匹配域名（逗号或空格分隔）", type: "list" },
+      { k: "path_prefix", label: "路径前缀", def: "/" },
+      { k: "exact_path", label: "精确匹配路径", type: "check" },
+      { k: "strip_prefix", label: "转发前剥离 path_prefix", type: "check" },
+      { k: "rewrite_path", label: "重写路径（可选，如 /doh）", opt: 1 },
+      { k: "redirect_url", label: "直接重定向目标 URL（可选，跳过上游）", opt: 1 },
+      { k: "redirect_status", label: "重定向状态码（300–399，默认 302）", type: "number", opt: 1 },
+      { k: "upstreams_txt", label: "上游 URL（每行一个，支持 http:// https:// h2c:// ws:// wss://）", type: "textarea" },
+      { k: "preserve_host", label: "保留原始 Host 头", type: "check", def: true },
+      { k: "mask_upstream_errors", label: "上游 >= 400 错误伪装为 404 not found", type: "check" },
+      { k: "is_fallback", label: "设为 Hysteria 2 兜底回落规则", type: "check" },
+      { k: "nodes", label: "生效节点（留空 = 全部节点）", type: "list" },
+      { k: "set_request_headers", label: "设置请求头 (JSON)", type: "json" },
+      { k: "set_response_headers", label: "设置响应头 (JSON)", type: "json" },
+      { k: "strip_response_headers", label: "删除响应头（逗号分隔）", type: "list" },
+      { k: "priority", label: "优先级", type: "number", def: 100 },
+      { k: "enabled", label: "启用", type: "check", def: true },
+    ], { ...r, upstreams_txt: upstreams }, v => {
+      const ups = String(v.upstreams_txt || "").split(/[\n,\s]+/).filter(Boolean).map(url => ({ url }));
+      delete v.upstreams_txt;
+      return api(d.id ? "PUT" : "POST", "/proxy/rules" + (d.id ? "/" + d.id : ""), { ...v, upstreams: ups });
+    });
+  },
+  proxyDel: d => del("/proxy/rules/" + d.id, "这条代理规则"),
+  oauthConfigEdit: () => {
+    const c = C.oauthConfig || {};
+    openForm("编辑面板 SSO 配置", [
+      { k: "enabled", label: "启用面板 OAuth SSO", type: "check" },
+      { k: "issuer_url", label: "OAuth Issuer URL", hint: "例如 https://auth.example.com" },
+      { k: "client_id", label: "Client ID" },
+      { k: "client_secret", label: "Client Secret（留空或 *** 保持不变）", type: "password", opt: 1 },
+      { k: "scopes", label: "Scopes", def: "openid profile email" },
+      { k: "auto_provision", label: "首次登录自动创建面板账户", type: "check" },
+      { k: "default_role", label: "自动创建账户默认角色", type: "select", def: "viewer", options: [["viewer", "Viewer (只读)"], ["editor", "Editor (编辑)"], ["admin", "Admin (管理员)"]] },
+      { k: "redirect_base_url", label: "回调基础 URL（留空自动识别）", opt: 1 },
+    ], c, v => api("PUT", "/oauth/config", v));
+  },
+  oauthClientEdit: d => {
+    const c = (C.oauthClients || []).find(x => (x.id || x.client_id) === d.id) || {};
+    openForm(d.id ? "编辑 OAuth 客户端" : "添加 OAuth 客户端", [
+      { k: "name", label: "应用名称" },
+      { k: "client_id", label: "Client ID", readonly: !!d.id },
+      { k: "redirect_uris", label: "Redirect URIs（逗号分隔）", type: "list" },
+      { k: "scopes", label: "允许的 Scopes", type: "list", def: ["openid", "profile", "email"] },
+    ], c, v => api(d.id ? "PUT" : "POST", "/oauth/clients" + (d.id ? "/" + d.id : ""), v));
+  },
+  oauthClientDel: d => del("/oauth/clients/" + d.id, "OAuth 客户端"),
+  oauthProvEdit: d => {
+    const p = (C.oauthProviders || []).find(x => x.id === d.id) || {};
+    openForm(d.id ? "编辑身份源" : "添加身份源", [
+      { k: "id", label: "Provider ID", readonly: !!d.id, hint: "例如 linuxdo, github" },
+      { k: "display_name", label: "显示名称" },
+      { k: "client_id", label: "Client ID" },
+      { k: "client_secret", label: "Client Secret（不会回显）", type: "password" },
+      { k: "authorize_url", label: "Authorize URL" },
+      { k: "token_url", label: "Token URL" },
+      { k: "userinfo_url", label: "Userinfo URL" },
+      { k: "enabled", label: "启用", type: "check", def: true },
+    ], p, v => api(d.id ? "PUT" : "POST", "/oauth/providers" + (d.id ? "/" + d.id : ""), v));
+  },
+  oauthProvDel: d => del("/oauth/providers/" + d.id, "身份源"),
+  zoneAdd: () => openForm("添加域名", [
+    { k: "name", label: "域名", hint: "如 example.com" },
+    { k: "type", label: "接入方式", type: "select", options: [["full", "完全托管：把域名的 NS 指向本平台，全部 DNS 记录在这里管理"], ["partial", "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来"]] },
+  ], {}, v => api("POST", "/zones", v)),
+  zoneKind: async () => {
+    const full = C.zone.type === "full";
+    if (!(await confirmBox(full ? "改为 CNAME 接入？" : "改为完全托管？", full ? "域名不再由本平台的名称服务器托管，需要在原 DNS 服务商处为每个主机名添加 CNAME。" : "需要在注册商处把域名的 NS 改为本平台的名称服务器，这里的记录才会对外生效。", "切换", false))) return;
+    await api("PATCH", "/zones/" + S.zone, { type: full ? "partial" : "full" }); toast("已切换接入方式"); render();
+  },
+  zonePause: async () => {
+    const paused = C.zone.paused;
+    if (!paused && !(await confirmBox(`暂停 ${C.zone.name}？`, "已代理的记录将直接解析到源站，源站地址会暴露，CDN 与 WAF 不再生效。", "暂停"))) return;
+    await api("PATCH", "/zones/" + S.zone, { paused: !paused }); toast(paused ? "已恢复" : "已暂停"); render();
+  },
+  zoneDel: async () => { if (await confirmBox(`删除 ${C.zone.name}？`, "域名的全部记录、规则和证书都会删除，无法恢复。")) { await api("DELETE", "/zones/" + S.zone); toast("已删除"); go("#/zones"); } },
+  purge: async () => {
+    if (!(await confirmBox("清除全部缓存？", "之后的请求会重新回源，源站负载可能短时升高。", "清除", false))) return;
+    const r = await api("POST", `/zones/${S.zone}/purge_cache`, { purge_everything: true }); toast(`已清除（本节点 ${r.purged} 个对象，其余节点随配置同步清除）`);
+  },
+  purgeFiles: async () => {
+    const box = document.getElementById("purgeUrls"), files = box.value.split(/\s+/).filter(Boolean);
+    if (!files.length) throw new Error("请填写要清除的 URL");
+    const r = await api("POST", `/zones/${S.zone}/purge_cache`, { files }); box.value = ""; toast(`已清除（本节点 ${r.purged} 个对象）`);
+  },
+  recEdit: d => {
+    const r = byId("records", d.id), o = r.origin || {};
+    openForm(d.id ? "编辑记录" : "添加记录", [
+      { k: "type", label: "类型", type: "select", options: ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR"] },
+      { k: "name", label: "名称", hint: "@ 表示根域；可写前缀（www）或完整域名；支持 *.前缀" },
+      { k: "content", label: "内容", hint: "A/AAAA 填 IP；已代理时这里是源站地址" },
+      { k: "proxied", label: "经 CDN 代理（仅 A / AAAA / CNAME）", type: "check" },
+      { k: "ttl", label: "TTL（1 = 自动）", type: "number", def: 1 },
+      { k: "priority", label: "优先级（MX / SRV）", type: "number", opt: 1 },
+      { k: "comment", label: "备注", opt: 1 },
+      { type: "head", label: "高级回源（仅对已代理的记录生效）" },
+      { k: "origin_node", label: "内部回源节点（可选，如 jp）", opt: 1 },
+      { k: "origin_sni", label: "回源 SNI", opt: 1 },
+      { k: "origin_host_header", label: "回源 Host", opt: 1 },
+      { k: "origin_port", label: "回源端口", type: "number", opt: 1 },
+      { k: "origin_scheme", label: "回源协议", type: "select", options: [["", "跟随 SSL 模式"], ["https", "HTTPS"], ["http", "HTTP"]] },
+    ], { ...r, origin_node: o.node || "", origin_sni: o.sni, origin_host_header: o.host_header, origin_port: o.port, origin_scheme: o.scheme || "" }, v => {
+      const origin = {};
+      for (const k of ["node", "sni", "host_header", "port", "scheme"]) {
+        const x = v["origin_" + k]; delete v["origin_" + k];
+        if (x !== null && x !== undefined && x !== "") origin[k] = x;
+      }
+      return api(d.id ? "PUT" : "POST", `/zones/${S.zone}/dns_records` + (d.id ? "/" + d.id : ""), { ...v, origin });
+    });
+  },
+  recDel: d => del(`/zones/${S.zone}/dns_records/${d.id}`, "这条记录"),
+  dnssecToggle: async d => {
+    const enable = d.enable === "1";
+    await api("PATCH", `/zones/${S.zone}/dnssec`, { status: enable ? "active" : "disabled" });
+    toast(enable ? "DNSSEC 已启用" : "DNSSEC 已关闭");
+    render();
+  },
+  ruleEdit: d => {
+    const R = RULES[d.key];
+    openForm((d.id ? "编辑" : "添加") + " · " + R.title, R.fields, byId(d.key, d.id),
+      v => api(d.id ? "PUT" : "POST", `/zones/${S.zone}/${R.path}` + (d.id ? "/" + d.id : ""), R.save ? R.save(v) : v));
+  },
+  ruleDel: d => del(`/zones/${S.zone}/${RULES[d.key].path}/${d.id}`, "这条规则"),
+  emailDns: async () => {
+    const e = await api("GET", `/zones/${S.zone}/email`);
+    for (const r of e.needed_records || []) await api("POST", `/zones/${S.zone}/dns_records`, r);
+    toast("记录已添加"); render();
+  },
+  nodeEdit: d => openForm(d.id ? "编辑节点" : "添加节点", [
+    { k: "name", label: "名称", hint: "小写字母、数字、-" }, { k: "dc", label: "机房编号（dc）", type: "number", min: 1, opt: 1 }, { k: "ipv4", label: "IPv4", opt: 1 }, { k: "ipv6", label: "IPv6", opt: 1 },
+    { k: "role", label: "节点角色", type: "select", def: "peer", options: [["peer", "Peer (完整控制面)"], ["accelerate", "Accelerate (纯加速节点)"]] },
+    { k: "accel_hosts", label: "Accelerate 允许域名（逗号分隔，支持 *.domain）", type: "list" },
+    { k: "continents", label: "负责的大洲", type: "multi", options: Object.entries(CONT) },
+    { k: "enabled", label: "启用（停用后不再出现在解析结果中）", type: "check", def: true },
+    { type: "head", label: "分档流量限制（1 GB = 10⁹ 字节）" },
+    { k: "traffic_period", label: "统计周期", type: "select", def: "month", options: [["month", "按月（UTC）"], ["day", "按日（UTC 0 点重置）"]] },
+    { k: "traffic_reset_day", label: "每月重置日（1–28）", type: "number", min: 1, max: 28, def: 1 },
+    { k: "traffic_dns_gb", label: "第一档：DNS 分流/摘除阈值（GB）", type: "number", step: "any", opt: 1 },
+    { k: "dns_offload_mode", label: "超第一档后的 DNS 分流模式", type: "select", def: "drop", options: [["drop", "立即摘除"], ["linear", "线性概率分流"]] },
+    { k: "dns_silent_on_limit", label: "超第一档后 53 端口静默", type: "check", def: false },
+    { k: "traffic_throttle_gb", label: "开始限速阈值（GB）", type: "number", step: "any", opt: 1 },
+    { k: "rate_limit_mbps", label: "限速上限（Mbps）", type: "number", step: "any", opt: 1 },
+    { k: "traffic_limit_gb", label: "第三档：停止服务阈值（GB）", type: "number", step: "any", opt: 1 },
+  ], d.id ? byId("nodes", d.id) : (d.name ? { name: d.name } : {}), v => api(d.id ? "PUT" : "POST", "/nodes" + (d.id ? "/" + d.id : ""), v)),
+  nodeDel: d => del("/nodes/" + d.id, "这个节点"),
+  nodeContRm: async d => {
+    const n = byId("nodes", d.id); if (!n.id) return;
+    await api("PUT", "/nodes/" + n.id, { ...n, continents: (n.continents || []).filter(c => c !== d.cont) });
+    toast(`已将 ${n.name} 移出 ${CONT[d.cont] || d.cont}`); render();
+  },
+  steerNodeRm: async d => {
+    const r = byId("steer", d.ruleId); if (!r.id) return;
+    const nodes = (r.nodes || []).filter((_, i) => i !== Number(d.idx));
+    if (!nodes.length) throw new Error("调度规则至少需要保留一个节点");
+    await api("PUT", "/steering/" + r.id, { ...r, nodes }); toast("已更新规则节点顺序"); render();
+  },
+  pwChange: () => openForm("修改密码", [
+    { k: "current", label: "当前密码", type: "password" }, { k: "new", label: "新密码（至少 8 位）", type: "password", auto: "new-password" }, { k: "again", label: "再输一遍新密码", type: "password", auto: "new-password" },
+  ], {}, async v => { if (v.new !== v.again) throw new Error("两次输入的新密码不一样"); try { await api("POST", "/account/password", { current: v.current, new: v.new }); } catch (e) { throw new Error(PW_TEXT(e.message)); } }),
+  tfaOn: async () => {
+    const t = await api("POST", "/account/totp/begin");
+    openForm("开启两步验证", [
+      { type: "head", label: "1. 用验证器 App 扫码" },
+      { type: "html", html: `<div class="boxb"><div class="qr">${t.qr_svg}</div><div class="secret">${esc(t.secret.replace(/(.{4})/g, "$1 ").trim())}</div></div>` },
+      { k: "code", label: "2. 输入 App 里显示的 6 位验证码" },
+    ], {}, async v => {
+      let r;
+      try { r = await api("POST", "/account/totp/enable", { code: v.code }); } catch (e) { throw new Error(/wrong code/.test(e.message) ? "验证码不对" : e.message); }
+      setTimeout(() => showBox("两步验证已开启", codesHtml(r.backup_codes), "我已保存"), 50);
+    });
+  },
+  tfaOff: () => openForm("关闭两步验证", [{ k: "password", label: "当前密码", type: "password" }], {},
+    v => api("POST", "/account/two_factor/disable", { password: v.password }).catch(e => { throw new Error(PW_TEXT(e.message)); })),
+  codesNew: () => openForm("重新生成备用验证码", [{ k: "password", label: "当前密码", type: "password" }], {}, async v => {
+    let r;
+    try { r = await api("POST", "/account/backup_codes", { password: v.password }); } catch (e) { throw new Error(PW_TEXT(e.message)); }
+    setTimeout(() => showBox("新的备用验证码", codesHtml(r.backup_codes), "我已保存"), 50);
+  }),
+  pkAdd: () => openForm("添加通行密钥", [{ k: "name", label: "名称", def: agentName(navigator.userAgent) }], {}, async v => {
+    if (!canPasskey()) throw new Error("当前访问方式不支持通行密钥");
+    const o = await api("POST", "/account/passkeys/begin");
+    let cred;
+    try {
+      cred = await navigator.credentials.create({ publicKey: {
+        challenge: unb64u(o.challenge), rp: { name: "fucloudflare", id: location.hostname }, user: { id: unb64u(o.user.id), name: o.user.name, displayName: o.user.name },
+        pubKeyCredParams: o.algorithms.map(alg => ({ type: "public-key", alg })), excludeCredentials: o.exclude.map(id => ({ type: "public-key", id: unb64u(id) })),
+        authenticatorSelection: { residentKey: "required", userVerification: "preferred" }, attestation: "none", timeout: 120000 } });
+    } catch (e) { throw new Error(e.name === "NotAllowedError" ? "已取消" : "创建失败：" + e.message); }
+    const r = cred.response;
+    await api("POST", "/account/passkeys", { id: cred.id, name: v.name, public_key: b64u(r.getPublicKey()), alg: r.getPublicKeyAlgorithm(), client_data: b64u(r.clientDataJSON), authenticator_data: b64u(r.getAuthenticatorData()) });
+  }),
+  pkDel: d => del("/account/passkeys/" + d.id, "通行密钥“" + d.name + "”"),
+  sesDel: async d => { await api("DELETE", "/account/sessions/" + d.id); toast("已下线"); render(); },
+  userAdd: () => openForm("添加用户", [
+    { k: "email", label: "邮箱" }, { k: "role", label: "角色", type: "select", options: [["viewer", "只读"], ["editor", "编辑"], ["admin", "管理员"]] },
+  ], {}, async v => {
+    const r = await api("POST", "/users", { email: v.email, role: v.role }).catch(e => { throw new Error(/already/.test(e.message) ? "这个邮箱已经有账户了" : PW_TEXT(e.message)); });
+    setTimeout(() => showBox("用户已创建", `<p>${esc(r.user.email)} 的初始密码（只显示这一次）：</p><div class="secret">${esc(r.password)}</div>`, "我已记下"), 50);
+  }),
+  userEdit: d => openForm("编辑用户", [
+    { k: "email", label: "邮箱", readonly: true }, { k: "role", label: "角色", type: "select", options: [["viewer", "只读"], ["editor", "编辑"], ["admin", "管理员"]] }, { k: "disabled", label: "停用", type: "check" },
+  ], byId("users", d.id), v => api("PATCH", "/users/" + d.id, { role: v.role, disabled: v.disabled })),
+  userReset: async d => {
+    const u = byId("users", d.id);
+    if (!(await confirmBox(`重置 ${u.email} 的密码？`, "会生成一个新的随机密码。", "重置", false))) return;
+    const r = await api("PATCH", "/users/" + d.id, { reset_password: true });
+    await showBox("密码已重置", `<p>${esc(u.email)} 的新密码：</p><div class="secret">${esc(r.password)}</div>`, "我已记下");
+    render();
+  },
+  userTfa: async d => {
+    const u = byId("users", d.id);
+    if (!(await confirmBox(`清除 ${u.email} 的两步验证？`, "验证器、备用验证码和通行密钥将全部清除。", "清除"))) return;
+    await api("PATCH", "/users/" + d.id, { reset_two_factor: true }); toast("已清除"); render();
+  },
+  userDel: d => del("/users/" + d.id, "用户 " + byId("users", d.id).email),
+  nodeAct: async d => {
+    const what = d.action === "restart" ? "重启" : "清空缓存";
+    if (!(await confirmBox(`${what} ${d.node}？`, "确认执行此节点操作？", what, d.action === "restart"))) return;
+    await api("POST", `/fleet/${d.node}/actions`, { action: d.action });
+    toast("指令已发送"); setTimeout(render, d.action === "restart" ? 4000 : 800);
+  },
+  relNew: () => openForm("发布新版本", [
+    { type: "html", html: '<label class="f"><span>二进制文件</span><input type="file" id="relFile"></label>' },
+    { k: "signature", label: "签名（signature=）" },
+  ], {}, async v => {
+    const file = document.getElementById("relFile").files[0];
+    if (!file) throw new Error("请选择二进制文件");
+    const data = await file.arrayBuffer();
+    const sha = [...new Uint8Array(await crypto.subtle.digest("SHA-256", data))].map(b => b.toString(16).padStart(2, "0")).join("");
+    await api("PUT", `/releases/${sha}?signature=${encodeURIComponent(v.signature.trim().replace(/^signature=/, ""))}`, data, true);
+  }),
+  relWithdraw: async d => { if (await confirmBox("撤回当前版本？", "节点将逐台回退到之前的版本。", "撤回并回退")) { await api("DELETE", "/releases/" + d.sha); toast("已撤回，回退中"); render(); } },
+  relForget: async d => { if (await confirmBox("忘掉这次发布？", "各节点保持当前版本不变。", "忘掉", false)) { await api("DELETE", `/releases/${d.sha}?forget=true`); toast("已忘掉"); render(); } },
+  steerEdit: d => openForm(d.id ? "编辑规则" : "添加规则", [
+    { k: "name", label: "名称" },
+    { k: "action", label: "动作", type: "select", options: [["route", "调度到指定节点"], ["block", "屏蔽：拒绝解析"]] },
+    { k: "nodes", label: "节点（按优先顺序，逗号分隔）", type: "list", hint: "可用：" + (C.nodeNames || []).join(", ") },
+    { k: "countries", label: "国家代码", type: "list" },
+    { k: "regions", label: "省/州代码 (ISO 3166-2)", type: "list" },
+    { k: "continents", label: "大洲", type: "multi", options: Object.entries(CONT) },
+    { k: "asns", label: "运营商 AS 号", type: "numlist" },
+    { k: "as_orgs", label: "运营商名称关键字", type: "list" },
+    { k: "priority", label: "优先级（小的先匹配）", type: "number" }, { k: "enabled", label: "启用", type: "check", def: true },
+  ], byId("steer", d.id), v => api(d.id ? "PUT" : "POST", "/steering" + (d.id ? "/" + d.id : ""), v)),
+  steerDel: d => del("/steering/" + d.id, "这条规则"),
+  workerEdit: async d => {
+    const code = d.name ? await api("GET", "/workers/scripts/" + d.name) : 'export default {\n  async fetch(request, env, ctx) {\n    return new Response("hello from the edge");\n  }\n}\n';
+    const st = d.name ? await api("GET", `/workers/scripts/${d.name}/settings`) : { vars: {}, kv_bindings: {}, d1_bindings: {}, crons: [] };
+    openForm(d.name ? "编辑脚本 " + d.name : "新建脚本", [
+      { k: "name", label: "名称", readonly: !!d.name, hint: "小写字母、数字、-、_" },
+      { k: "code", label: "代码", type: "textarea", tall: 1 },
+      { k: "vars", label: "环境变量 env (JSON)", type: "json" },
+      { k: "kv_bindings", label: "KV 绑定 { BINDING: namespace_id } (JSON)", type: "json" },
+      { k: "d1_bindings", label: "D1 绑定 { DB: database_id } (JSON)", type: "json" },
+      { k: "crons", label: "Cron 表达式（逗号分隔）", type: "list", hint: "例如 */5 * * * *" },
+    ], { name: d.name, code, vars: st.vars || {}, kv_bindings: st.kv_bindings || {}, d1_bindings: st.d1_bindings || {}, crons: st.crons || [] }, async v => {
+      const name = String(v.name || "").trim();
+      if (!name) throw new Error("脚本名称不能为空");
+      await api("PUT", "/workers/scripts/" + encodeURIComponent(name), v.code, true);
+      await api("PATCH", `/workers/scripts/${encodeURIComponent(name)}/settings`, { vars: v.vars, kv_bindings: v.kv_bindings, d1_bindings: v.d1_bindings, crons: v.crons });
+    }, true);
+  },
+  workerDel: d => del("/workers/scripts/" + d.name, "脚本 " + d.name),
+};
+
+document.addEventListener("click", e => {
+  const copy = e.target.closest("[data-copy]");
+  if (copy) { navigator.clipboard.writeText(copy.dataset.copy).then(() => toast("已复制"), () => toast("复制失败", true)); return; }
+  const el = e.target.closest("[data-act]");
+  if (!el) return;
+  e.preventDefault();
+  run(async () => {
+    if (el.dataset.act === "steerEdit") C.nodeNames = (await api("GET", "/nodes")).map(n => n.name);
+    await A[el.dataset.act](el.dataset);
+  });
+});
+document.addEventListener("change", e => {
+  const el = e.target;
+  if (el.id === "zsw") return go(el.value ? `#/zone/${el.value}/${S.view === "zone" ? S.tab : "overview"}` : "#/zones");
+  const key = el.dataset && el.dataset.set;
+  if (!key) return;
+  const value = "multi" in el.dataset ? [...document.querySelectorAll(`[data-set="${key}"]:checked`)].map(x => x.value) : el.type === "checkbox" ? el.checked : el.value;
+  run(async () => {
+    try { await api("PATCH", `/zones/${S.zone}/settings/${key}`, { value }); toast("已保存"); }
+    finally { render(); }
+  });
+});
+document.addEventListener("input", e => {
+  if (e.target.id === "kvPrefixInput") { F.kvPrefix = e.target.value; return; }
+  if (e.target.id === "d1SqlBox") { WUI.d1Sql = e.target.value; return; }
+  const id = e.target.dataset && e.target.dataset.filter;
+  if (!id) return;
+  F[id] = e.target.value;
+  applyFilters();
+});
+document.addEventListener("keydown", e => {
+  if (e.target.id === "kvPrefixInput" && e.key === "Enter") { e.preventDefault(); render(); }
+});
+
+// Drag-and-drop for fleet continent assignment & steering priority
+let dragCtx = null;
+document.addEventListener("dragstart", e => {
+  const el = e.target.closest("[data-drag-kind]");
+  if (!el) return;
+  dragCtx = { kind: el.dataset.dragKind, nodeId: el.dataset.nodeId, nodeName: el.dataset.nodeName, ruleId: el.dataset.ruleId, idx: Number(el.dataset.idx) };
+  el.classList.add("dragging");
+  e.dataTransfer.effectAllowed = "move";
+  try { e.dataTransfer.setData("text/plain", el.dataset.nodeId || el.dataset.nodeName || String(el.dataset.idx)); } catch {}
+});
+document.addEventListener("dragend", () => {
+  document.querySelectorAll(".dragging,.over").forEach(x => x.classList.remove("dragging", "over"));
+  dragCtx = null;
+});
+document.addEventListener("dragover", e => {
+  if (!dragCtx) return;
+  const target = e.target.closest("[data-drop-kind]");
+  if (!target) return;
+  const dk = target.dataset.dropKind;
+  const ok = (dragCtx.kind === "fleet-node" && dk === "fleet-cont")
+    || (dragCtx.kind === "steer-add" && (dk === "steer-rule" || dk === "steer-node"))
+    || (dragCtx.kind === "steer-node" && (dk === "steer-node" || dk === "steer-rule") && target.dataset.ruleId === dragCtx.ruleId);
+  if (!ok) return;
+  e.preventDefault();
+  target.classList.add("over");
+});
+document.addEventListener("dragleave", e => {
+  const target = e.target.closest("[data-drop-kind]");
+  if (target) target.classList.remove("over");
+});
+document.addEventListener("drop", e => {
+  if (!dragCtx) return;
+  const target = e.target.closest("[data-drop-kind]");
+  if (!target) return;
+  const ctx = dragCtx;
+  dragCtx = null;
+  target.classList.remove("over");
+  const dk = target.dataset.dropKind;
+  if (ctx.kind === "fleet-node" && dk === "fleet-cont") {
+    e.preventDefault();
+    const cont = target.dataset.cont, n = byId("nodes", ctx.nodeId);
+    if (!n.id || (n.continents || []).includes(cont)) return;
+    run(async () => {
+      await api("PUT", "/nodes/" + n.id, { ...n, continents: [...(n.continents || []), cont] });
+      toast(`已将 ${n.name} 分配到 ${CONT[cont] || cont}`); render();
+    });
+  } else if (ctx.kind === "steer-add" && (dk === "steer-rule" || dk === "steer-node")) {
+    e.preventDefault();
+    const r = byId("steer", target.dataset.ruleId);
+    if (!r.id || (r.nodes || []).includes(ctx.nodeName)) return;
+    run(async () => {
+      await api("PUT", "/steering/" + r.id, { ...r, nodes: [...(r.nodes || []), ctx.nodeName] });
+      toast(`已将 ${ctx.nodeName} 加入规则“${r.name}”`); render();
+    });
+  } else if (ctx.kind === "steer-node" && dk === "steer-node" && target.dataset.ruleId === ctx.ruleId) {
+    e.preventDefault();
+    const r = byId("steer", ctx.ruleId), from = ctx.idx, to = Number(target.dataset.idx);
+    if (!r.id || from === to) return;
+    const nodes = [...(r.nodes || [])];
+    const [moved] = nodes.splice(from, 1);
+    nodes.splice(to, 0, moved);
+    run(async () => {
+      await api("PUT", "/steering/" + r.id, { ...r, nodes });
+      toast("已调整节点优先级顺序"); render();
+    });
+  }
+});
+window.addEventListener("hashchange", () => { window.scrollTo(0, 0); render(); });
+render();
+</script>
+</body>
+</html>

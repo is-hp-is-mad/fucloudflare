@@ -1,0 +1,2689 @@
+//! Management REST API, wire-compatible with the Cloudflare v4 API for the
+//! zone and DNS record endpoints (same paths, envelope and field names), so
+//! existing tooling (curl scripts, Terraform-style clients) can be pointed here.
+
+use crate::edge::cache::Cache;
+use crate::edge::waf::Waf;
+use crate::sync::SyncProvider;
+use crate::items::{
+    CacheRule, Certificate, CertificatePack, EmailRule, FirewallRule, Item, OriginRule, RateLimit, RedirectRule, SpectrumApp,
+    TransformRule, WorkerRoute, WorkerScript,
+};
+use crate::auth::{Accounts, Assertion, AuthError, Client, Login, Principal, Proof, Registration, Role};
+use crate::store::{proxiable, Record, RecordInput, RecordOrigin, Store, StoreError, Zone};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+pub struct ApiState {
+    pub store: Arc<Store>,
+    pub token: String,
+    pub cache: Arc<Cache>,
+    pub waf: Arc<Waf>,
+    pub stats: Arc<crate::edge::stats::Stats>,
+    pub cname_base: Option<String>,
+    pub name_servers: Vec<String>,
+    pub panel_host: Option<String>,
+    pub health: Arc<crate::geo::Health>,
+    pub fleet: Arc<crate::fleet::Fleet>,
+    pub limits: Arc<crate::limits::Limits>,
+    /// This node's public addresses and, if given, its name.
+    pub edge_ips: Vec<std::net::IpAddr>,
+    pub node_name: Option<String>,
+    pub started_at: String,
+    /// The binaries this node runs and, on the primary, their roll-out.
+    pub releases: Arc<crate::release::Releases>,
+    /// The people who may use the panel.
+    pub accounts: Arc<Accounts>,
+    /// This node, as it describes itself.
+    pub info: Arc<crate::node::NodeInfo>,
+    /// Checking a password is expensive on purpose: only so many at a time.
+    pub password_checks: tokio::sync::Semaphore,
+    /// This node's SMTP side, when e-mail routing is switched on here.
+    pub mail: Option<Arc<crate::mail::Mail>>,
+    /// Node role (`peer` or `accelerate`).
+    pub role: crate::sync::NodeRole,
+    /// Optional peer-to-peer sync coordinator.
+    pub sync: Option<Arc<crate::sync::PeerSync>>,
+    /// Edge runtime (for Workers KV / D1 / scheduled execution).
+    pub edge: Arc<crate::edge::Edge>,
+}
+
+impl ApiState {
+    /// The name of the node this process runs on.
+    fn node(&self) -> String {
+        crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.as_deref())
+    }
+}
+
+type St = State<Arc<ApiState>>;
+type Params = Query<HashMap<String, String>>;
+type Who = axum::Extension<Principal>;
+type Caller = axum::Extension<Client>;
+
+pub fn router(state: Arc<ApiState>) -> Router {
+    // signing in: open to anybody who can reach the panel
+    let open = Router::new()
+        .route("/auth/status", get(auth_status))
+        .route("/auth/setup", post(auth_setup))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/second_step", post(auth_second_step))
+        .route("/auth/passkey/begin", post(auth_passkey_begin))
+        .route("/auth/passkey/finish", post(auth_passkey_finish))
+        .route("/auth/oauth/login", get(oauth_login))
+        .route("/auth/oauth/callback", get(oauth_callback))
+        .layer(middleware::from_fn(client_of));
+    let v4 = Router::new()
+        .route("/account", get(account))
+        .route("/account/logout", post(account_logout))
+        .route("/account/password", post(account_password))
+        .route("/account/totp/begin", post(totp_begin))
+        .route("/account/totp/enable", post(totp_enable))
+        .route("/account/two_factor/disable", post(two_factor_disable))
+        .route("/account/backup_codes", post(backup_codes))
+        .route("/account/passkeys/begin", post(passkey_begin))
+        .route("/account/passkeys", post(passkey_add))
+        .route("/account/passkeys/{id}", axum::routing::delete(passkey_delete))
+        .route("/account/sessions/{id}", axum::routing::delete(session_delete))
+        .route("/users", get(list_users).post(create_user))
+        .route("/users/{id}", axum::routing::patch(update_user).delete(delete_user))
+        .route("/oauth/config", get(get_oauth_config).put(put_oauth_config))
+        .route("/audit", get(audit))
+        .route("/fleet", get(fleet_overview))
+        .route("/fleet/{node}/actions", post(fleet_action))
+        .route("/user/tokens/verify", get(verify_token))
+        .route("/system", get(system))
+        .route("/replication/state", get(replication_state))
+        .route("/replication/report", post(replication_report).layer(axum::extract::DefaultBodyLimit::max(32 << 20)))
+        .route(
+            "/replication/sync",
+            get(replication_sync)
+                .post(replication_sync_push)
+                .layer(axum::extract::DefaultBodyLimit::max(32 << 20)),
+        )
+        .route("/analytics", get(analytics_summary))
+        .route("/releases", get(release_status))
+        .route(
+            "/releases/{sha256}",
+            axum::routing::put(submit_release).delete(withdraw_release).layer(axum::extract::DefaultBodyLimit::max(256 << 20)),
+        )
+        .route("/releases/{sha256}/binary", get(release_binary))
+        .route("/warp/purge_cache", post(purge_warp_cache))
+        .route("/nodes", get(list_nodes).post(create_node))
+        .route("/nodes/{node_id}", get(get_node).put(update_node).patch(update_node).delete(delete_node))
+        .route("/steering", get(list_steering).post(create_steering))
+        .route("/steering/{rule_id}", axum::routing::put(update_steering).patch(update_steering).delete(delete_steering))
+        .route("/proxy/rules", get(list_proxy_rules).post(create_proxy_rule))
+        .route(
+            "/proxy/rules/{rule_id}",
+            get(get_proxy_rule)
+                .put(update_proxy_rule)
+                .patch(update_proxy_rule)
+                .delete(delete_proxy_rule),
+        )
+        .route("/email/status", get(email_status))
+        .route("/zones", get(list_zones).post(create_zone))
+        .route("/zones/{zone_id}", get(get_zone).patch(patch_zone).delete(delete_zone))
+        .route("/zones/{zone_id}/dns_records", get(list_records).post(create_record))
+        .route("/zones/{zone_id}/dnssec", get(get_dnssec).patch(patch_dnssec))
+        .route(
+            "/zones/{zone_id}/dns_records/{record_id}",
+            get(get_record).put(put_record).patch(patch_record).delete(delete_record),
+        )
+        .route("/zones/{zone_id}/settings", get(get_settings))
+        .route("/zones/{zone_id}/settings/{name}", get(get_setting).patch(patch_setting))
+        .route("/zones/{zone_id}/purge_cache", post(purge_cache))
+        .route("/zones/{zone_id}/security/events", get(security_events))
+        .route("/zones/{zone_id}/ssl/certificate_packs", get(list_packs).post(create_pack))
+        .route(
+            "/zones/{zone_id}/ssl/certificate_packs/{pack_id}",
+            get(get_pack).patch(retry_pack).delete(delete_item::<CertificatePack>),
+        )
+        .route("/workers/scripts", get(list_workers))
+        .route("/workers/scripts/{name}", get(get_worker).put(put_worker).delete(delete_worker))
+        .route("/workers/scripts/{name}/settings", get(get_worker_settings).patch(patch_worker_settings))
+        .route("/workers/scripts/{name}/scheduled", post(trigger_worker_scheduled))
+        .route("/kv/namespaces", get(kv_list_namespaces).post(kv_create_namespace))
+        .route("/kv/namespaces/{ns_id}", get(kv_get_namespace).patch(kv_rename_namespace).delete(kv_delete_namespace))
+        .route("/kv/namespaces/{ns_id}/keys", get(kv_list_keys))
+        .route("/kv/namespaces/{ns_id}/values/{key}", get(kv_get_value).put(kv_put_value).delete(kv_delete_value))
+        .route("/d1/database", get(d1_list_databases).post(d1_create_database))
+        .route("/d1/database/{db_id}", get(d1_get_database).delete(d1_delete_database))
+        .route("/d1/database/{db_id}/query", post(d1_query))
+        .route("/d1/database/{db_id}/raw", post(d1_raw))
+        .merge(crud::<FirewallRule>("/zones/{zone_id}/firewall/rules"))
+        .merge(crud::<RateLimit>("/zones/{zone_id}/rate_limits"))
+        .merge(crud::<OriginRule>("/zones/{zone_id}/origin_rules"))
+        .merge(crud::<Certificate>("/zones/{zone_id}/custom_certificates"))
+        .merge(crud::<SpectrumApp>("/zones/{zone_id}/spectrum/apps"))
+        .merge(crud::<WorkerRoute>("/zones/{zone_id}/workers/routes"))
+        .merge(crud::<RedirectRule>("/zones/{zone_id}/redirect_rules"))
+        .merge(crud::<TransformRule>("/zones/{zone_id}/transform_rules"))
+        .merge(crud::<CacheRule>("/zones/{zone_id}/cache_rules"))
+        .route("/zones/{zone_id}/email", get(email_zone))
+        .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
+        .route("/zones/{zone_id}/analytics", get(analytics))
+        .layer(middleware::from_fn_with_state(state.clone(), auth));
+    Router::new()
+        .route("/", get(panel_html))
+        .nest("/client/v4", open.merge(v4))
+        .fallback(|| async { ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()) })
+        .layer(middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+async fn panel_html() -> Response {
+    let mut resp = axum::response::Html(include_str!("panel.html")).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        ),
+    );
+    resp
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let is_api = req.uri().path().starts_with("/client/v4/");
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    if is_api {
+        h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    }
+    resp
+}
+
+// ------------------------------------------------------------ envelope ----
+
+pub struct ApiError(StatusCode, u32, String);
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = json!({
+            "success": false,
+            "errors": [{ "code": self.1, "message": self.2 }],
+            "messages": [],
+            "result": null,
+        });
+        (self.0, Json(body)).into_response()
+    }
+}
+
+impl From<StoreError> for ApiError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::ZoneNotFound => ApiError(StatusCode::NOT_FOUND, 1001, "Zone not found".into()),
+            StoreError::RecordNotFound => ApiError(StatusCode::NOT_FOUND, 81044, "Record does not exist".into()),
+            StoreError::NotFound => ApiError(StatusCode::NOT_FOUND, 1002, "Resource not found".into()),
+            StoreError::ReadOnly => ApiError(
+                StatusCode::CONFLICT,
+                1003,
+                "this node is in accelerate mode; make changes on a peer node".into(),
+            ),
+            StoreError::Conflict(m) => ApiError(StatusCode::CONFLICT, 81057, m),
+            StoreError::Invalid(m) => ApiError(StatusCode::BAD_REQUEST, 1004, m),
+            StoreError::Io(m) => {
+                tracing::error!("state persistence failed: {m}");
+                ApiError(StatusCode::INTERNAL_SERVER_ERROR, 1000, "failed to persist state".into())
+            }
+        }
+    }
+}
+
+type ApiResult = Result<Json<Value>, ApiError>;
+
+fn ok(result: Value) -> ApiResult {
+    Ok(Json(json!({ "success": true, "errors": [], "messages": [], "result": result })))
+}
+
+fn bad(msg: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, 1004, msg.into())
+}
+
+fn body<T: DeserializeOwned>(bytes: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(bytes).map_err(|e| bad(format!("invalid request body: {e}")))
+}
+
+fn paginated(items: Vec<Value>, q: &HashMap<String, String>, default_per_page: usize) -> ApiResult {
+    let int = |k: &str, d: usize| q.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let page = int("page", 1).max(1);
+    let per_page = int("per_page", default_per_page).clamp(1, 5000);
+    let total = items.len();
+    let slice: Vec<Value> = items.into_iter().skip((page - 1).saturating_mul(per_page)).take(per_page).collect();
+    Ok(Json(json!({
+        "success": true, "errors": [], "messages": [],
+        "result_info": {
+            "page": page, "per_page": per_page, "count": slice.len(),
+            "total_count": total, "total_pages": total.div_ceil(per_page),
+        },
+        "result": slice,
+    })))
+}
+
+// ---------------------------------------------------------------- auth ----
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Where a request comes from. The API listens on loopback; what reaches it
+/// from outside came through the edge, which names the visitor.
+fn client(headers: &header::HeaderMap) -> Client {
+    let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let forwarded = text("x-forwarded-for");
+    let ip = forwarded.rsplit(',').next().map(str::trim).filter(|ip| !ip.is_empty()).unwrap_or("local").to_string();
+    Client { ip, agent: text("user-agent") }
+}
+
+async fn client_of(mut req: Request, next: Next) -> Response {
+    let from = client(req.headers());
+    if req.method() == axum::http::Method::POST {
+        static AUTH_RATE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (std::time::Instant, u32)>>> =
+            std::sync::LazyLock::new(Default::default);
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+        let limited = {
+            let mut map = AUTH_RATE.lock().unwrap();
+            if map.len() > 10_000 {
+                map.retain(|_, (at, _)| now.duration_since(*at) < window);
+                if map.len() > 10_000 {
+                    map.clear();
+                }
+            }
+            let entry = map.entry(from.ip.clone()).or_insert((now, 0));
+            if now.duration_since(entry.0) >= window {
+                *entry = (now, 0);
+            }
+            entry.1 += 1;
+            entry.1 > 60
+        };
+        if limited {
+            return ApiError(StatusCode::TOO_MANY_REQUESTS, 2002, "too many authentication attempts: try again later".into()).into_response();
+        }
+    }
+    req.extensions_mut().insert(from);
+    next.run(req).await
+}
+
+/// May somebody with this role make this request? Everybody may look after
+/// their own account; viewers only read; users, the audit trail, releases,
+/// nodes, spectrum listeners and what nodes are told to do are the administrators'.
+fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
+    let under = |prefix: &str| path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'));
+    let reads = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    let own = under("/account");
+    let admins = under("/users")
+        || under("/oauth")
+        || under("/audit")
+        || under("/replication")
+        || path.starts_with("/releases/")
+        || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || path.contains("/spectrum/apps")));
+    match role {
+        Role::Admin => true,
+        Role::Editor => own || !admins,
+        Role::Viewer => own || (reads && !admins),
+    }
+}
+
+/// Who is asking: the API token (the fleet's own tooling), or somebody
+/// signed in to the panel.
+async fn auth(State(st): St, mut req: Request, next: Next) -> Response {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim);
+    let who = match presented {
+        Some(t) if ct_eq(t.as_bytes(), st.token.as_bytes()) => Some(Principal::system()),
+        Some(t) => st.accounts.session(t),
+        None => None,
+    };
+    let Some(who) = who else {
+        return ApiError(StatusCode::UNAUTHORIZED, 10000, "Authentication error".into()).into_response();
+    };
+    let path = req.uri().path();
+    if who.must_change_password
+        && !matches!((req.method().as_str(), path), ("GET", "/account") | ("POST", "/account/password") | ("POST", "/account/logout"))
+    {
+        return ApiError(StatusCode::FORBIDDEN, 2016, "you must change your password before continuing".into()).into_response();
+    }
+    if !permitted(who.role, req.method(), path) {
+        return ApiError(StatusCode::FORBIDDEN, 2010, "your role does not allow this".into()).into_response();
+    }
+    let from = client(req.headers());
+    req.extensions_mut().insert(who);
+    req.extensions_mut().insert(from);
+    next.run(req).await
+}
+
+impl From<AuthError> for ApiError {
+    fn from(e: AuthError) -> Self {
+        ApiError(StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST), e.code, e.message)
+    }
+}
+
+// ------------------------------------------------------------- accounts ----
+
+/// Run something that checks or makes a password hash, off the async
+/// threads and not too many at once.
+async fn hashing<T: Send + 'static>(st: &Arc<ApiState>, work: impl FnOnce(&Accounts) -> Result<T, AuthError> + Send + 'static) -> Result<T, ApiError> {
+    let _permit = tokio::time::timeout(std::time::Duration::from_secs(2), st.password_checks.acquire())
+        .await
+        .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, 2002, "too many password checks in flight: try again in a moment".into()))?
+        .map_err(|_| bad("shutting down"))?;
+    let accounts = st.accounts.clone();
+    let done = tokio::task::spawn_blocking(move || work(&accounts)).await.map_err(|e| bad(e.to_string()))?;
+    Ok(done?)
+}
+
+async fn accounts_blocking<T: Send + 'static>(
+    st: &Arc<ApiState>,
+    work: impl FnOnce(&Accounts) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let accounts = st.accounts.clone();
+    tokio::task::spawn_blocking(move || work(&accounts)).await.map_err(|e| bad(e.to_string()))?
+}
+
+async fn push_auth_critical(st: &Arc<ApiState>) {
+    if let Some(sync) = &st.sync {
+        sync.push_now_bounded(std::time::Duration::from_millis(400)).await;
+    }
+}
+
+fn signed_in((token, user): (String, Value)) -> ApiResult {
+    ok(json!({ "token": token, "user": user }))
+}
+
+/// What the panel needs to know before anybody is signed in.
+async fn auth_status(State(st): St) -> ApiResult {
+    ok(json!({
+        "initialized": st.accounts.initialized(),
+        "role": st.role.as_str(),
+        "writable": !st.role.is_accelerate(),
+        "replica": st.role.is_accelerate(),
+        "panel_host": st.panel_host,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetupBody {
+    /// The API token: proof that whoever sets the panel up runs the node.
+    token: String,
+    email: String,
+    password: String,
+}
+
+/// The first account: an administrator, by e-mail address. Only while
+/// there is none, and only with the API token.
+async fn auth_setup(State(st): St, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: SetupBody = body(&bytes)?;
+    if st.accounts.initialized() {
+        return Err(ApiError(StatusCode::CONFLICT, 2013, "this panel is set up already: sign in".into()));
+    }
+    if !ct_eq(b.token.trim().as_bytes(), st.token.as_bytes()) {
+        return Err(ApiError(StatusCode::FORBIDDEN, 2015, "that is not this node's API token".into()));
+    }
+    let (email, password) = (b.email.clone(), b.password.clone());
+    let who = from.clone();
+    hashing(&st, move |accounts| accounts.create_user(&email, Role::Admin, Some(&password), &email.trim().to_ascii_lowercase(), &who)).await?;
+    let res = match hashing(&st, move |accounts| accounts.login(&b.email, &b.password, &from)).await? {
+        Login::Session(token, user) => signed_in((token, user)),
+        Login::SecondStep { .. } => Err(bad("sign in")),
+    };
+    push_auth_critical(&st).await;
+    res
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    email: String,
+    password: String,
+}
+
+async fn auth_login(State(st): St, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    let b: LoginBody = body(&bytes)?;
+    match hashing(&st, move |accounts| accounts.login(&b.email, &b.password, &from)).await? {
+        Login::Session(token, user) => {
+            push_auth_critical(&st).await;
+            signed_in((token, user))
+        }
+        Login::SecondStep { ticket, methods } => ok(json!({ "second_step": { "ticket": ticket, "methods": methods } })),
+    }
+}
+
+#[derive(Deserialize)]
+struct SecondStepBody {
+    ticket: String,
+    code: Option<String>,
+    backup_code: Option<String>,
+    passkey: Option<Assertion>,
+}
+
+async fn auth_second_step(State(st): St, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    let b: SecondStepBody = body(&bytes)?;
+    let proof = match (b.code, b.backup_code, b.passkey) {
+        (Some(code), _, _) => Proof::Totp(code),
+        (_, Some(code), _) => Proof::BackupCode(code),
+        (_, _, Some(assertion)) => Proof::Passkey(assertion),
+        _ => return Err(bad("one of 'code', 'backup_code' and 'passkey' is required")),
+    };
+    let ticket = b.ticket;
+    let res = accounts_blocking(&st, move |accounts| Ok(accounts.second_step(&ticket, proof, &from)?)).await?;
+    push_auth_critical(&st).await;
+    signed_in(res)
+}
+
+async fn auth_passkey_begin(State(st): St) -> ApiResult {
+    ok(json!({ "challenge": st.accounts.passkey_login_begin() }))
+}
+
+async fn auth_passkey_finish(State(st): St, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    let assertion = body::<Assertion>(&bytes)?;
+    let res = accounts_blocking(&st, move |accounts| Ok(accounts.passkey_login(&assertion, &from)?)).await?;
+    push_auth_critical(&st).await;
+    signed_in(res)
+}
+
+fn oauth_redirect_response(location: &str, cookies: &[String]) -> Response {
+    let mut resp = (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response();
+    for c in cookies {
+        if let Ok(v) = axum::http::HeaderValue::from_str(c) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+fn oauth_error_redirect(msg: &str, clear_cookie: bool) -> Response {
+    let enc = percent_encoding::utf8_percent_encode(msg, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let cookies = if clear_cookie {
+        vec!["fucf_oauth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string()]
+    } else {
+        Vec::new()
+    };
+    oauth_redirect_response(&format!("/#/?oauth_error={enc}"), &cookies)
+}
+
+fn oauth_redirect_uri(cfg: &crate::auth::OAuthConfig, headers: &axum::http::HeaderMap, panel_host: Option<&str>) -> (String, bool) {
+    if !cfg.redirect_base_url.is_empty() {
+        let base = cfg.redirect_base_url.trim_end_matches('/');
+        let secure = base.starts_with("https://");
+        return (format!("{base}/client/v4/auth/oauth/callback"), secure);
+    }
+    if let Some(ph) = panel_host.map(str::trim).filter(|s| !s.is_empty()) {
+        return (format!("https://{ph}/client/v4/auth/oauth/callback"), true);
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("localhost");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if host.starts_with("127.0.0.1") || host.starts_with("localhost") || host.starts_with("[::1]") {
+                "http".into()
+            } else {
+                "https".into()
+            }
+        });
+    (format!("{proto}://{host}/client/v4/auth/oauth/callback"), proto == "https")
+}
+
+fn oauth_random_b64url(len: usize) -> String {
+    use base64::Engine;
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut buf = vec![0u8; len];
+    let _ = SystemRandom::new().fill(&mut buf);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn extract_cookie(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    for hv in headers.get_all(header::COOKIE) {
+        if let Ok(s) = hv.to_str() {
+            for part in s.split(';') {
+                if let Some((k, v)) = part.trim().split_once('=') {
+                    if k.trim() == name {
+                        return Some(v.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn oauth_http_exchange(
+    edge: &crate::edge::Edge,
+    url: &str,
+    method: axum::http::Method,
+    headers: Vec<(&str, String)>,
+    body: Bytes,
+) -> Result<(StatusCode, Bytes), String> {
+    use http_body_util::BodyExt;
+    let uri: hyper::Uri = url.parse().map_err(|e| format!("invalid URL '{url}': {e}"))?;
+    let path_q = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let target = crate::edge::upstream::Target::from_url(url)?;
+    let mut req = hyper::Request::builder()
+        .method(method)
+        .uri(path_q)
+        .body(crate::edge::full(body))
+        .map_err(|e| e.to_string())?;
+    for (k, v) in headers {
+        if let (Ok(hn), Ok(hv)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(&v),
+        ) {
+            req.headers_mut().insert(hn, hv);
+        }
+    }
+    let resp = edge.upstream.send(&target, req).await.map_err(|e| format!("{e:?}"))?;
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
+    Ok((status, bytes))
+}
+
+async fn oauth_login(State(st): St, headers: axum::http::HeaderMap) -> Response {
+    let cfg = st.accounts.oauth_config();
+    if !cfg.enabled || cfg.issuer_url.is_empty() || cfg.client_id.is_empty() {
+        return oauth_error_redirect("oauth_not_configured", false);
+    }
+    let code_verifier = oauth_random_b64url(32);
+    let state = oauth_random_b64url(16);
+    let nonce = oauth_random_b64url(16);
+    let challenge = {
+        use base64::Engine;
+        let d = ring::digest::digest(&ring::digest::SHA256, code_verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d.as_ref())
+    };
+    let sealed = match st.accounts.seal_oauth_state(&code_verifier, &state, &nonce) {
+        Ok(s) => s,
+        Err(_) => return oauth_error_redirect("oauth_state_seal_failed", false),
+    };
+    let (redirect_uri, secure) = oauth_redirect_uri(&cfg, &headers, st.panel_host.as_deref());
+    let scopes = if cfg.scopes.is_empty() { "openid profile email" } else { cfg.scopes.as_str() };
+    let enc = |s: &str| percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let auth_url = format!(
+        "{}/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}&code_challenge={}&code_challenge_method=S256",
+        cfg.issuer_url,
+        enc(&cfg.client_id),
+        enc(&redirect_uri),
+        enc(scopes),
+        enc(&state),
+        enc(&nonce),
+        enc(&challenge),
+    );
+    let mut cookie = format!("fucf_oauth={sealed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    oauth_redirect_response(&auth_url, &[cookie])
+}
+
+async fn oauth_callback(
+    State(st): St,
+    axum::Extension(from): Caller,
+    headers: axum::http::HeaderMap,
+    Query(q): Params,
+) -> Response {
+    if let Some(err) = q.get("error").filter(|s| !s.is_empty()) {
+        return oauth_error_redirect(err, true);
+    }
+    let Some(code) = q.get("code").filter(|s| !s.is_empty()) else {
+        return oauth_error_redirect("missing_code", true);
+    };
+    let Some(state) = q.get("state").filter(|s| !s.is_empty()) else {
+        return oauth_error_redirect("missing_state", true);
+    };
+    let Some(cookie_val) = extract_cookie(&headers, "fucf_oauth") else {
+        return oauth_error_redirect("missing_oauth_cookie", true);
+    };
+    let Ok((code_verifier, _nonce)) = st.accounts.verify_oauth_state(&cookie_val, state) else {
+        return oauth_error_redirect("invalid_or_expired_state", true);
+    };
+
+    let cfg = st.accounts.oauth_config();
+    if !cfg.enabled || cfg.issuer_url.is_empty() || cfg.client_id.is_empty() {
+        return oauth_error_redirect("oauth_not_configured", true);
+    }
+    let (redirect_uri, secure) = oauth_redirect_uri(&cfg, &headers, st.panel_host.as_deref());
+    let enc = |s: &str| percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let mut form = format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        enc(code),
+        enc(&redirect_uri),
+        enc(&cfg.client_id),
+        enc(&code_verifier),
+    );
+    if !cfg.client_secret.is_empty() {
+        form.push_str(&format!("&client_secret={}", enc(&cfg.client_secret)));
+    }
+    let token_url = format!("{}/token", cfg.issuer_url);
+    let (tok_status, tok_bytes) = match oauth_http_exchange(
+        &st.edge,
+        &token_url,
+        axum::http::Method::POST,
+        vec![
+            ("content-type", "application/x-www-form-urlencoded".into()),
+            ("accept", "application/json".into()),
+        ],
+        Bytes::from(form),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => return oauth_error_redirect("token_exchange_failed", true),
+    };
+    if !tok_status.is_success() {
+        return oauth_error_redirect("token_exchange_rejected", true);
+    }
+    let Ok(tok_json) = serde_json::from_slice::<Value>(&tok_bytes) else {
+        return oauth_error_redirect("invalid_token_response", true);
+    };
+    let access_token = tok_json["access_token"].as_str().unwrap_or_default();
+
+    let mut email = String::new();
+    if !access_token.is_empty() {
+        let userinfo_url = format!("{}/userinfo", cfg.issuer_url);
+        if let Ok((ui_status, ui_bytes)) = oauth_http_exchange(
+            &st.edge,
+            &userinfo_url,
+            axum::http::Method::GET,
+            vec![
+                ("authorization", format!("Bearer {access_token}")),
+                ("accept", "application/json".into()),
+            ],
+            Bytes::new(),
+        )
+        .await
+        {
+            if ui_status.is_success() {
+                if let Ok(ui_json) = serde_json::from_slice::<Value>(&ui_bytes) {
+                    if let Some(e) = ui_json["email"].as_str() {
+                        email = e.to_string();
+                    }
+                }
+            }
+        }
+    }
+    if email.is_empty() {
+        if let Some(id_tok) = tok_json["id_token"].as_str() {
+            if let Some(payload_b64) = id_tok.split('.').nth(1) {
+                use base64::Engine;
+                if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64) {
+                    if let Ok(claims) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(e) = claims["email"].as_str() {
+                            email = e.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if email.is_empty() {
+        return oauth_error_redirect("userinfo_missing_email", true);
+    }
+
+    let (token, _) = match accounts_blocking(&st, move |accounts| Ok(accounts.login_or_provision_oauth(&email, &from)?)).await {
+        Ok(res) => res,
+        Err(e) => return oauth_error_redirect(&e.2, true),
+    };
+    push_auth_critical(&st).await;
+
+    let mut sess_cookie = format!("fucf_session={token}; Path=/; HttpOnly; SameSite=Lax");
+    if secure {
+        sess_cookie.push_str("; Secure");
+    }
+    let clear_oauth = "fucf_oauth=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+    let tok_enc = enc(&token);
+    oauth_redirect_response(&format!("/#/?oauth_token={tok_enc}"), &[clear_oauth, sess_cookie])
+}
+
+async fn get_oauth_config(State(st): St) -> ApiResult {
+    let mut cfg = st.accounts.oauth_config();
+    let has_secret = !cfg.client_secret.is_empty();
+    if has_secret {
+        cfg.client_secret = "***".into();
+    }
+    let mut val = serde_json::to_value(&cfg).unwrap_or_default();
+    if let Some(o) = val.as_object_mut() {
+        o.remove("sync");
+        o.insert("has_client_secret".into(), json!(has_secret));
+    }
+    ok(val)
+}
+
+async fn put_oauth_config(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    let cfg: crate::auth::OAuthConfig = body(&bytes)?;
+    let actor = who.email.clone();
+    let mut updated = accounts_blocking(&st, move |accounts| Ok(accounts.set_oauth_config(cfg, &actor, &from)?)).await?;
+    push_auth_critical(&st).await;
+    let has_secret = !updated.client_secret.is_empty();
+    if has_secret {
+        updated.client_secret = "***".into();
+    }
+    let mut val = serde_json::to_value(&updated).unwrap_or_default();
+    if let Some(o) = val.as_object_mut() {
+        o.remove("sync");
+        o.insert("has_client_secret".into(), json!(has_secret));
+    }
+    ok(val)
+}
+
+/// Who is signed in, and what protects the account.
+async fn account(State(st): St, axum::Extension(who): Who) -> ApiResult {
+    match &who.user_id {
+        Some(id) => ok(st.accounts.me(id, who.session_id.as_deref()).ok_or(StoreError::NotFound)?),
+        None => ok(json!({ "email": who.email, "role": who.role, "api_token": true, "initialized": st.accounts.initialized() })),
+    }
+}
+
+async fn account_logout(State(st): St, axum::Extension(who): Who) -> ApiResult {
+    if let Some(session) = who.session_id {
+        accounts_blocking(&st, move |accounts| {
+            accounts.logout(&session);
+            Ok(())
+        })
+        .await?;
+        push_auth_critical(&st).await;
+    }
+    ok(json!({}))
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    #[serde(default)]
+    current: String,
+    #[serde(default)]
+    new: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    code: String,
+}
+
+async fn account_password(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: PasswordBody = body(&bytes)?;
+    hashing(&st, move |accounts| accounts.change_password(&who, &b.current, &b.new, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({}))
+}
+
+/// Start setting up an authenticator app: the secret, as text and as a QR code.
+async fn totp_begin(State(st): St, axum::Extension(who): Who) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let (secret, uri) = accounts_blocking(&st, move |accounts| Ok(accounts.totp_begin(&who)?)).await?;
+    let uri_qr = uri.clone();
+    let svg = tokio::task::spawn_blocking(move || -> Result<String, ApiError> {
+        let qr = qrcode::QrCode::new(uri_qr.as_bytes()).map_err(|e| bad(e.to_string()))?;
+        Ok(qr.render::<qrcode::render::svg::Color>().min_dimensions(200, 200).quiet_zone(true).build())
+    })
+    .await
+    .map_err(|e| bad(e.to_string()))??;
+    ok(json!({ "secret": secret, "uri": uri, "qr_svg": svg }))
+}
+
+async fn totp_enable(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: PasswordBody = body(&bytes)?;
+    let codes = accounts_blocking(&st, move |accounts| Ok(accounts.totp_enable(&who, &b.code, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "backup_codes": codes }))
+}
+
+async fn two_factor_disable(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: PasswordBody = body(&bytes)?;
+    hashing(&st, move |accounts| accounts.two_factor_disable(&who, &b.password, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({}))
+}
+
+/// Ten new backup codes; the ones before stop working.
+async fn backup_codes(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: PasswordBody = body(&bytes)?;
+    let codes = hashing(&st, move |accounts| accounts.backup_codes_regenerate(&who, &b.password, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "backup_codes": codes }))
+}
+
+async fn passkey_begin(State(st): St, axum::Extension(who): Who) -> ApiResult {
+    ok(accounts_blocking(&st, move |accounts| Ok(accounts.passkey_register_begin(&who)?)).await?)
+}
+
+async fn passkey_add(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let reg = body::<Registration>(&bytes)?;
+    let res = accounts_blocking(&st, move |accounts| Ok(accounts.passkey_register(&who, &reg, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(res)
+}
+
+async fn passkey_delete(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let del_id = id.clone();
+    accounts_blocking(&st, move |accounts| Ok(accounts.passkey_delete(&who, &del_id, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "id": id }))
+}
+
+async fn session_delete(State(st): St, axum::Extension(who): Who, Path(id): Path<String>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let del_id = id.clone();
+    accounts_blocking(&st, move |accounts| Ok(accounts.revoke_session(&who, &del_id)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "id": id }))
+}
+
+async fn list_users(State(st): St) -> ApiResult {
+    ok(Value::Array(st.accounts.users()))
+}
+
+#[derive(Deserialize)]
+struct UserBody {
+    email: Option<String>,
+    role: Option<Role>,
+    /// Left out: one is made up, and returned this once.
+    password: Option<String>,
+    disabled: Option<bool>,
+    #[serde(default)]
+    reset_password: bool,
+    #[serde(default)]
+    reset_two_factor: bool,
+}
+
+async fn create_user(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: UserBody = body(&bytes)?;
+    let email = b.email.ok_or_else(|| bad("'email' is required"))?;
+    let role = b.role.unwrap_or(Role::Viewer);
+    let (user, generated) = hashing(&st, move |accounts| accounts.create_user(&email, role, b.password.as_deref(), &who.email, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "user": user, "password": generated }))
+}
+
+async fn update_user(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let b: UserBody = body(&bytes)?;
+    let (user, generated) =
+        hashing(&st, move |accounts| accounts.update_user(&id, b.role, b.disabled, b.reset_password, b.reset_two_factor, &who, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "user": user, "password": generated }))
+}
+
+async fn delete_user(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let del_id = id.clone();
+    accounts_blocking(&st, move |accounts| Ok(accounts.delete_user(&del_id, &who, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "id": id }))
+}
+
+async fn audit(State(st): St) -> ApiResult {
+    ok(Value::Array(st.accounts.audit()))
+}
+
+// ---------------------------------------------------------------- fleet ----
+
+/// Every node of the fleet in detail: what it runs, how it is doing, where
+/// it stands with the configuration and the release.
+async fn fleet_overview(State(st): St) -> ApiResult {
+    let (me, version, accel) = (st.node(), st.store.version(), st.role.is_accelerate());
+    let target = st.releases.target();
+    let configured = st.store.list_nodes();
+    let mut names: Vec<String> = configured.iter().map(|n| n.name.clone()).collect();
+    for known in std::iter::once(me.clone()).chain(st.fleet.all(&version).as_object().into_iter().flat_map(|peers| peers.keys().cloned())) {
+        if !names.contains(&known) {
+            names.push(known);
+        }
+    }
+    let nodes: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let own = *name == me;
+            let peer = if own { None } else { st.fleet.status(name, &version) };
+            let status = if own { st.info.status() } else { peer.as_ref().map(|p| p["status"].clone()).unwrap_or(Value::Null) };
+            let exe = if own { st.info.updater.own().to_string() } else { peer.as_ref().and_then(|p| p["exe"].as_str()).unwrap_or_default().to_string() };
+            let usage = if own { Some(st.limits.usage()) } else { st.fleet.usage(name) };
+            let node_role = if own { st.role.as_str().to_string() } else { st.fleet.role(name) };
+            json!({
+                "name": name,
+                "self": own,
+                "role": node_role,
+                "configured": configured.iter().find(|n| n.name == *name),
+                "healthy": st.health.is_up(name),
+                "online": own || peer.as_ref().is_some_and(|p| p["online"] == true),
+                "in_sync": own || peer.as_ref().is_some_and(|p| p["in_sync"] == true),
+                "config_version": if own { json!(version) } else { peer.as_ref().map(|p| p["version"].clone()).unwrap_or(Value::Null) },
+                "last_seen": peer.as_ref().map(|p| p["last_seen"].clone()),
+                "build": if own { json!(env!("CARGO_PKG_VERSION")) } else { peer.as_ref().map(|p| p["build"].clone()).unwrap_or(Value::Null) },
+                "exe": exe,
+                "takes_releases": if own { st.info.updater.enabled() } else { !exe.is_empty() },
+                "on_release": target.as_ref().is_some_and(|(_, sha)| *sha == exe),
+                "traffic": usage,
+                "status": status,
+            })
+        })
+        .collect();
+    let peers = match &target {
+        _ if accel => Vec::new(),
+        Some((submission, sha256)) => st.fleet.views(&version, submission, sha256),
+        None => st.fleet.views(&version, "", ""),
+    };
+    let acme_leader = crate::sync::acme_lease::preferred_leader(&me, &st.fleet.online_peers());
+    ok(json!({
+        "node": me,
+        "role": st.role.as_str(),
+        "writable": !accel,
+        "config_version": version,
+        "sync_rev": st.store.current_rev(),
+        "acme_leader": acme_leader,
+        "nodes": nodes,
+        "actions": crate::node::ACTIONS,
+        "release": st.releases.status(&me, &peers),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ActionBody {
+    action: String,
+}
+
+/// Tell a node to do something: this one at once, a peer when it next
+/// gets in touch (within seconds).
+async fn fleet_action(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(node): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: ActionBody = body(&bytes)?;
+    if !crate::node::ACTIONS.contains(&b.action.as_str()) {
+        return Err(bad(format!("'{}' is not something a node can be told to do ({})", b.action, crate::node::ACTIONS.join(", "))));
+    }
+    let said = if node == st.node() {
+        st.info.run(&b.action).await.map_err(bad)?
+    } else {
+        if st.role.is_accelerate() {
+            return Err(StoreError::ReadOnly.into());
+        }
+        if !st.fleet.status(&node, &st.store.version()).is_some_and(|p| p["online"] == true) {
+            return Err(ApiError(StatusCode::CONFLICT, 1006, format!("{node} is not in touch with this node right now")));
+        }
+        st.fleet.command(&node, &b.action);
+        format!("{node} is told when it next gets in touch (within a few seconds)")
+    };
+    let note_text = format!("{node}: {}", b.action);
+    let _ = accounts_blocking(&st, move |accounts| {
+        accounts.note(&who, "node.action", note_text, &from);
+        Ok(())
+    })
+    .await;
+    ok(json!({ "node": node, "action": b.action, "message": said }))
+}
+
+async fn verify_token() -> ApiResult {
+    ok(json!({ "status": "active" }))
+}
+
+// --------------------------------------------------------------- zones ----
+
+fn zone_json(z: &Zone) -> Value {
+    json!({
+        "id": z.id, "name": z.name, "status": z.status, "paused": z.paused, "type": z.kind,
+        "settings": z.settings,
+        "name_servers": z.name_servers, "created_on": z.created_on, "modified_on": z.modified_on,
+    })
+}
+
+async fn list_zones(State(st): St, Query(q): Params) -> ApiResult {
+    let name = q.get("name").map(|n| n.trim_end_matches('.').to_ascii_lowercase());
+    let zones = st.store.list_zones();
+    let items = zones.iter().filter(|z| name.as_ref().is_none_or(|n| &z.name == n)).map(zone_json).collect();
+    paginated(items, &q, 20)
+}
+
+#[derive(Deserialize)]
+struct ZoneBody {
+    name: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    paused: Option<bool>,
+}
+
+async fn create_zone(State(st): St, bytes: Bytes) -> ApiResult {
+    let b: ZoneBody = body(&bytes)?;
+    let name = b.name.ok_or_else(|| bad("'name' is required"))?;
+    ok(zone_json(&st.store.create_zone_as_async(&name, b.kind.as_deref().unwrap_or("full")).await?))
+}
+
+async fn get_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(zone_json(&st.store.get_zone(&zone_id)?))
+}
+
+async fn patch_zone(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: ZoneBody = body(&bytes)?;
+    if let Some(kind) = &b.kind {
+        st.store.set_zone_kind_async(&zone_id, kind).await?;
+    }
+    let zone = match b.paused {
+        Some(p) => st.store.set_zone_paused_async(&zone_id, p).await?,
+        None => st.store.get_zone(&zone_id)?,
+    };
+    ok(zone_json(&zone))
+}
+
+async fn delete_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    st.store.delete_zone_async(&zone_id).await?;
+    ok(json!({ "id": zone_id }))
+}
+
+// ------------------------------------------------------------- records ----
+
+fn record_json(z: &Zone, r: &Record) -> Value {
+    let mut v = json!({
+        "id": r.id, "zone_id": r.zone_id, "zone_name": z.name, "name": r.name, "type": r.rtype,
+        "content": r.content, "ttl": r.ttl, "proxied": r.proxied, "proxiable": proxiable(&r.rtype),
+        "comment": r.comment, "origin": r.origin, "created_on": r.created_on, "modified_on": r.modified_on,
+    });
+    if let Some(p) = r.priority {
+        v["priority"] = json!(p);
+    }
+    v
+}
+
+#[derive(Deserialize)]
+struct RecordBody {
+    #[serde(rename = "type")]
+    rtype: Option<String>,
+    name: Option<String>,
+    content: Option<String>,
+    ttl: Option<u32>,
+    priority: Option<u16>,
+    proxied: Option<bool>,
+    comment: Option<String>,
+    /// Origin options of a proxied record; an empty object removes them.
+    origin: Option<RecordOrigin>,
+}
+
+impl RecordBody {
+    /// Build a full record, taking missing fields from `base` (PATCH) or
+    /// requiring them (POST/PUT).
+    fn into_input(self, base: Option<&Record>) -> Result<RecordInput, ApiError> {
+        let need = |v: Option<String>, old: Option<&String>, field: &str| {
+            v.or_else(|| old.cloned()).ok_or_else(|| bad(format!("'{field}' is required")))
+        };
+        Ok(RecordInput {
+            rtype: need(self.rtype, base.map(|b| &b.rtype), "type")?,
+            name: need(self.name, base.map(|b| &b.name), "name")?,
+            content: need(self.content, base.map(|b| &b.content), "content")?,
+            ttl: self.ttl.or(base.map(|b| b.ttl)).unwrap_or(1),
+            priority: self.priority.or(base.and_then(|b| b.priority)),
+            proxied: self.proxied.or(base.map(|b| b.proxied)).unwrap_or(false),
+            comment: self.comment.or(base.and_then(|b| b.comment.clone())),
+            origin: self.origin.or(base.and_then(|b| b.origin.clone())),
+        })
+    }
+}
+
+async fn list_records(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    let (zone, records) = st.store.list_records(&zone_id)?;
+    let rtype = q.get("type").map(|t| t.to_ascii_uppercase());
+    let name = q.get("name").map(|n| n.trim_end_matches('.').to_ascii_lowercase());
+    let content = q.get("content");
+    let items = records
+        .iter()
+        .filter(|r| rtype.as_ref().is_none_or(|t| &r.rtype == t))
+        .filter(|r| name.as_ref().is_none_or(|n| &r.name == n))
+        .filter(|r| content.is_none_or(|c| &r.content == c))
+        .map(|r| record_json(&zone, r))
+        .collect();
+    paginated(items, &q, 100)
+}
+
+async fn create_record(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let input = body::<RecordBody>(&bytes)?.into_input(None)?;
+    let (zone, rec) = st.store.create_record_async(&zone_id, input).await?;
+    ok(record_json(&zone, &rec))
+}
+
+async fn get_record(State(st): St, Path((zone_id, record_id)): Path<(String, String)>) -> ApiResult {
+    let (zone, rec) = st.store.get_record(&zone_id, &record_id)?;
+    ok(record_json(&zone, &rec))
+}
+
+async fn put_record(State(st): St, Path((zone_id, record_id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    let input = body::<RecordBody>(&bytes)?.into_input(None)?;
+    let (zone, rec) = st.store.update_record_async(&zone_id, &record_id, input).await?;
+    ok(record_json(&zone, &rec))
+}
+
+async fn patch_record(State(st): St, Path((zone_id, record_id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    let (_, existing) = st.store.get_record(&zone_id, &record_id)?;
+    let input = body::<RecordBody>(&bytes)?.into_input(Some(&existing))?;
+    let (zone, rec) = st.store.update_record_async(&zone_id, &record_id, input).await?;
+    ok(record_json(&zone, &rec))
+}
+
+async fn delete_record(State(st): St, Path((zone_id, record_id)): Path<(String, String)>) -> ApiResult {
+    st.store.delete_record_async(&zone_id, &record_id).await?;
+    ok(json!({ "id": record_id }))
+}
+
+#[derive(Deserialize)]
+struct DnssecBody {
+    status: String,
+}
+
+async fn get_dnssec(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(st.store.get_dnssec(&zone_id)?)
+}
+
+async fn patch_dnssec(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: DnssecBody = body(&bytes)?;
+    let enable = match b.status.to_ascii_lowercase().as_str() {
+        "active" | "enabled" | "on" => true,
+        "disabled" | "off" => false,
+        other => return Err(bad(format!("status must be 'active' or 'disabled', not '{other}'"))),
+    };
+    ok(st.store.set_dnssec_async(&zone_id, enable).await?)
+}
+
+// ------------------------------------------- generic zone-scoped CRUD ----
+
+/// List/create/read/update/delete routes for one [`Item`] type.
+fn crud<T: Item>(path: &str) -> Router<Arc<ApiState>> {
+    Router::new()
+        .route(path, get(list_items::<T>).post(create_item::<T>))
+        .route(
+            &format!("{path}/{{item_id}}"),
+            get(get_item::<T>).put(put_item::<T>).patch(patch_item::<T>).delete(delete_item::<T>),
+        )
+}
+
+async fn list_items<T: Item>(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    let items = st.store.items::<T>(&zone_id)?;
+    paginated(items.iter().map(Item::public).collect(), &q, 100)
+}
+
+async fn create_item<T: Item>(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(st.store.save_item_async::<T>(&zone_id, None, body(&bytes)?, true).await?.public())
+}
+
+async fn get_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    ok(st.store.item::<T>(&zone_id, &id)?.public())
+}
+
+async fn put_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    ok(st.store.save_item_async::<T>(&zone_id, Some(&id), body(&bytes)?, true).await?.public())
+}
+
+async fn patch_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    ok(st.store.save_item_async::<T>(&zone_id, Some(&id), body(&bytes)?, false).await?.public())
+}
+
+async fn delete_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    st.store.delete_item_async::<T>(&zone_id, &id).await?;
+    ok(json!({ "id": id }))
+}
+
+// ------------------------------------------------ managed certificates ----
+
+/// A pack as the API shows it. `dns_delegation` lists the CNAME records with
+/// which a zone hosted elsewhere lets this server answer its DNS challenges.
+fn pack_json(st: &ApiState, pack: &CertificatePack) -> Value {
+    let mut v = pack.public();
+    if let Some(base) = &st.cname_base {
+        let mut names: Vec<&str> = pack.hosts.iter().map(|h| h.trim_start_matches("*.")).collect();
+        names.sort();
+        names.dedup();
+        let record = |h: &&str| json!({ "type": "CNAME", "name": format!("_acme-challenge.{h}"), "content": format!("_acme-challenge.{h}.{base}") });
+        v["dns_delegation"] = Value::Array(names.iter().map(record).collect());
+    }
+    v
+}
+
+async fn list_packs(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    let packs = st.store.items::<CertificatePack>(&zone_id)?;
+    paginated(packs.iter().map(|p| pack_json(&st, p)).collect(), &q, 100)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PackBody {
+    hosts: Vec<String>,
+    validation_method: String,
+}
+
+/// Order a certificate: it is requested from the CA right away and renewed
+/// from then on. Without `hosts`, for the zone's apex and wildcard.
+async fn create_pack(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: PackBody = if bytes.is_empty() { PackBody::default() } else { body(&bytes)? };
+    let order = json!({ "hosts": b.hosts, "validation_method": b.validation_method });
+    ok(pack_json(&st, &st.store.save_item_async::<CertificatePack>(&zone_id, None, order, true).await?))
+}
+
+async fn get_pack(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    ok(pack_json(&st, &st.store.item::<CertificatePack>(&zone_id, &id)?))
+}
+
+/// Try again now instead of waiting out the pause after a failure.
+async fn retry_pack(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    st.store.item::<CertificatePack>(&zone_id, &id)?;
+    let pack = st
+        .store
+        .update_pack_async(&id, |p| {
+            (p.next_attempt, p.attempts) = (None, 0);
+            if p.certificate.is_empty() {
+                (p.status, p.error) = ("pending".into(), String::new());
+            }
+        })
+        .await?;
+    ok(pack_json(&st, &pack))
+}
+
+// ------------------------------------------------------------ settings ----
+
+fn setting_json(z: &Zone, name: &str) -> Result<Value, ApiError> {
+    let all = serde_json::to_value(&z.settings).unwrap_or_default();
+    let value = all.get(name).cloned().ok_or_else(|| bad(format!("unknown setting '{name}'")))?;
+    Ok(json!({ "id": name, "value": value, "modified_on": z.modified_on, "editable": true }))
+}
+
+async fn get_settings(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    let z = st.store.get_zone(&zone_id)?;
+    let all = serde_json::to_value(&z.settings).unwrap_or_default();
+    let names: Vec<String> = all.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    ok(Value::Array(names.iter().filter_map(|n| setting_json(&z, n).ok()).collect()))
+}
+
+async fn get_setting(State(st): St, Path((zone_id, name)): Path<(String, String)>) -> ApiResult {
+    ok(setting_json(&st.store.get_zone(&zone_id)?, &name)?)
+}
+
+async fn patch_setting(State(st): St, Path((zone_id, name)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    let mut b: Value = body(&bytes)?;
+    let value = b.get_mut("value").map(Value::take).ok_or_else(|| bad("'value' is required"))?;
+    let z = st.store.update_setting_async(&zone_id, &name, value).await?;
+    ok(setting_json(&z, &name)?)
+}
+
+// ------------------------------------------------------------- e-mail ----
+
+/// This node's side of mail routing: the listener, its names, where it
+/// hands mail on, and what came through lately.
+async fn email_status(State(st): St) -> ApiResult {
+    let mut v = st.mail.as_ref().map(|m| m.status()).unwrap_or_else(|| {
+        json!({ "listening": Value::Null, "hosts": [], "relay": Value::Null })
+    });
+    v["activity"] = Value::Array(st.mail.as_ref().map(|m| m.activity()).unwrap_or_default());
+    ok(v)
+}
+
+/// A zone's mail routing: is it on, its rules, and whether the DNS the
+/// world needs (MX at the zone, an SPF that allows the exchangers) is
+/// there; what is missing comes back ready to paste.
+async fn email_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    let (z, records) = st.store.list_records(&zone_id)?;
+    let rules = st.store.items::<EmailRule>(&zone_id)?;
+    let apex = |rtype: &str| {
+        records.iter().filter(|r| r.rtype == rtype && r.name == z.name).map(|r| r.content.clone()).collect::<Vec<_>>()
+    };
+    let mx = apex("MX");
+    let spf: Vec<String> = apex("TXT").into_iter().filter(|t| t.starts_with("v=spf1")).collect();
+    let mut needed = Vec::new();
+    if mx.is_empty() {
+        needed.push(json!({ "type": "MX", "name": z.name, "priority": 10,
+            "content": st.mail.as_ref().and_then(|m| m.hosts.first().cloned()).unwrap_or_else(|| "mx.example".into()) }));
+    }
+    if spf.is_empty() {
+        // the exchangers are the only machines that send as this zone
+        needed.push(json!({ "type": "TXT", "name": z.name, "content": "v=spf1 mx -all" }));
+    }
+    ok(json!({
+        "enabled": z.settings.email_routing,
+        "rules": rules.iter().map(Item::public).collect::<Vec<_>>(),
+        "mx": mx,
+        "spf": spf,
+        "needed_records": needed,
+    }))
+}
+
+// ------------------------------------------------- cache and security ----
+
+#[derive(Deserialize)]
+struct PurgeBody {
+    #[serde(default)]
+    purge_everything: bool,
+    #[serde(default)]
+    files: Vec<String>,
+    #[serde(default)]
+    prefixes: Vec<String>,
+}
+
+async fn purge_cache(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    purge(&st, &zone_id, body(&bytes)?).await
+}
+
+/// Purge what the reserved `/cdn-cgi/fucf-warp` endpoint keeps in the edge
+/// cache; `files` and `prefixes` name its objects by their keys.
+async fn purge_warp_cache(State(st): St, bytes: Bytes) -> ApiResult {
+    purge(&st, crate::edge::warp::CACHE_SCOPE, body(&bytes)?).await
+}
+
+/// Drop cached objects of one scope (a zone, or the edge's own) on this
+/// node and, through the configuration, on every other one.
+async fn purge(st: &ApiState, scope: &str, b: PurgeBody) -> ApiResult {
+    if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() {
+        return Err(bad("specify purge_everything, files or prefixes"));
+    }
+    st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone()).await?;
+    let purged = if b.purge_everything {
+        st.cache.purge_zone(scope)
+    } else {
+        st.cache.purge_urls(scope, &b.files, false) + st.cache.purge_urls(scope, &b.prefixes, true)
+    };
+    ok(json!({ "id": scope, "purged": purged }))
+}
+
+async fn security_events(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(100usize).min(5000);
+    let mut events = st.waf.events(&zone_id, limit);
+    let me = st.node();
+    events.iter_mut().filter(|e| e.node.is_empty()).for_each(|e| e.node = me.clone());
+    ok(serde_json::to_value(events).unwrap_or_default())
+}
+
+// ------------------------------------------------------------- workers ----
+
+fn worker_json(w: &WorkerScript) -> Value {
+    json!({
+        "id": w.name,
+        "size": w.script.len(),
+        "kv_bindings": w.kv_bindings,
+        "d1_bindings": w.d1_bindings,
+        "crons": w.crons,
+        "created_on": w.created_on,
+        "modified_on": w.modified_on,
+    })
+}
+
+async fn list_workers(State(st): St) -> ApiResult {
+    ok(Value::Array(st.store.list_workers().iter().map(worker_json).collect()))
+}
+
+/// Upload a script: the request body is the JavaScript source.
+async fn put_worker(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    let script = String::from_utf8(bytes.to_vec()).map_err(|_| bad("script must be UTF-8"))?;
+    if script.trim().is_empty() {
+        return Err(bad("script is empty"));
+    }
+    crate::workers::check_syntax(&script).map_err(bad)?;
+    ok(worker_json(&st.store.put_worker_async(&name, Some(script), None).await?))
+}
+
+async fn get_worker(State(st): St, Extension(who): Extension<Principal>, Path(name): Path<String>) -> Result<Response, ApiError> {
+    if who.role == Role::Viewer {
+        return Err(ApiError(StatusCode::FORBIDDEN, 2010, "your role does not allow this".into()));
+    }
+    let w = st.store.get_worker(&name)?;
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], w.script).into_response())
+}
+
+async fn delete_worker(State(st): St, Path(name): Path<String>) -> ApiResult {
+    st.store.delete_worker_async(&name).await?;
+    ok(json!({ "id": name }))
+}
+
+async fn get_worker_settings(State(st): St, Extension(who): Extension<Principal>, Path(name): Path<String>) -> ApiResult {
+    let w = st.store.get_worker(&name)?;
+    let vars = if who.role == Role::Viewer {
+        w.vars.keys().map(|k| (k.clone(), "***".to_string())).collect()
+    } else {
+        w.vars
+    };
+    ok(json!({
+        "vars": vars,
+        "kv_bindings": w.kv_bindings,
+        "d1_bindings": w.d1_bindings,
+        "crons": w.crons,
+    }))
+}
+
+#[derive(Deserialize)]
+struct WorkerSettings {
+    #[serde(default)]
+    vars: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    kv_bindings: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    d1_bindings: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    crons: Option<Vec<String>>,
+}
+
+async fn patch_worker_settings(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: WorkerSettings = body(&bytes)?;
+    if let Some(crons) = &b.crons {
+        for expr in crons {
+            crate::workers::cron::CronExpr::parse(expr).map_err(bad)?;
+        }
+    }
+    let w = st
+        .store
+        .patch_worker_bindings_async(&name, b.vars, b.kv_bindings, b.d1_bindings, b.crons)
+        .await?;
+    wake_push(&st);
+    ok(json!({
+        "vars": w.vars,
+        "kv_bindings": w.kv_bindings,
+        "d1_bindings": w.d1_bindings,
+        "crons": w.crons,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TriggerScheduledBody {
+    cron: Option<String>,
+}
+
+async fn trigger_worker_scheduled(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    let req: TriggerScheduledBody = if bytes.is_empty() {
+        TriggerScheduledBody::default()
+    } else {
+        body(&bytes)?
+    };
+    let w = std::sync::Arc::new(st.store.get_worker(&name)?);
+    let cron_expr = req
+        .cron
+        .or_else(|| w.crons.first().cloned())
+        .unwrap_or_else(|| "* * * * *".into());
+    crate::workers::cron::CronExpr::parse(&cron_expr).map_err(bad)?;
+    let ms = crate::sync::clock::unix_ms();
+    crate::workers::run_scheduled(st.edge.clone(), st.store.snapshot(), w, &cron_expr, ms)
+        .await
+        .map_err(bad)?;
+    ok(json!({ "triggered": true, "cron": cron_expr, "scheduledTime": ms }))
+}
+
+// ------------------------------------------------------------------ kv ----
+
+fn kv_store(st: &ApiState) -> Result<std::sync::Arc<crate::workers::kv::KvStore>, ApiError> {
+    st.edge
+        .kv
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, 5030, "KV store not initialized".into()))
+}
+
+fn d1_store(st: &ApiState) -> Result<std::sync::Arc<crate::workers::db::D1Store>, ApiError> {
+    st.edge
+        .d1
+        .get()
+        .cloned()
+        .ok_or_else(|| ApiError(StatusCode::SERVICE_UNAVAILABLE, 5031, "D1 store not initialized".into()))
+}
+
+fn wake_push(st: &ApiState) {
+    if let Some(s) = &st.sync {
+        s.wake_push();
+    }
+}
+
+async fn kv_list_namespaces(State(st): St) -> ApiResult {
+    let kv = kv_store(&st)?;
+    let list = tokio::task::spawn_blocking(move || kv.list_namespaces())
+        .await
+        .map_err(|e| bad(e.to_string()))?;
+    ok(json!(list))
+}
+
+#[derive(Deserialize)]
+struct KvNamespaceInput {
+    title: String,
+}
+
+async fn kv_create_namespace(State(st): St, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let inp: KvNamespaceInput = body(&bytes)?;
+    let kv = kv_store(&st)?;
+    let ns = tokio::task::spawn_blocking(move || kv.create_namespace(&inp.title))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!(ns))
+}
+
+async fn kv_get_namespace(State(st): St, Path(ns_id): Path<String>) -> ApiResult {
+    let kv = kv_store(&st)?;
+    let ns = tokio::task::spawn_blocking(move || kv.get_namespace(&ns_id))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, 1001, "KV namespace not found".into()))?;
+    ok(json!(ns))
+}
+
+async fn kv_rename_namespace(State(st): St, Path(ns_id): Path<String>, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let inp: KvNamespaceInput = body(&bytes)?;
+    let kv = kv_store(&st)?;
+    let ns = tokio::task::spawn_blocking(move || kv.rename_namespace(&ns_id, &inp.title))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!(ns))
+}
+
+async fn kv_delete_namespace(State(st): St, Path(ns_id): Path<String>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let kv = kv_store(&st)?;
+    let id = ns_id.clone();
+    tokio::task::spawn_blocking(move || kv.delete_namespace(&id))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!({ "id": ns_id }))
+}
+
+async fn kv_list_keys(State(st): St, Path(ns_id): Path<String>, Query(q): Params) -> ApiResult {
+    let kv = kv_store(&st)?;
+    let prefix = q.get("prefix").cloned();
+    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok());
+    let cursor = q.get("cursor").cloned();
+    let res = tokio::task::spawn_blocking(move || {
+        kv.list(&ns_id, prefix.as_deref(), limit, cursor.as_deref())
+    })
+    .await
+    .map_err(|e| bad(e.to_string()))?
+    .map_err(bad)?;
+    ok(res)
+}
+
+async fn kv_get_value(
+    State(st): St,
+    Extension(who): Extension<Principal>,
+    Path((ns_id, key)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    if who.role == Role::Viewer {
+        return Err(ApiError(StatusCode::FORBIDDEN, 2010, "your role does not allow this".into()));
+    }
+    let kv = kv_store(&st)?;
+    let got = tokio::task::spawn_blocking(move || kv.get_with_metadata(&ns_id, &key))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    match got {
+        Some((bytes, _)) => Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()),
+        None => Err(ApiError(StatusCode::NOT_FOUND, 1009, "key not found".into())),
+    }
+}
+
+async fn kv_put_value(
+    State(st): St,
+    Path((ns_id, key)): Path<(String, String)>,
+    Query(q): Params,
+    bytes: Bytes,
+) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let expiration = q.get("expiration").and_then(|s| s.parse::<u64>().ok());
+    let expiration_ttl = q.get("expiration_ttl").and_then(|s| s.parse::<u64>().ok());
+    let metadata: Option<Value> = match q.get("metadata") {
+        Some(m) => Some(serde_json::from_str(m).map_err(|e| bad(e.to_string()))?),
+        None => None,
+    };
+    let kv = kv_store(&st)?;
+    tokio::task::spawn_blocking(move || kv.put(&ns_id, &key, &bytes, expiration, expiration_ttl, metadata))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!({ "saved": true }))
+}
+
+async fn kv_delete_value(State(st): St, Path((ns_id, key)): Path<(String, String)>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let kv = kv_store(&st)?;
+    tokio::task::spawn_blocking(move || kv.delete(&ns_id, &key))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!({ "deleted": true }))
+}
+
+// ------------------------------------------------------------------ d1 ----
+
+async fn d1_list_databases(State(st): St) -> ApiResult {
+    let d1 = d1_store(&st)?;
+    let list = tokio::task::spawn_blocking(move || d1.list_databases())
+        .await
+        .map_err(|e| bad(e.to_string()))?;
+    ok(json!(list))
+}
+
+#[derive(Deserialize)]
+struct D1CreateInput {
+    name: String,
+}
+
+async fn d1_create_database(State(st): St, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let inp: D1CreateInput = body(&bytes)?;
+    let d1 = d1_store(&st)?;
+    let db = tokio::task::spawn_blocking(move || d1.create_database(&inp.name))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!(db))
+}
+
+async fn d1_get_database(State(st): St, Path(db_id): Path<String>) -> ApiResult {
+    let d1 = d1_store(&st)?;
+    let db = tokio::task::spawn_blocking(move || d1.get_database(&db_id))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, 1002, "D1 database not found".into()))?;
+    ok(json!(db))
+}
+
+async fn d1_delete_database(State(st): St, Path(db_id): Path<String>) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let d1 = d1_store(&st)?;
+    let id = db_id.clone();
+    tokio::task::spawn_blocking(move || d1.delete_database(&id))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    wake_push(&st);
+    ok(json!({ "id": db_id }))
+}
+
+#[derive(Deserialize)]
+struct D1QueryBody {
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
+}
+
+async fn d1_query(State(st): St, Path(db_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let req: D1QueryBody = body(&bytes)?;
+    let params = req
+        .params
+        .iter()
+        .map(crate::workers::db::D1Param::from_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(bad)?;
+    let d1 = d1_store(&st)?;
+    let res = tokio::task::spawn_blocking(move || d1.query(&db_id, &req.sql, params, false, false, None))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    if !st.role.is_accelerate() {
+        wake_push(&st);
+    }
+    ok(json!([res]))
+}
+
+async fn d1_raw(State(st): St, Path(db_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let req: D1QueryBody = body(&bytes)?;
+    let params = req
+        .params
+        .iter()
+        .map(crate::workers::db::D1Param::from_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(bad)?;
+    let d1 = d1_store(&st)?;
+    let res = tokio::task::spawn_blocking(move || d1.query(&db_id, &req.sql, params, true, true, None))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    if !st.role.is_accelerate() {
+        wake_push(&st);
+    }
+    ok(res)
+}
+
+/// The look-back window of an analytics query, in minutes: `since=-1440`
+/// (as Cloudflare writes it), `1440`, `90m`, `24h` or `7d`.
+fn window(q: &HashMap<String, String>, default: u64) -> Result<u64, ApiError> {
+    let Some(raw) = q.get("since") else { return Ok(default) };
+    let s = raw.trim().trim_start_matches('-');
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let per_unit = match unit {
+        "" | "m" => 1,
+        "h" => 60,
+        "d" => 1440,
+        _ => 0,
+    };
+    match digits.parse::<u64>() {
+        Ok(n) if per_unit > 0 && n > 0 => Ok(n.saturating_mul(per_unit).min(crate::edge::stats::MAX_WINDOW)),
+        _ => Err(bad("'since' must look like -1440 (minutes), 90m, 24h or 7d")),
+    }
+}
+
+/// Traffic of one zone: totals, time series, split by node and breakdowns.
+async fn analytics(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    let step = q.get("step").and_then(|v| v.parse().ok());
+    ok(st.stats.report(&zone_id, &st.node(), window(&q, 1440)?, step))
+}
+
+/// Traffic totals of every zone.
+async fn analytics_summary(State(st): St, Query(q): Params) -> ApiResult {
+    let window = window(&q, 1440)?;
+    let mut by_zone = st.stats.summary(window);
+    let mut totals = crate::edge::stats::Counters::default();
+    let mut zones = serde_json::Map::new();
+    for z in st.store.list_zones() {
+        let c = by_zone.remove(&z.id).unwrap_or_default();
+        totals.add(&c);
+        let mut v = c.json();
+        v["name"] = json!(z.name);
+        zones.insert(z.id, v);
+    }
+    ok(json!({ "window": window, "totals": totals.json(), "zones": zones }))
+}
+
+// ------------------------------------------------ fleet: nodes, system ----
+
+async fn system(State(st): St) -> ApiResult {
+    let (accel, version) = (st.role.is_accelerate(), st.store.version());
+    let fleet = if accel { Value::Null } else { st.fleet.all(&version) };
+    ok(json!({
+        "role": st.role.as_str(),
+        "writable": !accel,
+        "node": st.node(),
+        "build": env!("CARGO_PKG_VERSION"),
+        "exe": st.releases.updater.own(),
+        "started_at": st.started_at,
+        "version": version,
+        "sync_rev": st.store.current_rev(),
+        "cname_base": st.cname_base,
+        "name_servers": st.name_servers,
+        "panel_host": st.panel_host,
+        "continents": crate::geo::CONTINENTS,
+        "peers": fleet,
+        "replicas": fleet,
+    }))
+}
+
+fn record_peer_query(st: &ApiState, q: &HashMap<String, String>) {
+    if let (Some(node), Some(theirs)) = (q.get("node").filter(|n| !n.is_empty()), q.get("version")) {
+        st.fleet.seen(node, theirs, q.get("build").map(String::as_str).unwrap_or(""));
+        if let Some(role) = q.get("role").filter(|r| !r.is_empty()) {
+            st.fleet.set_role(node, role);
+        }
+        if let Some(exe) = q.get("exe").filter(|exe| !exe.is_empty()) {
+            let list = |key: &str| q.get(key).map(|l| l.split(',').filter(|s| !s.is_empty()).map(String::from).collect());
+            st.fleet.runs(
+                node,
+                crate::fleet::PeerExe {
+                    sha256: exe.clone(),
+                    trusted: q.get("trusted").is_none_or(|t| t != "0"),
+                    submission: q.get("submission").cloned().unwrap_or_default(),
+                    rejected: list("rejected").unwrap_or_default(),
+                },
+            );
+        }
+    }
+}
+
+/// Legacy state endpoint (compat for older tools/replicas).
+async fn replication_state(State(st): St, Query(q): Params) -> ApiResult {
+    let version = st.store.version();
+    record_peer_query(&st, &q);
+    let (release, commands) = match q.get("node").filter(|n| !n.is_empty()) {
+        Some(node) if !st.role.is_accelerate() => (st.releases.directive(node), st.fleet.take_commands(node)),
+        _ => (Value::Null, Vec::new()),
+    };
+    if q.get("version") == Some(&version) {
+        return ok(json!({ "version": version, "changed": false, "release": release, "commands": commands }));
+    }
+    ok(json!({ "version": version, "changed": true, "data": st.store.export(), "release": release, "commands": commands }))
+}
+
+fn caller_is_accelerate(headers: &axum::http::HeaderMap, role_hint: Option<&str>) -> bool {
+    headers
+        .get("x-fucf-node-role")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.eq_ignore_ascii_case("accelerate"))
+        || role_hint.is_some_and(|s| s.eq_ignore_ascii_case("accelerate"))
+}
+
+/// Incremental (or epoch-mismatch full-resync) peer sync pull endpoint.
+async fn replication_sync(State(st): St, headers: axum::http::HeaderMap, Query(q): Params) -> ApiResult {
+    record_peer_query(&st, &q);
+    let is_accel_caller = caller_is_accelerate(&headers, q.get("role").map(|s| s.as_str()));
+    let (release, commands) = match q.get("node").filter(|n| !n.is_empty()) {
+        Some(node) if !st.role.is_accelerate() => (st.releases.directive(node), st.fleet.take_commands(node)),
+        _ => (Value::Null, Vec::new()),
+    };
+
+    let since_cfg: u64 = q.get("since").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ep_cfg = q.get("epoch").filter(|s| !s.is_empty()).cloned();
+    let cfg_cur_ep = st.store.epoch();
+    let need_cfg = st.store.current_rev() > since_cfg
+        || ep_cfg.as_deref() != Some(cfg_cur_ep.as_str());
+    let config_delta = if need_cfg {
+        Some(st.store.export_since_async(since_cfg, ep_cfg.as_deref()).await.map_err(bad)?)
+    } else {
+        None
+    };
+
+    let since_acc: u64 = q.get("since_accounts").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ep_acc = q.get("epoch_accounts").filter(|s| !s.is_empty()).cloned();
+    let acc_cur_ep = st.accounts.epoch();
+    let need_acc = !is_accel_caller
+        && (st.accounts.current_rev() > since_acc
+            || ep_acc.as_deref() != Some(acc_cur_ep.as_str()));
+    let accounts_delta = if need_acc {
+        let ep_opt = ep_acc.clone();
+        Some(
+            accounts_blocking::<crate::sync::DomainDelta>(&st, move |accounts| {
+                accounts.export_since(since_acc, ep_opt.as_deref()).map_err(bad)
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let mut domains_out: Vec<crate::sync::DomainDelta> = Vec::new();
+    if let (Some(sync), Some(dom_json)) = (&st.sync, q.get("domains")) {
+        if let Ok(cursors) = serde_json::from_str::<HashMap<String, (String, u64)>>(dom_json) {
+            let providers = sync.providers.read().unwrap().clone();
+            for p in providers {
+                let (ep, since) = cursors.get(p.domain()).map(|(e, r)| (Some(e.clone()), *r)).unwrap_or((None, 0));
+                if p.current_rev() > since || ep.as_deref() != Some(p.epoch().as_str()) {
+                    let delta = tokio::task::spawn_blocking(move || p.export_since(since, ep.as_deref()))
+                        .await
+                        .map_err(|e| bad(e.to_string()))?
+                        .map_err(bad)?;
+                    domains_out.push(delta);
+                }
+            }
+        }
+    }
+
+    let (hlc_ms, hlc_seq) = st
+        .sync
+        .as_ref()
+        .map(|s| s.clock.current())
+        .unwrap_or_else(|| (crate::sync::clock::unix_ms(), 0));
+    ok(json!({
+        "node": st.node(),
+        "role": st.role.as_str(),
+        "version": st.store.version(),
+        "build": env!("CARGO_PKG_VERSION"),
+        "hlc": { "ms": hlc_ms, "seq": hlc_seq },
+        "config": config_delta,
+        "accounts": accounts_delta,
+        "domains": domains_out,
+        "release": release,
+        "commands": commands,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SyncHlc {
+    ms: u64,
+    seq: u64,
+}
+
+#[derive(Deserialize)]
+struct TelemetryPush {
+    #[serde(default)]
+    boot: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    stats: HashMap<String, crate::edge::stats::Series>,
+    #[serde(default)]
+    events: Vec<crate::edge::waf::Event>,
+    #[serde(default)]
+    usage: Option<crate::limits::Usage>,
+    #[serde(default)]
+    status: Value,
+}
+
+#[derive(Deserialize)]
+struct SyncPushBody {
+    #[serde(default)]
+    node: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    build: String,
+    #[serde(default)]
+    hlc: Option<SyncHlc>,
+    #[serde(default)]
+    config: Option<crate::sync::DomainDelta>,
+    #[serde(default)]
+    accounts: Option<crate::sync::DomainDelta>,
+    #[serde(default)]
+    domains: Vec<crate::sync::DomainDelta>,
+    #[serde(default)]
+    telemetry: Option<TelemetryPush>,
+}
+
+/// Peer push-notify & telemetry absorption endpoint.
+async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let req: SyncPushBody = body(&bytes)?;
+    if caller_is_accelerate(&headers, Some(req.role.as_str()))
+        && (req.config.is_some() || req.accounts.is_some() || !req.domains.is_empty())
+    {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            2010,
+            "accelerate nodes cannot push config, accounts, or domain state".into(),
+        ));
+    }
+    let clock = st
+        .sync
+        .as_ref()
+        .map(|s| s.clock.clone())
+        .unwrap_or_else(|| Arc::new(crate::sync::HlcClock::default()));
+    if let Some(h) = &req.hlc {
+        clock.observe(h.ms, h.seq);
+    }
+    let peer_node = req.node.trim().to_ascii_lowercase();
+    if !peer_node.is_empty() && peer_node.len() <= 64 {
+        st.fleet.seen(&peer_node, &req.version, &req.build);
+        if !req.role.is_empty() {
+            st.fleet.set_role(&peer_node, &req.role);
+        }
+        if let Some(tele) = req.telemetry {
+            if let Some(usage) = tele.usage {
+                st.fleet.set_usage(&peer_node, usage);
+            }
+            if !tele.status.is_null() {
+                st.fleet.set_status(&peer_node, tele.status);
+            }
+            if st.fleet.fresh_report(&peer_node, &tele.boot, tele.seq) {
+                st.stats.absorb(&peer_node, &tele.stats);
+                st.waf.absorb(&peer_node, tele.events);
+            }
+        }
+    }
+
+    let mut adopted = false;
+    if let Some(cfg) = req.config {
+        adopted |= st.store.merge_delta_async(&cfg).await?;
+    }
+    if let Some(acc) = req.accounts {
+        let clk = clock.clone();
+        adopted |= accounts_blocking(&st, move |accounts| accounts.merge_delta(&acc, &clk).map_err(bad)).await?;
+    }
+    if !req.domains.is_empty() {
+        if let Some(sync) = &st.sync {
+            let providers = sync.providers.read().unwrap().clone();
+            for d in req.domains {
+                if let Some(p) = providers.iter().find(|p| p.domain() == d.domain).cloned() {
+                    let clk = clock.clone();
+                    adopted |= tokio::task::spawn_blocking(move || p.merge_delta(&d, &clk))
+                        .await
+                        .map_err(|e| bad(e.to_string()))?
+                        .map_err(bad)?;
+                }
+            }
+        }
+    }
+
+    ok(json!({
+        "node": st.node(),
+        "role": st.role.as_str(),
+        "version": st.store.version(),
+        "build": env!("CARGO_PKG_VERSION"),
+        "adopted": adopted,
+        "accepted": true,
+    }))
+}
+
+// ------------------------------------------------------------ releases ----
+
+/// Where this node's binary and, across peers, the roll-out stand.
+async fn release_status(State(st): St) -> ApiResult {
+    let peers = match st.releases.target() {
+        _ if st.role.is_accelerate() => Vec::new(),
+        Some((submission, sha256)) => st.fleet.views(&st.store.version(), &submission, &sha256),
+        None => st.fleet.views(&st.store.version(), "", ""),
+    };
+    ok(st.releases.status(&st.node(), &peers))
+}
+
+/// Upload a release (the body is the binary, signed with the release key)
+/// and start rolling it out.
+async fn submit_release(State(st): St, Path(sha256): Path<String>, Query(q): Params, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let signature = q.get("signature").cloned().ok_or_else(|| bad("'signature' is required"))?;
+    let deaf: Vec<String> =
+        st.fleet.views(&st.store.version(), "", "").into_iter().filter(|p| p.online && p.exe.is_empty()).map(|p| p.name).collect();
+    if !deaf.is_empty() {
+        let message = format!("{} would not take the release (an older build there): install the current build by hand first", deaf.join(", "));
+        return Err(ApiError(StatusCode::CONFLICT, 1005, message));
+    }
+    let releases = st.releases.clone();
+    let submitted = tokio::task::spawn_blocking(move || releases.submit(&sha256, &signature, &bytes)).await;
+    submitted.map_err(|e| bad(e.to_string()))?.map_err(bad)?;
+    release_status(State(st)).await
+}
+
+/// Take the release back: the nodes that run it go back to what they ran
+/// before. With forget=true it is only dropped, and the nodes stay as they are.
+async fn withdraw_release(State(st): St, Path(sha256): Path<String>, Query(q): Params) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let releases = st.releases.clone();
+    let forget = q.get("forget").is_some_and(|f| f == "true" || f == "1");
+    tokio::task::spawn_blocking(move || releases.withdraw(&sha256, forget))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(|e| ApiError(StatusCode::NOT_FOUND, 1002, e))?;
+    release_status(State(st)).await
+}
+
+/// The binary of the fleet's release, for peers.
+async fn release_binary(State(st): St, Path(sha256): Path<String>) -> Result<Response, ApiError> {
+    let releases = st.releases.clone();
+    let bytes = tokio::task::spawn_blocking(move || releases.binary(&sha256)).await.ok().flatten().ok_or(StoreError::NotFound)?;
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+}
+
+#[derive(Deserialize)]
+struct Report {
+    node: String,
+    version: String,
+    #[serde(default)]
+    build: String,
+    /// One run of the replica's process, and the number of this report in it.
+    #[serde(default)]
+    boot: String,
+    #[serde(default)]
+    seq: u64,
+    #[serde(default)]
+    stats: HashMap<String, crate::edge::stats::Series>,
+    #[serde(default)]
+    events: Vec<crate::edge::waf::Event>,
+    /// Where the replica stands with its traffic allowance.
+    #[serde(default)]
+    usage: Option<crate::limits::Usage>,
+    /// What the replica says about itself (see crate::node).
+    #[serde(default)]
+    status: Value,
+}
+
+/// Replicas/peers deliver what they recorded: traffic counters and security events.
+async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    let report: Report = body(&bytes)?;
+    let node = report.node.trim().to_ascii_lowercase();
+    if node.is_empty() || node.len() > 64 {
+        return Err(bad("'node' must be the name of the reporting node"));
+    }
+    st.fleet.seen(&node, &report.version, &report.build);
+    if let Some(usage) = report.usage {
+        st.fleet.set_usage(&node, usage);
+    }
+    if !report.status.is_null() {
+        st.fleet.set_status(&node, report.status);
+    }
+    let fresh = st.fleet.fresh_report(&node, &report.boot, report.seq);
+    if fresh {
+        st.stats.absorb(&node, &report.stats);
+        st.waf.absorb(&node, report.events);
+    }
+    ok(json!({ "accepted": fresh, "version": st.store.version() }))
+}
+
+/// Nodes with their health as probed from this node and what each peer last reported.
+async fn list_nodes(State(st): St) -> ApiResult {
+    let list = st.store.list_nodes();
+    let (me, version, accel) = (st.node(), st.store.version(), st.role.is_accelerate());
+    let nodes = list.iter().map(|n| {
+        let mut v = serde_json::to_value(n).unwrap_or_default();
+        v["healthy"] = json!(st.health.is_up(&n.name));
+        v["self"] = json!(n.name == me);
+        v["replica"] = if accel || n.name == me { Value::Null } else { st.fleet.status(&n.name, &version).unwrap_or(Value::Null) };
+        let usage = if n.name == me { Some(st.limits.usage()) } else { st.fleet.usage(&n.name) };
+        v["traffic"] = serde_json::to_value(usage).unwrap_or_default();
+        v
+    });
+    ok(Value::Array(nodes.collect()))
+}
+
+async fn list_steering(State(st): St) -> ApiResult {
+    ok(serde_json::to_value(st.store.list_steering()).unwrap_or_default())
+}
+
+async fn create_steering(State(st): St, bytes: Bytes) -> ApiResult {
+    ok(serde_json::to_value(st.store.save_steering_async(None, body(&bytes)?).await?).unwrap_or_default())
+}
+
+async fn update_steering(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(serde_json::to_value(st.store.save_steering_async(Some(&id), body(&bytes)?).await?).unwrap_or_default())
+}
+
+async fn delete_steering(State(st): St, Path(id): Path<String>) -> ApiResult {
+    st.store.delete_steering_async(&id).await?;
+    ok(json!({ "id": id }))
+}
+
+// ------------------------------------------------ local proxy rules ----
+
+async fn list_proxy_rules(State(st): St) -> ApiResult {
+    ok(serde_json::to_value(st.store.list_proxy_rules()).unwrap_or_default())
+}
+
+async fn get_proxy_rule(State(st): St, Path(id): Path<String>) -> ApiResult {
+    let rule = st.store.get_proxy_rule(&id).ok_or(StoreError::NotFound)?;
+    ok(serde_json::to_value(rule).unwrap_or_default())
+}
+
+async fn create_proxy_rule(State(st): St, bytes: Bytes) -> ApiResult {
+    let rule = st.store.save_proxy_rule_async(None, body(&bytes)?).await?;
+    if let Some(sync) = &st.sync {
+        sync.wake_push();
+    }
+    ok(serde_json::to_value(rule).unwrap_or_default())
+}
+
+async fn update_proxy_rule(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    let rule = st.store.save_proxy_rule_async(Some(&id), body(&bytes)?).await?;
+    if let Some(sync) = &st.sync {
+        sync.wake_push();
+    }
+    ok(serde_json::to_value(rule).unwrap_or_default())
+}
+
+async fn delete_proxy_rule(State(st): St, Path(id): Path<String>) -> ApiResult {
+    st.store.delete_proxy_rule_async(&id).await?;
+    if let Some(sync) = &st.sync {
+        sync.wake_push();
+    }
+    ok(json!({ "id": id }))
+}
+
+async fn create_node(State(st): St, bytes: Bytes) -> ApiResult {
+    ok(serde_json::to_value(st.store.save_node_async(None, body(&bytes)?).await?).unwrap_or_default())
+}
+
+async fn get_node(State(st): St, Path(id): Path<String>) -> ApiResult {
+    let node = st.store.list_nodes().into_iter().find(|n| n.id == id).ok_or(StoreError::NotFound)?;
+    ok(serde_json::to_value(node).unwrap_or_default())
+}
+
+async fn update_node(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(serde_json::to_value(st.store.save_node_async(Some(&id), body(&bytes)?).await?).unwrap_or_default())
+}
+
+async fn delete_node(State(st): St, Path(id): Path<String>) -> ApiResult {
+    st.store.delete_node_async(&id).await?;
+    ok(json!({ "id": id }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+    use tower_service::Service;
+
+    fn make_test_state(dir: &std::path::Path, role: crate::sync::NodeRole) -> Arc<ApiState> {
+        let store = Arc::new(Store::open(&dir.join("store.json"), vec![]).unwrap());
+        let cache = Arc::new(Cache::new(1 << 20));
+        let waf = Arc::new(Waf::new());
+        let edge_val = crate::edge::Edge::new(store.clone(), cache.clone(), waf.clone(), vec![]).unwrap();
+        let kv = if role.is_accelerate() {
+            crate::workers::kv::KvStore::open_ephemeral(store.clock(), "jp".into())
+        } else {
+            crate::workers::kv::KvStore::open(dir.join("kv"), store.clock(), "au".into()).unwrap()
+        };
+        let d1 = if role.is_accelerate() {
+            crate::workers::db::D1Store::open_ephemeral(store.clock(), "jp".into())
+        } else {
+            crate::workers::db::D1Store::open(dir.join("d1"), store.clock(), "au".into()).unwrap()
+        };
+        let _ = edge_val.kv.set(kv);
+        let _ = edge_val.d1.set(d1);
+        let edge = Arc::new(edge_val);
+        let stats = Arc::new(crate::edge::stats::Stats::load(&dir.join("stats.json")));
+        let health = Arc::new(crate::geo::Health::default());
+        let fleet = Arc::new(crate::fleet::Fleet::default());
+        let limits = Arc::new(crate::limits::Limits::load(&dir.join("limits.json")));
+        let gfw = Arc::new(crate::gfw::GfwMonitor::default());
+        let updater = Arc::new(crate::release::Updater::new(dir, None));
+        let releases = Arc::new(crate::release::Releases::new(updater.clone(), !role.is_accelerate()));
+        let accounts = Arc::new(Accounts::open(dir.join("accounts.json"), None));
+        let info = Arc::new(crate::node::NodeInfo {
+            started: std::time::Instant::now(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            listeners: vec![],
+            cache: cache.clone(),
+            limits: limits.clone(),
+            gfw,
+            updater,
+            front: None,
+        });
+        Arc::new(ApiState {
+            store,
+            token: "test-token".into(),
+            cache,
+            waf,
+            stats,
+            cname_base: None,
+            name_servers: vec![],
+            panel_host: None,
+            health,
+            fleet,
+            limits,
+            edge_ips: vec![],
+            node_name: Some("au".into()),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            releases,
+            accounts,
+            info,
+            password_checks: tokio::sync::Semaphore::new(4),
+            mail: None,
+            role,
+            sync: None,
+            edge,
+        })
+    }
+
+    async fn call(app: &mut Router, method: &str, uri: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.call(req).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn kv_d1_and_scheduled_http_api_routes() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-m2-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        let mut app = router(st);
+
+        // 1. KV namespace + CRUD routes
+        let (sc, b) = call(&mut app, "POST", "/client/v4/kv/namespaces", br#"{"title":"sessions"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let ns_id = serde_json::from_slice::<Value>(&b).unwrap()["result"]["id"].as_str().unwrap().to_string();
+
+        let (sc, _) = call(&mut app, "PUT", &format!("/client/v4/kv/namespaces/{ns_id}/values/k1?expiration_ttl=120"), b"hello-kv".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        let (sc, b) = call(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns_id}/values/k1"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(b, b"hello-kv");
+
+        let (sc, b) = call(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns_id}/keys?prefix=k"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["result"]["keys"].as_array().unwrap().len(), 1);
+
+        let (sc, _) = call(&mut app, "DELETE", &format!("/client/v4/kv/namespaces/{ns_id}/values/k1"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns_id}/values/k1"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // 2. D1 database + query/raw routes
+        let (sc, b) = call(&mut app, "POST", "/client/v4/d1/database", br#"{"name":"appdb"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let db_id = serde_json::from_slice::<Value>(&b).unwrap()["result"]["id"].as_str().unwrap().to_string();
+
+        let (sc, _) = call(&mut app, "POST", &format!("/client/v4/d1/database/{db_id}/query"), br#"{"sql":"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "POST", &format!("/client/v4/d1/database/{db_id}/query"), br#"{"sql":"INSERT INTO items (id, name) VALUES (?, ?)","params":[1,"alpha"]}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, b) = call(&mut app, "POST", &format!("/client/v4/d1/database/{db_id}/raw"), br#"{"sql":"SELECT id, name FROM items"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["result"], json!([["id", "name"], [1, "alpha"]]));
+
+        // 3. Worker upload + bindings + scheduled trigger route
+        let worker_js = br#"export default { async scheduled(ctrl, env, ctx) { await env.KV.put("ran", ctrl.cron); } }"#.to_vec();
+        let (sc, _) = call(&mut app, "PUT", "/client/v4/workers/scripts/cronw", worker_js).await;
+        assert_eq!(sc, StatusCode::OK);
+        let patch = serde_json::to_vec(&json!({
+            "kv_bindings": { "KV": ns_id },
+            "d1_bindings": { "DB": db_id },
+            "crons": ["*/5 * * * *"]
+        })).unwrap();
+        let (sc, _) = call(&mut app, "PATCH", "/client/v4/workers/scripts/cronw/settings", patch).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "POST", "/client/v4/workers/scripts/cronw/scheduled", br#"{"cron":"*/5 * * * *"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, b) = call(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns_id}/values/ran"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(b, b"*/5 * * * *");
+
+        // 4. Accelerate node rejects KV/D1 writes with 409 Conflict
+        let dir_acc = std::env::temp_dir().join(format!("fucf-api-acc-{}", uuid::Uuid::new_v4().simple()));
+        let mut acc_app = router(make_test_state(&dir_acc, crate::sync::NodeRole::Accelerate));
+        let (sc, _) = call(&mut acc_app, "POST", "/client/v4/kv/namespaces", br#"{"title":"ro"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::CONFLICT);
+        let (sc, _) = call(&mut acc_app, "POST", "/client/v4/d1/database", br#"{"name":"ro"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::CONFLICT);
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir_acc);
+    }
+
+    #[tokio::test]
+    async fn proxy_rules_api_crud_and_sync() {
+        let dir_a = std::env::temp_dir().join(format!("fucf-api-proxy-a-{}", uuid::Uuid::new_v4().simple()));
+        let dir_b = std::env::temp_dir().join(format!("fucf-api-proxy-b-{}", uuid::Uuid::new_v4().simple()));
+        let st_a = make_test_state(&dir_a, crate::sync::NodeRole::Peer);
+        let st_b = make_test_state(&dir_b, crate::sync::NodeRole::Peer);
+        let mut app_a = router(st_a.clone());
+
+        let body = serde_json::to_vec(&json!({
+            "name": "caddy-app",
+            "hosts": ["app.example.com"],
+            "upstreams": [{"url": "h2c://127.0.0.1:10002", "weight": 2}]
+        })).unwrap();
+        let (sc, b) = call(&mut app_a, "POST", "/client/v4/proxy/rules", body).await;
+        assert_eq!(sc, StatusCode::OK);
+        let rule_id = serde_json::from_slice::<Value>(&b).unwrap()["result"]["id"].as_str().unwrap().to_string();
+
+        let (sc, b) = call(&mut app_a, "GET", &format!("/client/v4/proxy/rules/{rule_id}"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["result"]["name"], "caddy-app");
+
+        // Replicate from A to B via delta sync
+        let delta = st_a.store.export_since_async(0, None).await.unwrap();
+        assert!(st_b.store.merge_delta_async(&delta).await.unwrap());
+        assert_eq!(st_b.store.list_proxy_rules().len(), 1);
+
+        // Update + delete on A
+        let patch = serde_json::to_vec(&json!({"name": "caddy-app-v2"})).unwrap();
+        let (sc, _) = call(&mut app_a, "PUT", &format!("/client/v4/proxy/rules/{rule_id}"), patch).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app_a, "DELETE", &format!("/client/v4/proxy/rules/{rule_id}"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let delta2 = st_a.store.export_since_async(delta.to_rev, Some(&delta.epoch)).await.unwrap();
+        assert!(st_b.store.merge_delta_async(&delta2).await.unwrap());
+        assert!(st_b.store.list_proxy_rules().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    async fn call_raw(
+        app: &mut Router,
+        method: &str,
+        uri: &str,
+        extra_headers: Vec<(&str, &str)>,
+        body: Vec<u8>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use http_body_util::BodyExt;
+        use tower_service::Service;
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        for (k, v) in extra_headers {
+            builder = builder.header(k, v);
+        }
+        let req = builder.body(axum::body::Body::from(body)).unwrap();
+        let resp = app.call(req).await.unwrap();
+        let status = resp.status();
+        let hdrs = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, hdrs, bytes)
+    }
+
+    #[tokio::test]
+    async fn oauth_sso_flow_and_cross_node_cookie() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let idp_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let resp = if req_str.starts_with("POST /token") {
+                        let body = r#"{"access_token":"tok123","token_type":"Bearer"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    } else if req_str.starts_with("GET /userinfo") {
+                        let body = r#"{"sub":"u1","email":"sso@example.com"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir_a = std::env::temp_dir().join(format!("fucf-oauth-a-{}", uuid::Uuid::new_v4().simple()));
+        let dir_b = std::env::temp_dir().join(format!("fucf-oauth-b-{}", uuid::Uuid::new_v4().simple()));
+        let st_a = make_test_state(&dir_a, crate::sync::NodeRole::Peer);
+        let st_b = make_test_state(&dir_b, crate::sync::NodeRole::Peer);
+        let mut app_a = router(st_a.clone());
+        let mut app_b = router(st_b.clone());
+
+        let cfg = serde_json::to_vec(&json!({
+            "enabled": true,
+            "issuer_url": format!("http://127.0.0.1:{idp_port}"),
+            "client_id": "panel-cid",
+            "client_secret": "panel-sec",
+            "auto_provision": true,
+            "default_role": "editor",
+        })).unwrap();
+        let (sc, b) = call(&mut app_a, "PUT", "/client/v4/oauth/config", cfg).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["result"]["client_secret"], "***");
+
+        // Initiate /login on Node A (creates ClusterSecret if not yet set)
+        let (sc, hdrs, _) = call_raw(&mut app_a, "GET", "/client/v4/auth/oauth/login", vec![("host", "127.0.0.1:8080")], vec![]).await;
+        assert_eq!(sc, StatusCode::FOUND);
+
+        // Replicate accounts (ClusterSecret + OAuthConfig) from A to B
+        let acc_delta = st_a.accounts.export_since(0, None).unwrap();
+        let clk_b = st_b.store.clock();
+        assert!(st_b.accounts.merge_delta(&acc_delta, &clk_b).unwrap());
+        let loc = hdrs.get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+        assert!(loc.contains("code_challenge_method=S256"), "{loc}");
+        let state_param = loc.split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        let cookie_hdr = hdrs.get(header::SET_COOKIE).unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+
+        // Complete /callback on Node B (stateless cross-node cookie!)
+        let cb_uri = format!("/client/v4/auth/oauth/callback?code=authcode1&state={state_param}");
+        let (sc, hdrs, _) = call_raw(
+            &mut app_b,
+            "GET",
+            &cb_uri,
+            vec![("host", "127.0.0.1:8080"), ("cookie", &cookie_hdr)],
+            vec![],
+        ).await;
+        assert_eq!(sc, StatusCode::FOUND);
+        let redir = hdrs.get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+        assert!(redir.starts_with("/#/?oauth_token="), "expected oauth_token redirect, got {redir}");
+        let tok_raw = redir.strip_prefix("/#/?oauth_token=").unwrap();
+        let tok = percent_encoding::percent_decode_str(tok_raw).decode_utf8_lossy().to_string();
+        let (sc, _, me_body) = call_raw(&mut app_b, "GET", "/client/v4/account", vec![("authorization", &format!("Bearer {tok}"))], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let me: Value = serde_json::from_slice(&me_body).unwrap();
+        assert_eq!(me["result"]["email"], "sso@example.com");
+        assert_eq!(me["result"]["role"], "editor");
+
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    #[tokio::test]
+    async fn accelerate_sync_secret_and_write_isolation() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-iso-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let mut app = router(st.clone());
+
+        // Accelerate pull omits accounts_delta
+        let (sc, _, b) = call_raw(
+            &mut app,
+            "GET",
+            "/client/v4/replication/sync?since=0&since_accounts=0",
+            vec![("authorization", "Bearer test-token"), ("x-fucf-node-role", "accelerate")],
+            vec![],
+        ).await;
+        assert_eq!(sc, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert!(v["result"]["accounts"].is_null(), "accelerate pull must omit accounts_delta");
+        assert!(!v["result"]["config"].is_null(), "accelerate pull keeps config");
+
+        // Accelerate push with config/accounts/domains is rejected with 403
+        let push_body = serde_json::to_vec(&json!({
+            "node": "accel-1",
+            "role": "accelerate",
+            "config": st.store.export_since_async(0, None).await.unwrap(),
+        })).unwrap();
+        let (sc, _, _) = call_raw(
+            &mut app,
+            "POST",
+            "/client/v4/replication/sync",
+            vec![("authorization", "Bearer test-token"), ("x-fucf-node-role", "accelerate"), ("content-type", "application/json")],
+            push_body,
+        ).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn viewer_redaction_for_workers_and_kv() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-viewer-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("view@example.com", Role::Viewer, Some("viewer-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let viewer_tok = match st.accounts.login("view@example.com", "viewer-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => token,
+            _ => panic!("expected signed in"),
+        };
+        let mut app = router(st.clone());
+
+        let (sc, _) = call(&mut app, "PUT", "/client/v4/workers/scripts/secw", b"export default { fetch() { return new Response('ok'); } }".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "PATCH", "/client/v4/workers/scripts/secw/settings", br#"{"vars":{"API_KEY":"supersecret"}}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, b) = call(&mut app, "POST", "/client/v4/kv/namespaces", br#"{"title":"secns"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let ns_id = serde_json::from_slice::<Value>(&b).unwrap()["result"]["id"].as_str().unwrap().to_string();
+        let (sc, _) = call(&mut app, "PUT", &format!("/client/v4/kv/namespaces/{ns_id}/values/tok"), b"secretval".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        let auth_hdr = format!("Bearer {viewer_tok}");
+        let (sc, _, _) = call_raw(
+            &mut app,
+            "POST",
+            "/client/v4/account/password",
+            vec![("authorization", &auth_hdr), ("content-type", "application/json")],
+            br#"{"current":"viewer-pass-123","new":"viewer-pass-456"}"#.to_vec(),
+        ).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/workers/scripts/secw", vec![("authorization", &auth_hdr)], vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns_id}/values/tok"), vec![("authorization", &auth_hdr)], vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let (sc, _, b) = call_raw(&mut app, "GET", "/client/v4/workers/scripts/secw/settings", vec![("authorization", &auth_hdr)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let settings: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(settings["result"]["vars"]["API_KEY"], "***");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oauth_redirect_uri_prefers_panel_host() {
+        let mut cfg = crate::auth::OAuthConfig::default();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::HOST, "evil.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+
+        // When panel_host is configured and redirect_base_url is empty, Host / X-Forwarded-Proto are ignored.
+        let (uri, secure) = oauth_redirect_uri(&cfg, &headers, Some("dashboard.fucloudflare.com"));
+        assert_eq!(uri, "https://dashboard.fucloudflare.com/client/v4/auth/oauth/callback");
+        assert!(secure);
+
+        // Explicit redirect_base_url takes precedence over panel_host.
+        cfg.redirect_base_url = "https://auth.example.com/".into();
+        let (uri, secure) = oauth_redirect_uri(&cfg, &headers, Some("dashboard.fucloudflare.com"));
+        assert_eq!(uri, "https://auth.example.com/client/v4/auth/oauth/callback");
+        assert!(secure);
+    }
+}
