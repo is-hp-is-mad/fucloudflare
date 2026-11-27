@@ -111,6 +111,7 @@ body.busy .bar{opacity:1}
 @keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(300%)}}
 
 /* Kumo App-Dash Shell: 260px/57px sidebar + 58px topbar + 1000px track */
+.sb-backdrop{display:none}
 .shell{display:grid;grid-template-columns:var(--sidebar-nav-width) minmax(0,1fr);min-height:100dvh;transition:grid-template-columns .18s ease}
 .shell[data-collapsed="true"]{--sidebar-nav-width:57px}
 [data-sidebar="sidebar"]{position:sticky;top:0;height:100dvh;width:var(--sidebar-nav-width);display:flex;flex-direction:column;background:var(--color-kumo-elevated);border-right:1px solid var(--color-kumo-hairline);overflow:hidden;transition:width .18s ease;z-index:20}
