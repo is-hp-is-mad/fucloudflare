@@ -49,6 +49,7 @@ impl Edge {
         let internal = is_fucf_node(ip, &self.store.snapshot().nodes);
         let resp = match (name, below) {
             ("fucf-trace", None) => self.trace(ip, ssl, &req, host, ray),
+            ("challenge-platform", Some("verify")) => return super::challenge::verify(&self.waf, ip, ssl, req, ray).await,
             ("warp", _) if self.warp_upstream.get().is_some() => return warp::handle(self.clone(), warp::Visitor { ip, ssl, host, ray }, req).await,
             ("fucf-warp", _) => return warp::handle(self.clone(), warp::Visitor { ip, ssl, host, ray }, req).await,
             // The notice of a node over its traffic allowance takes its looks

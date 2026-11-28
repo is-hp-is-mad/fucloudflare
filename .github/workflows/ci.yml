@@ -172,6 +172,14 @@ jobs:
           cd scripts/ui && npm init -y >/dev/null && npm i --no-audit --no-fund playwright@1.49.1 >/dev/null && npx playwright install --with-deps chromium >/dev/null
           node shots.mjs http://127.0.0.1:8787/ "$SESSION" "$ZONE" ../../shots ../../edge-pages/*.html
           node shots-auth.mjs http://auth.example.com:18080 "$AUTH_COOKIE" ../../shots
+      - name: the human check catches headless Chromium
+        run: |
+          api() { curl -fsS -X "$1" -H "Authorization: Bearer $UI_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:8787/client/v4$2" ${3:+-d "$3"}; }
+          api POST /zones/$ZONE/firewall/rules '{"expression":"http.request.uri.path eq \"/guarded-js\"","action":"js_challenge","description":"ci"}' >/dev/null
+          api POST /zones/$ZONE/firewall/rules '{"expression":"http.request.uri.path eq \"/guarded-click\"","action":"managed_challenge","description":"ci"}' >/dev/null
+          sleep 1
+          curl -s -D- -o /dev/null -H "Host: example.com" http://127.0.0.1:18080/guarded-click | grep -i "cf-mitigated: challenge" || { echo "no challenge"; exit 1; }
+          cd scripts/ui && node challenge-check.mjs http://example.com:18080 ../../shots
       - uses: actions/upload-artifact@v4
         if: always()
         with:

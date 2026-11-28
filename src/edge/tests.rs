@@ -287,6 +287,12 @@ async fn caches_static_content() {
     let second = get(&env, "example.com", "/assets/app.js?v=1").await;
     assert_eq!(second.header("cf-cache-status"), Some("HIT"));
     assert!(second.header("age").is_some());
+    // every response tells whether it came from the cache
+    assert!(first.header("x-cache").is_some_and(|v| v.starts_with("MISS from ")), "{}", first.head);
+    assert!(second.header("x-cache").is_some_and(|v| v.starts_with("HIT from ")), "{}", second.head);
+    let own = get(&env, "nowhere.test", "/").await;
+    assert_eq!((own.status, own.header("cf-cache-status")), (404, Some("NONE")));
+    assert!(own.header("x-cache").is_some_and(|v| v.starts_with("MISS from ")));
     assert_eq!(first.body, second.body);
     assert_eq!(env.hits.load(Ordering::SeqCst), 1);
 
@@ -962,6 +968,66 @@ async fn decoy_names_get_nothing_and_a_leaving_node_says_it_is_updating() {
     assert!(r.body.contains("This edge node is updating") && r.body.contains("class=\"hop warn\""), "{}", r.body);
     env.edge.resume();
     assert_eq!(get(&env, "www.example.com", "/").await.status, 200);
+}
+
+#[tokio::test]
+async fn the_human_check_lets_a_person_through_and_keeps_automation_out() {
+    let env = setup().await;
+    let rule = json!({ "expression": "http.request.uri.path eq \"/guarded\"", "action": "managed_challenge" });
+    env.store.save_item::<FirewallRule>(&env.zone, None, rule, true).unwrap();
+    const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
+    let browser = format!("User-Agent: {UA}\r\nAccept-Language: zh-CN,zh;q=0.9\r\n");
+
+    let r = send(&env, "GET", "example.com", "/guarded", &browser, "").await;
+    assert_eq!((r.status, r.header("cf-mitigated")), (403, Some("challenge")));
+    assert!(r.body.contains("Verify you are human") && r.body.contains("challenge-platform/verify"), "{}", r.body);
+    assert_eq!(env.hits.load(Ordering::SeqCst), 0);
+    let config: serde_json::Value = {
+        let start = r.body.find("<script type=\"application/json\" id=\"fc\">").unwrap() + 40;
+        let end = start + r.body[start..].find("</script>").unwrap();
+        serde_json::from_str(&r.body[start..end]).unwrap()
+    };
+    let ticket = config["t"].as_str().unwrap().to_string();
+    let bits = config["b"].as_u64().unwrap() as u8;
+    let n = (0u64..).find(|n| challenge::work_done(&ticket, *n, bits)).unwrap();
+
+    let report = |signals: serde_json::Value, mode: &str| {
+        json!({ "t": ticket, "n": n, "m": mode, "s": signals,
+            "c": { "trusted": true, "dt": 1200, "detail": 1, "pt": "mouse" },
+            "ev": { "moves": 30, "dist": 500, "first": 200, "keys": 0, "touch": 0, "scroll": 0, "age": 1500 } })
+        .to_string()
+    };
+    let safari = json!({ "wd": false, "auto": [], "ua": UA, "uad": null, "langs": 2, "plug": 5, "hc": 8, "scr": [1512, 982, 1512, 944, 30],
+        "win": [1512, 860, 1512, 944], "tz": "Asia/Shanghai", "touch": 0, "chrome": false, "own": 0, "wdp": true, "nat": 0,
+        "gl": "Apple Inc. / Apple GPU", "cdp": false, "notif": "default", "perm": "prompt" });
+    let post = |body: String| {
+        let headers = format!("{browser}Content-Type: application/json\r\n");
+        async move { send(&env, "POST", "example.com", "/cdn-cgi/challenge-platform/verify", &headers, &body).await }
+    };
+
+    // a managed challenge needs the click
+    let r = post(report(safari.clone(), "auto")).await;
+    assert!(r.status == 200 && r.body.contains("\"need\":\"click\""), "{}", r.body);
+    // a driven browser fails, even with a click
+    let mut driven = safari.clone();
+    driven["wd"] = json!(true);
+    let r = post(report(driven, "click")).await;
+    assert!(r.status == 403 && r.body.contains("webdriver") && r.header("set-cookie").is_none(), "{}", r.body);
+    // the work has to be done
+    let lazy = report(safari.clone(), "click").replace(&format!("\"n\":{n}"), &format!("\"n\":{}", n + 1));
+    let r = post(lazy).await;
+    assert!(r.status == 403 && r.body.contains("bad_work") || challenge::work_done(&ticket, n + 1, bits), "{}", r.body);
+    // a person clicks: cleared
+    let r = post(report(safari, "click")).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let cookie = r.header("set-cookie").unwrap().to_string();
+    assert!(cookie.starts_with("fucf_clearance=") && cookie.contains("HttpOnly"), "{cookie}");
+    let pair = cookie.split(';').next().unwrap();
+    let r = send(&env, "GET", "example.com", "/guarded", &format!("{browser}Cookie: {pair}\r\n"), "").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    // another browser cannot use the ticket
+    let r = send(&env, "POST", "example.com", "/cdn-cgi/challenge-platform/verify", "User-Agent: curl/8\r\nContent-Type: application/json\r\n", &report(json!({}), "click")).await;
+    assert!(r.status == 403 && r.body.contains("other_visitor"), "{}", r.body);
 }
 
 #[tokio::test]

@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod certdir;
 pub mod cgi;
+pub mod challenge;
 pub mod files;
 pub mod compress;
 pub mod front;
@@ -106,6 +107,24 @@ impl std::fmt::Display for Reason {
 
 /// The title of every error page about the origin.
 pub const ORIGIN_ERROR: &str = "回源错误 Origin error";
+
+/// Every response says whether it came from the cache: `cf-cache-status`
+/// (Cloudflare's labels; `NONE` for what the edge answered by itself:
+/// error pages, challenges, the panel, `/cdn-cgi`), and `x-cache`
+/// (`HIT from <colo>` or `MISS from <colo>`), the short form most tools read.
+fn mark_cache(resp: &mut Response<Body>, colo: &str) {
+    let label = match resp.headers().get("cf-cache-status").and_then(|v| v.to_str().ok()) {
+        Some(label) => label.to_string(),
+        None => {
+            resp.headers_mut().insert("cf-cache-status", HeaderValue::from_static("NONE"));
+            "NONE".to_string()
+        }
+    };
+    let hit = if stats::served_from_cache(&label) { "HIT" } else { "MISS" };
+    if let Ok(v) = HeaderValue::from_str(&format!("{hit} from {colo}")) {
+        resp.headers_mut().insert("x-cache", v);
+    }
+}
 
 /// Set on panel requests a node passes on to the node that runs the panel.
 const PANEL_HOP: &str = "fucf-panel-hop";
@@ -556,21 +575,6 @@ fn page_with(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx, s
 fn capitalized(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-}
-
-fn challenge_page(token: &str, ray: &str) -> Response<Body> {
-    html_page(
-        StatusCode::FORBIDDEN,
-        "Just a moment...",
-        &format!(
-            "<div class=\"spin\" aria-hidden=\"true\"></div><h1>Checking your browser...</h1>\
-             <p>正在确认您的浏览器，几秒后会自动继续。This takes a few seconds.</p>\
-             <noscript><p>Please enable JavaScript to continue. 请启用 JavaScript 后继续。</p></noscript>\
-             <script>document.cookie=\"{cookie}={token}; path=/; max-age=1800; SameSite=Lax\";location.reload();</script>\
-             <footer><span>Ray ID <code>{ray}</code></span><span>fucf</span></footer>",
-            cookie = waf::CLEARANCE_COOKIE,
-        ),
-    )
 }
 
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
@@ -2114,7 +2118,10 @@ impl Edge {
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
                 }
-                Verdict::Challenge { token } => Some(challenge_page(&token, ray)),
+                Verdict::Challenge { click } => {
+                    let ip = info.ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+                    Some(challenge::page(&self.waf, &zone.zone.id, ip, info.header("user-agent"), click, ray, page_lang, &self.here().colo))
+                }
             };
             if let Some(mut resp) = stopped {
                 resp.extensions_mut().insert(WafHit);
@@ -2239,6 +2246,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
         let ctx = PageCtx { hop: Hop::Edge, host: asked_host, here: edge.here(), reason: None, lang };
         let mut resp = updating_page(&ray, &ctx);
         resp.headers_mut().insert(header::SERVER, HeaderValue::from_static("fucf"));
+        mark_cache(&mut resp, &edge.here().colo);
         return resp;
     }
     let _busy = Busy::new(edge.clone());
@@ -2312,6 +2320,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
         resp = resp.map(|inner| Throttled { inner, limits, held: Bytes::new(), wait: None }.boxed());
     }
     resp.headers_mut().insert(header::SERVER, HeaderValue::from_static("fucf"));
+    mark_cache(&mut resp, &edge.here().colo);
     if let Ok(v) = HeaderValue::from_str(&ray) {
         resp.headers_mut().insert("fucf-ray", v);
     }

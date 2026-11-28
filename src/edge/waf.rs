@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MAX_EVENTS: usize = 5000;
 /// Events a replica holds for the primary while it cannot be reached.
 const MAX_OUTBOX: usize = 2000;
-const CLEARANCE_SECS: u64 = 1800;
+pub const CLEARANCE_SECS: u64 = 1800;
 /// An origin that keeps failing is logged once per this many seconds (per zone, host and status).
 const ORIGIN_ERROR_EVERY: u64 = 60;
 pub const CLEARANCE_COOKIE: &str = "fucf_clearance";
@@ -49,7 +49,8 @@ pub enum Verdict {
     Pass,
     Block { rule_id: String },
     RateLimited { retry_after: u64 },
-    Challenge { token: String },
+    /// The human check (see `super::challenge`); `click`: it always asks for a click.
+    Challenge { click: bool },
 }
 
 // ------------------------------------------------------ managed rules ----
@@ -375,6 +376,17 @@ impl Waf {
         hex(hmac::sign(&self.key, format!("{zone_id}|{ip}|{expiry}").as_bytes()).as_ref())
     }
 
+    /// A MAC of `data` under the fleet's secret, hex.
+    pub fn mac(&self, data: &str) -> String {
+        hex(hmac::sign(&self.key, data.as_bytes()).as_ref())
+    }
+
+    /// Whether `mac_hex` is [`Waf::mac`] of `data`.
+    pub fn mac_ok(&self, data: &str, mac_hex: &str) -> bool {
+        let bytes: Option<Vec<u8>> = (0..mac_hex.len() / 2).map(|i| mac_hex.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok())).collect();
+        mac_hex.len() == 64 && bytes.is_some_and(|m| hmac::verify(&self.key, data.as_bytes(), &m).is_ok())
+    }
+
     pub fn clearance_token(&self, zone_id: &str, ip: IpAddr) -> String {
         let expiry = unix_now() + CLEARANCE_SECS;
         format!("{expiry}.{}", self.sign(zone_id, ip, expiry))
@@ -451,11 +463,13 @@ impl Waf {
                     return Verdict::Pass;
                 }
                 "log" => self.log(zone, info, ray, "firewall", ident, "log"),
-                "js_challenge" => {
+                "js_challenge" | "managed_challenge" => {
                     if !self.has_clearance(&zone.zone.id, info) {
-                        self.log(zone, info, ray, "firewall", ident, "js_challenge");
-                        let Some(ip) = info.ip else { return Verdict::Block { rule_id: rule.meta.id.clone() } };
-                        return Verdict::Challenge { token: self.clearance_token(&zone.zone.id, ip) };
+                        self.log(zone, info, ray, "firewall", ident, &rule.action);
+                        if info.ip.is_none() {
+                            return Verdict::Block { rule_id: rule.meta.id.clone() };
+                        }
+                        return Verdict::Challenge { click: rule.action == "managed_challenge" };
                     }
                 }
                 _ => {
@@ -469,7 +483,7 @@ impl Waf {
         if zone.zone.settings.security_level == "under_attack" && !self.has_clearance(&zone.zone.id, info) {
             self.log(zone, info, ray, "security_level", ("under_attack", "Under attack mode"), "js_challenge");
             return match info.ip {
-                Some(ip) => Verdict::Challenge { token: self.clearance_token(&zone.zone.id, ip) },
+                Some(_) => Verdict::Challenge { click: false },
                 None => Verdict::Block { rule_id: "under_attack".into() },
             };
         }

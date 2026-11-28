@@ -678,7 +678,7 @@ const COMMON = [{ k: "priority", label: "优先级（小的先执行）", type: 
 const DESC = { k: "description", label: "说明" };
 const RULES = {
   firewall: { path: "firewall/rules", title: "防火墙规则", empty: "<b>还没有防火墙规则</b>按路径、IP、国家或运营商拦截、质询或放行请求。", cols: ["description", "expression", "action", "priority", "enabled"],
-    fields: [DESC, EXPR, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["js_challenge", "JS 质询"], ["log", "仅记录"], ["skip", "放行并跳过后续检查"]] }, ...COMMON] },
+    fields: [DESC, EXPR, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["js_challenge", "JS 质询（可疑时要求点一下）"], ["managed_challenge", "人机验证（点一下）"], ["log", "仅记录"], ["skip", "放行并跳过后续检查"]] }, ...COMMON] },
   rate: { path: "rate_limits", title: "限速规则", empty: "<b>还没有限速规则</b>限制单个 IP 在统计周期内的请求数。", cols: ["description", "expression", "threshold", "period", "action", "enabled"],
     fields: [DESC, EXPR, { k: "threshold", label: "阈值（请求数 / 每 IP）", type: "number", def: 100 }, { k: "period", label: "统计周期（秒）", type: "number", def: 60 }, { k: "mitigation_timeout", label: "超限后封禁时长（秒）", type: "number" }, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["log", "仅记录"]] }, { k: "enabled", label: "启用", type: "check", def: true }] },
   origin: { path: "origin_rules", title: "回源规则", empty: "<b>还没有回源规则</b>按表达式改写回源地址、端口、协议、Host 头或 SNI。", cols: ["description", "expression", "origin_host", "origin_node", "origin_port", "host_header", "priority", "enabled"],
@@ -705,8 +705,8 @@ const RULES = {
       { k: "worker", label: "Worker 脚本名（动作为 Worker 时必填）", opt: 1, hint: "脚本需导出 async email(message, env, ctx)" },
       DESC, { k: "enabled", label: "启用", type: "check", def: true }] },
 };
-const TONE = { block: "bad", js_challenge: "warn", skip: "ok" };
-const ACT = { block: "拦截", js_challenge: "JS 质询", log: "仅记录", skip: "放行", challenge: "质询", allow: "放行" };
+const TONE = { block: "bad", js_challenge: "warn", managed_challenge: "warn", skip: "ok" };
+const ACT = { block: "拦截", js_challenge: "JS 质询", managed_challenge: "人机验证", log: "仅记录", skip: "放行", challenge: "质询", allow: "放行" };
 const SRC = { firewall: "防火墙", waf: "托管 WAF", rate_limit: "限速", ratelimit: "限速" };
 function colFmt(k, f) {
   if (k === "expression") return r => (r.expression ? `<code class="expr">${esc(r.expression)}</code>` : '<span class="hint">全部请求</span>');

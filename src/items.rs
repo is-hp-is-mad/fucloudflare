@@ -186,7 +186,9 @@ pub struct FirewallRule {
     #[serde(flatten)]
     pub meta: Meta,
     pub expression: String,
-    /// `block`, `js_challenge`, `log` or `skip` (allow, bypassing the WAF).
+    /// `block`, `js_challenge` (the human check, which asks for a click only
+    /// when the browser looks doubtful), `managed_challenge` (always one
+    /// click), `log` or `skip` (allow, bypassing the WAF).
     pub action: String,
     #[serde(default)]
     pub description: String,
@@ -201,7 +203,7 @@ impl Item for FirewallRule {
     item_boilerplate!(firewall_rules);
     fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
         check_expr(&self.expression)?;
-        one_of("action", &self.action, &["block", "js_challenge", "log", "skip"])
+        one_of("action", &self.action, &["block", "js_challenge", "managed_challenge", "log", "skip"])
     }
 }
 
