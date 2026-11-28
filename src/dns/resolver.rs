@@ -1295,7 +1295,7 @@ mod tests {
         r.store.save_node(None, json!({ "name": "jp", "ipv4": "203.0.113.4", "role": "accelerate", "accel_hosts": ["*.example.com"] })).unwrap();
 
         // off: a name that does not exist does not
-        assert_eq!(ask(&r, "nothing.example.com", rtype::A).rcode, rcode::NXDOMAIN);
+        assert_eq!(ask(&r, "nothing.example.com", rtype::A).rcode as u16, rcode::NXDOMAIN);
         r.store.update_setting(&zone, "decoy_subdomains", json!(true)).unwrap();
 
         // on: the node without a limit, then the one with the larger limit; never an accelerate node

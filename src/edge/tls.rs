@@ -165,7 +165,7 @@ impl CertResolver {
         let sni = sni.to_ascii_lowercase();
         let snap = self.store.snapshot();
         if snap.find_zone(&sni).is_some_and(|z| z.is_decoy(&sni)) {
-            return None; // decoy names: the handshake fails
+            return; // decoy names get no certificate at all
         }
         let wildcard = sni.split_once('.').map(|(_, parent)| format!("*.{parent}"));
         if snap.certs.contains_key(&sni) || wildcard.as_deref().is_some_and(|w| snap.certs.contains_key(w)) {
@@ -223,6 +223,9 @@ impl ResolvesServerCert for CertResolver {
         }
         let Some(sni) = sni.or_else(|| DEFAULT_SNI.get().cloned()) else { return Some(self.default.clone()) };
         let snap = self.store.snapshot();
+        if snap.find_zone(&sni).is_some_and(|z| z.is_decoy(&sni)) {
+            return None; // decoy names: the handshake fails
+        }
         let wildcard = sni.split_once('.').map(|(_, parent)| format!("*.{parent}"));
         if let Some(c) = snap.certs.get(&sni).or_else(|| snap.certs.get(wildcard.as_deref()?)) {
             return Some(c.clone());
