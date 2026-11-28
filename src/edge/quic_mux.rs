@@ -83,8 +83,16 @@ fn hkdf_expand_label(prk: &hkdf::Prk, label: &[u8], out_len: usize) -> Option<Ve
     Some(out)
 }
 
-/// Extract the TLS 1.3 ClientHello SNI from a QUIC v1/v2 Initial packet.
-pub fn extract_quic_initial_sni(pkt: &[u8]) -> Option<String> {
+/// The largest ClientHello put together from Initial packets. A real one,
+/// even with a post-quantum key share, is a few kilobytes.
+const MAX_HELLO: usize = 16384;
+
+/// The plaintext Destination Connection ID and the CRYPTO frames (offset,
+/// data) of a QUIC v1/v2 Initial packet. A ClientHello with a post-quantum
+/// key share (X25519MLKEM768 adds 1216 bytes) no longer fits one packet, and
+/// clients split and reorder its CRYPTO frames, so the frames are returned as
+/// they are and put together by [`hello`].
+fn initial_crypto(pkt: &[u8]) -> Option<(Vec<u8>, Vec<(usize, Vec<u8>)>)> {
     if pkt.len() < 16 || (pkt[0] & 0x80) == 0 {
         return None; // short header or too short
     }
@@ -162,8 +170,8 @@ pub fn extract_quic_initial_sni(pkt: &[u8]) -> Option<String> {
     let mut ciphertext = pkt[pn_off + pn_len..pn_off + payload_len].to_vec();
     let plain = key.open_in_place(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(&header), &mut ciphertext).ok()?;
 
-    // Reassemble CRYPTO frame(s) from the decrypted Initial payload.
-    let mut crypto = Vec::new();
+    // The CRYPTO frames of the decrypted Initial payload.
+    let mut frames = Vec::new();
     let mut foff = 0usize;
     while foff < plain.len() {
         let frame_type = read_varint(plain, &mut foff)?;
@@ -173,22 +181,62 @@ pub fn extract_quic_initial_sni(pkt: &[u8]) -> Option<String> {
                 // CRYPTO frame: offset + length + data
                 let c_off = read_varint(plain, &mut foff)? as usize;
                 let c_len = read_varint(plain, &mut foff)? as usize;
-                let data = plain.get(foff..foff + c_len)?;
+                let data = plain.get(foff..foff.checked_add(c_len)?)?;
                 foff += c_len;
-                let end = c_off.checked_add(c_len)?;
-                if end > 16384 {
+                if c_off.checked_add(c_len)? > MAX_HELLO {
                     return None;
                 }
-                if end > crypto.len() {
-                    crypto.resize(end, 0);
-                }
-                crypto[c_off..end].copy_from_slice(data);
+                frames.push((c_off, data.to_vec()));
             }
             _ => break,
         }
     }
+    Some((dcid.to_vec(), frames))
+}
 
-    extract_client_hello_sni(&crypto)
+/// What the CRYPTO frames seen so far say about the ClientHello.
+#[derive(Debug, PartialEq)]
+enum Hello {
+    Sni(String),
+    /// A whole ClientHello without a server name, or not a ClientHello.
+    NoSni,
+    /// Not enough of it yet to tell.
+    Partial,
+}
+
+/// The bytes from offset 0 that the frames cover without a gap (frames may
+/// overlap and come in any order).
+fn contiguous(frames: &[(usize, Vec<u8>)]) -> Vec<u8> {
+    let mut sorted: Vec<&(usize, Vec<u8>)> = frames.iter().collect();
+    sorted.sort_by_key(|(off, _)| *off);
+    let mut out: Vec<u8> = Vec::new();
+    for (off, data) in sorted {
+        if *off > out.len() {
+            break;
+        }
+        let end = off + data.len();
+        if end > out.len() {
+            out.extend_from_slice(&data[out.len() - off..]);
+        }
+    }
+    out
+}
+
+fn hello(frames: &[(usize, Vec<u8>)]) -> Hello {
+    let buf = contiguous(frames);
+    if let Some(sni) = extract_client_hello_sni(&buf) {
+        return Hello::Sni(sni);
+    }
+    if buf.first().is_some_and(|t| *t != 0x01) {
+        return Hello::NoSni;
+    }
+    let whole = buf.len() >= 4 && 4 + (((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | buf[3] as usize) <= buf.len();
+    let seen: usize = frames.iter().map(|(_, d)| d.len()).sum();
+    if whole || seen > MAX_HELLO {
+        Hello::NoSni
+    } else {
+        Hello::Partial
+    }
 }
 
 /// Extract SNI (extension 0x0000) from a TLS handshake ClientHello message.
@@ -292,6 +340,22 @@ struct Session {
     last: Instant,
 }
 
+/// Initial packets of one client whose ClientHello is not whole yet.
+struct Pending {
+    dcid: Vec<u8>,
+    frames: Vec<(usize, Vec<u8>)>,
+    packets: Vec<Vec<u8>>,
+    since: Instant,
+}
+
+/// How long and over how many packets a ClientHello may be put together, and
+/// for how many clients at once, before what was held is sent on as if it had
+/// no server name: a client that never completes one costs a few kilobytes
+/// for a moment, never more.
+const PENDING_TTL: Duration = Duration::from_secs(2);
+const MAX_HELD: usize = 8;
+const MAX_PENDING: usize = 1024;
+
 fn matches_fallback_sni(sni: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| {
         if let Some(suffix) = p.strip_prefix("*.") {
@@ -364,6 +428,7 @@ async fn run_mux(
     fallback_snis: Vec<String>,
 ) {
     let sessions: Arc<Mutex<HashMap<SocketAddr, Session>>> = Arc::default();
+    let mut pending: HashMap<SocketAddr, Pending> = HashMap::new();
     let mut buf = [0u8; 65535];
     let mut last_gc = Instant::now();
 
@@ -383,6 +448,7 @@ async fn run_mux(
         if last_gc.elapsed() >= Duration::from_secs(30) {
             last_gc = now;
             sessions.lock().unwrap().retain(|_, s| now.duration_since(s.last) < SESSION_IDLE);
+            pending.retain(|_, p| now.duration_since(p.since) < PENDING_TTL);
         }
 
         // Classify on QUIC Initial packets (so a client port can even switch SNI),
@@ -390,7 +456,38 @@ async fn run_mux(
         let mut target_h3 = false;
         let mut fb_sock: Option<Arc<UdpSocket>> = None;
 
-        let initial_sni = if n >= 16 && (pkt[0] & 0x80) != 0 { extract_quic_initial_sni(pkt) } else { None };
+        // A ClientHello split over several Initial packets: hold them until its
+        // server name is seen, then send them all the same way, in order.
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let initial = if n >= 16 && (pkt[0] & 0x80) != 0 { initial_crypto(pkt) } else { None };
+        let initial_sni = match initial {
+            Some((dcid, frames)) => {
+                let mut held = match pending.remove(&peer) {
+                    Some(p) if p.dcid == dcid && now.duration_since(p.since) < PENDING_TTL => p,
+                    _ => Pending { dcid, frames: Vec::new(), packets: Vec::new(), since: now },
+                };
+                held.frames.extend(frames);
+                held.packets.push(pkt.to_vec());
+                match hello(&held.frames) {
+                    Hello::Partial if held.packets.len() < MAX_HELD && pending.len() < MAX_PENDING => {
+                        pending.insert(peer, held);
+                        continue;
+                    }
+                    Hello::Sni(sni) => {
+                        batch = held.packets;
+                        Some(sni)
+                    }
+                    Hello::NoSni | Hello::Partial => {
+                        batch = held.packets;
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if batch.is_empty() {
+            batch.push(pkt.to_vec());
+        }
         if let Some(sni) = initial_sni {
             if is_cdn_sni(&sni, &store, panel_host.as_deref(), cname_base.as_deref(), &fallback_snis) {
                 sessions.lock().unwrap().insert(peer, Session { route: Route::LocalH3, last: now });
@@ -414,7 +511,9 @@ async fn run_mux(
         }
 
         if target_h3 {
-            let _ = h3_tx.try_send((pkt.to_vec(), peer));
+            for packet in batch {
+                let _ = h3_tx.try_send((packet, peer));
+            }
             continue;
         }
 
@@ -459,7 +558,9 @@ async fn run_mux(
         }
 
         if let Some(sock) = fb_sock {
-            let _ = sock.send(pkt).await;
+            for packet in &batch {
+                let _ = sock.send(packet).await;
+            }
         }
     }
 }
@@ -468,6 +569,68 @@ async fn run_mux(
 mod tests {
     use super::*;
     use crate::store::testutil::temp_store;
+
+    /// A real TLS 1.3 ClientHello from rustls with our provider (so with the
+    /// post-quantum key share), as the handshake message QUIC carries.
+    fn client_hello(name: &str) -> Vec<u8> {
+        let config = rustls::ClientConfig::builder_with_provider(crate::edge::tls::crypto())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut conn = rustls::ClientConnection::new(Arc::new(config), name.to_string().try_into().unwrap()).unwrap();
+        let mut record = Vec::new();
+        conn.write_tls(&mut record).unwrap();
+        record[5..].to_vec() // drop the TLS record header
+    }
+
+    #[test]
+    fn a_client_hello_split_over_many_frames_names_its_server_once_the_frames_up_to_it_are_in() {
+        let ch = client_hello("alpha.test");
+        assert!(ch.len() > 1200, "the hybrid key share makes it longer than one packet: {}", ch.len());
+        let frames: Vec<(usize, Vec<u8>)> = ch.chunks(100).enumerate().map(|(i, c)| (i * 100, c.to_vec())).collect();
+        assert_eq!(hello(&frames), Hello::Sni("alpha.test".into()), "all of it");
+        // in order: partial until the server name is covered, then found
+        let mut seen = Vec::new();
+        let mut found = false;
+        for f in &frames {
+            seen.push(f.clone());
+            match hello(&seen) {
+                Hello::Sni(name) => {
+                    assert_eq!(name, "alpha.test");
+                    found = true;
+                    break;
+                }
+                other => assert_eq!(other, Hello::Partial),
+            }
+        }
+        assert!(found);
+        // backwards: nothing until the first frame arrives, then found
+        let mut seen = Vec::new();
+        for f in frames.iter().rev() {
+            seen.push(f.clone());
+            let want = if f.0 == 0 { Hello::Sni("alpha.test".into()) } else { Hello::Partial };
+            assert_eq!(hello(&seen), want);
+        }
+        // overlapping and repeated frames, as retransmissions bring
+        let mut messy = frames.clone();
+        messy.push((50, ch[50..250].to_vec()));
+        messy.extend(frames.iter().take(3).cloned());
+        messy.reverse();
+        assert_eq!(hello(&messy), Hello::Sni("alpha.test".into()));
+    }
+
+    #[test]
+    fn what_is_not_a_client_hello_with_a_name_is_told_apart_from_one_not_whole_yet() {
+        assert_eq!(hello(&[]), Hello::Partial);
+        assert_eq!(hello(&[(0, vec![0x02, 0, 0, 4, 1, 2, 3, 4])]), Hello::NoSni, "not a ClientHello");
+        assert_eq!(hello(&[(0, vec![0x01, 0, 0, 2, 0, 0])]), Hello::NoSni, "whole and without a name");
+        assert_eq!(hello(&[(0, vec![0x01, 0, 0x10, 0])]), Hello::Partial, "announced 4096 bytes, has none");
+        assert_eq!(hello(&[(10, vec![0; 100])]), Hello::Partial, "a gap before it");
+        let big: Vec<(usize, Vec<u8>)> = (0..20).map(|i| (i * 1000 + 10, vec![0u8; 1000])).collect();
+        assert_eq!(hello(&big), Hello::NoSni, "more than a ClientHello can be is given up on");
+        assert_eq!(contiguous(&[(0, vec![1, 2, 3]), (2, vec![9, 4]), (6, vec![7])]), vec![1, 2, 3, 4]);
+    }
 
     #[tokio::test]
     async fn demuxes_cdn_sni_and_fallback_on_same_udp_port() {
