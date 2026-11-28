@@ -141,6 +141,24 @@ struct Args {
     #[arg(long, env = "FUCF_H3_FRONT_CERT")]
     h3_front_cert: Option<PathBuf>,
 
+    /// Directories with certificates other tools issue and renew (acme.sh,
+    /// certbot, Caddy's storage, hand-made `name.crt` + `name.key`): served for
+    /// the names they cover when the configuration has none of its own.
+    /// Looked at again every minute.
+    #[arg(long = "tls-cert-dir", env = "FUCF_TLS_CERT_DIR", value_delimiter = ',')]
+    tls_cert_dir: Vec<PathBuf>,
+
+    /// The server name assumed when a TLS client sends none (clients that
+    /// connect by IP address), e.g. this node's public address.
+    #[arg(long = "tls-default-sni", env = "FUCF_TLS_DEFAULT_SNI")]
+    tls_default_sni: Option<String>,
+
+    /// Directories proxy rules with a `file_root` may serve files from (and
+    /// everything below them). Without any, no files are served at all: the
+    /// rules are shared by the whole fleet, what a node exposes is its own call.
+    #[arg(long = "file-root-allow", env = "FUCF_FILE_ROOT_ALLOW", value_delimiter = ',')]
+    file_root_allow: Vec<PathBuf>,
+
     /// UDP port of the HTTP/3 front, as visitors see it.
     #[arg(long, env = "FUCF_H3_FRONT_PORT", default_value_t = 443)]
     h3_front_port: u16,
@@ -459,19 +477,31 @@ async fn main() -> anyhow::Result<()> {
         let up = edge::warp::WarpUpstream::parse(url).map_err(anyhow::Error::msg)?;
         let _ = edge.warp_upstream.set(up);
     }
+    let dirs: Vec<PathBuf> = args.tls_cert_dir.iter().filter(|d| !d.as_os_str().is_empty()).cloned().collect();
+    if !dirs.is_empty() {
+        let certs = tokio::task::spawn_blocking(move || edge::certdir::DiskCerts::new(dirs)).await?;
+        tokio::spawn(certs.clone().watch());
+        edge::tls::set_disk_certs(certs);
+    }
+    edge::files::set_allowed_roots(args.file_root_allow.iter().filter(|d| !d.as_os_str().is_empty()).cloned().collect());
+    if let Some(name) = &args.tls_default_sni {
+        edge::tls::set_default_sni(name);
+    }
     if let Some(path) = args.export_domains.clone() {
         let extra: Vec<String> = [panel_host.clone(), cname_base.clone()].into_iter().flatten().collect();
+        // proxy rules scoped to other nodes are none of this node's business
+        let me = fleet::self_name(&store, &args.edge_ips, args.node_name.as_deref());
         let initial = {
-            let (p, s, e) = (path.clone(), store.clone(), extra.clone());
-            tokio::task::spawn_blocking(move || export_domains_file(&p, &s, &e, None)).await.ok().flatten()
+            let (p, s, e, n) = (path.clone(), store.clone(), extra.clone(), me.clone());
+            tokio::task::spawn_blocking(move || export_domains_file(&p, &s, &e, &n, None)).await.ok().flatten()
         };
         let store_bg = store.clone();
         tokio::spawn(async move {
             let mut changes = store_bg.subscribe();
             let mut last = initial;
             while changes.changed().await.is_ok() {
-                let (p, s, e, prev) = (path.clone(), store_bg.clone(), extra.clone(), last.clone());
-                if let Ok(next) = tokio::task::spawn_blocking(move || export_domains_file(&p, &s, &e, prev.as_deref())).await {
+                let (p, s, e, n, prev) = (path.clone(), store_bg.clone(), extra.clone(), me.clone(), last.clone());
+                if let Ok(next) = tokio::task::spawn_blocking(move || export_domains_file(&p, &s, &e, &n, prev.as_deref())).await {
                     last = next;
                 }
             }
@@ -919,9 +949,10 @@ async fn apply_purges(store: Arc<store::Store>, cache: Arc<edge::cache::Cache>) 
 
 /// Atomically write all hosted zone names (plus extra hosts like panel/cname_base)
 /// to `path`, one per line, only when the rendered content actually changed.
-fn export_domains_file(path: &std::path::Path, store: &store::Store, extra: &[String], last: Option<&str>) -> Option<String> {
+fn export_domains_file(path: &std::path::Path, store: &store::Store, extra: &[String], node: &str, last: Option<&str>) -> Option<String> {
     let mut set: std::collections::BTreeSet<String> = store.list_zones().into_iter().map(|z| z.name).collect();
-    for rule in &store.snapshot().local_proxy_rules {
+    let here = |rule: &&items::LocalProxyRule| rule.nodes.is_empty() || rule.nodes.iter().any(|n| n.eq_ignore_ascii_case(node));
+    for rule in store.snapshot().local_proxy_rules.iter().filter(here) {
         for h in &rule.hosts {
             let h = h.trim().trim_end_matches('.').trim_start_matches("*.").to_ascii_lowercase();
             if !h.is_empty() && h != "*" {
@@ -985,14 +1016,29 @@ mod tests {
             )
             .unwrap();
 
+        store
+            .save_proxy_rule(
+                None,
+                json!({
+                    "name": "elsewhere",
+                    "nodes": ["jp"],
+                    "hosts": ["only.jp.example"],
+                    "upstreams": [{"url": "http://127.0.0.1:9003"}]
+                }),
+            )
+            .unwrap();
+
         let out = dir.join("domains.lst");
-        let content = export_domains_file(&out, &store, &["dashboard.example".into()], None).unwrap();
+        let content = export_domains_file(&out, &store, &["dashboard.example".into()], "eu", None).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(
             lines,
             vec!["app.proxy.example", "dashboard.example", "sub.example", "zone.example"]
         );
         assert_eq!(std::fs::read_to_string(&out).unwrap(), content);
+        // the node a rule is scoped to exports its hosts
+        let content = export_domains_file(&out, &store, &[], "JP", None).unwrap();
+        assert!(content.lines().any(|l| l == "only.jp.example"), "{content}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

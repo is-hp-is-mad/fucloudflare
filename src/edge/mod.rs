@@ -2,7 +2,9 @@
 //! (host lookup -> WAF -> worker -> cache -> origin).
 
 pub mod cache;
+pub mod certdir;
 pub mod cgi;
+pub mod files;
 pub mod compress;
 pub mod front;
 pub mod h3;

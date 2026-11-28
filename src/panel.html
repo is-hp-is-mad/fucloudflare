@@ -1111,7 +1111,7 @@ async function viewProxy() {
       { label: "名称", fmt: r => `<b>${esc(r.name || r.id)}</b>${r.is_fallback ? ' <span class="tag warn">Hy2 回落</span>' : ""}` },
       { label: "监听端口", fmt: r => r.listen_port ? `<code class="mono">:${esc(r.listen_port)}</code>` : '<span class="hint">全部</span>' },
       { label: "域名 / 路径", fmt: r => `<div>${(r.hosts && r.hosts.length) ? chips(r.hosts) : '<span class="hint">*</span>'}</div><span class="sub mono">${esc(r.path_prefix || "/")}${r.exact_path ? " (精确)" : ""}</span>` },
-      { label: "上游目标", fmt: r => (r.upstreams || []).map(u => `<code class="mono">${esc(u.url || u)}</code>`).join(" ") || '<span class="hint">—</span>' },
+      { label: "处理方式", fmt: r => r.redirect_url ? `<span class="tag blue">重定向</span> <code class="mono">${esc(r.redirect_url)}</code>` : r.respond ? `<span class="tag">固定响应 ${esc(r.respond.status)}</span>` : r.file_root ? `<span class="tag">静态文件</span> <code class="mono">${esc(r.file_root)}</code>` : (r.upstreams || []).map(u => `<code class="mono">${esc(u.url || u)}</code>`).join(" ") || '<span class="hint">—</span>' },
       { label: "状态", fmt: r => (r.enabled !== false ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
     ], rules, r => rowActs("proxyEdit", "proxyDel", { id: r.id }), `<b>还没有本地反向代理规则</b>点击右上角“添加代理规则”替代 Caddy vhost 或配置 Hysteria 2 伪装回落。`)),
   };
@@ -1578,7 +1578,12 @@ const A = {
       { k: "rewrite_path", label: "重写路径（可选，如 /doh）", opt: 1 },
       { k: "redirect_url", label: "直接重定向目标 URL（可选，跳过上游）", opt: 1 },
       { k: "redirect_status", label: "重定向状态码（300–399，默认 302）", type: "number", opt: 1 },
-      { k: "upstreams_txt", label: "上游 URL（每行一个，支持 http:// https:// h2c:// ws:// wss://）", type: "textarea" },
+      { k: "upstreams_txt", label: "上游 URL（每行一个，支持 http:// https:// h2c:// ws:// wss://；用固定响应或静态文件时可留空）", type: "textarea", opt: 1 },
+      { k: "respond_status", label: "固定响应：状态码（填了就不转发，相当于 Caddy 的 respond）", type: "number", opt: 1 },
+      { k: "respond_body", label: "固定响应：内容", type: "textarea", opt: 1 },
+      { k: "respond_type", label: "固定响应：Content-Type（默认 text/plain; charset=utf-8）", opt: 1 },
+      { k: "file_root", label: "静态文件目录（绝对路径，相当于 Caddy 的 file_server；须在节点的 --file-root-allow 之内）", opt: 1 },
+      { k: "index_files", label: "目录索引文件（默认 index.html）", type: "list", opt: 1 },
       { k: "preserve_host", label: "保留原始 Host 头", type: "check", def: true },
       { k: "mask_upstream_errors", label: "上游 >= 400 错误伪装为 404 not found", type: "check" },
       { k: "is_fallback", label: "设为 Hysteria 2 兜底回落规则", type: "check" },
@@ -1588,10 +1593,11 @@ const A = {
       { k: "strip_response_headers", label: "删除响应头（逗号分隔）", type: "list" },
       { k: "priority", label: "优先级", type: "number", def: 100 },
       { k: "enabled", label: "启用", type: "check", def: true },
-    ], { ...r, upstreams_txt: upstreams }, v => {
+    ], { ...r, upstreams_txt: upstreams, respond_status: r.respond && r.respond.status, respond_body: r.respond && r.respond.body, respond_type: r.respond && r.respond.content_type }, v => {
       const ups = String(v.upstreams_txt || "").split(/[\n,\s]+/).filter(Boolean).map(url => ({ url }));
-      delete v.upstreams_txt;
-      return api(d.id ? "PUT" : "POST", "/proxy/rules" + (d.id ? "/" + d.id : ""), { ...v, upstreams: ups });
+      const respond = v.respond_status || v.respond_body ? { status: Number(v.respond_status) || 200, body: v.respond_body || "", content_type: v.respond_type || null } : null;
+      for (const k of ["upstreams_txt", "respond_status", "respond_body", "respond_type"]) delete v[k];
+      return api(d.id ? "PUT" : "POST", "/proxy/rules" + (d.id ? "/" + d.id : ""), { ...v, upstreams: ups, respond, file_root: v.file_root || null });
     });
   },
   proxyDel: d => del("/proxy/rules/" + d.id, "这条代理规则"),

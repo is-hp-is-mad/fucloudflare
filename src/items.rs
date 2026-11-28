@@ -1245,7 +1245,28 @@ impl Default for ProxyUpstream {
     }
 }
 
+/// A fixed answer for a `LocalProxyRule` (Caddy's `respond`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StaticResponse {
+    /// HTTP status (100-599, default 200).
+    pub status: u16,
+    pub body: String,
+    /// `Content-Type` of the body (default `text/plain; charset=utf-8`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+impl Default for StaticResponse {
+    fn default() -> Self {
+        StaticResponse { status: 200, body: String::new(), content_type: None }
+    }
+}
+
 /// Native reverse-proxy rule (Caddy replacement) + Hysteria 2 masquerade fallback.
+///
+/// What a matching request gets, in this order: `redirect_url`, `respond`,
+/// files from `file_root`, or the `upstreams`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalProxyRule {
@@ -1272,6 +1293,16 @@ pub struct LocalProxyRule {
     /// Mask upstream >= 400 responses as `404 Not Found` (`"not found"`).
     pub mask_upstream_errors: bool,
     pub upstreams: Vec<ProxyUpstream>,
+    /// Answer with this instead of forwarding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub respond: Option<StaticResponse>,
+    /// Serve files from this directory instead of forwarding (only below the
+    /// directories a node allows with `--file-root-allow`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_root: Option<String>,
+    /// What is tried for a directory under `file_root` (default `index.html`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub index_files: Vec<String>,
     /// Keep the visitor's `Host` header when forwarding to the upstream.
     #[serde(default = "yes")]
     pub preserve_host: bool,
@@ -1306,6 +1337,9 @@ impl Default for LocalProxyRule {
             redirect_status: None,
             mask_upstream_errors: false,
             upstreams: Vec::new(),
+            respond: None,
+            file_root: None,
+            index_files: Vec::new(),
             preserve_host: true,
             strip_response_headers: Vec::new(),
             set_response_headers: BTreeMap::new(),
@@ -1384,8 +1418,40 @@ impl LocalProxyRule {
             }
         }
 
-        if self.upstreams.is_empty() && self.redirect_url.is_none() {
-            return invalid("a proxy rule needs at least one upstream (or redirect_url)");
+        if let Some(r) = &mut self.respond {
+            if !(100..=599).contains(&r.status) {
+                return invalid("respond.status must be between 100 and 599");
+            }
+            if r.body.len() > 64 * 1024 {
+                return invalid("respond.body is limited to 64 KiB");
+            }
+            if let Some(ct) = &mut r.content_type {
+                *ct = ct.trim().to_string();
+                if ct.is_empty() {
+                    r.content_type = None;
+                } else if hyper::header::HeaderValue::from_str(ct).is_err() {
+                    return invalid("respond.content_type is not a valid header value");
+                }
+            }
+        }
+        if let Some(root) = &mut self.file_root {
+            let t = root.trim().trim_end_matches('/').to_string();
+            if t.is_empty() && root.trim() != "/" {
+                self.file_root = None;
+            } else if !t.starts_with('/') || t.split('/').any(|seg| seg == "..") {
+                return invalid("file_root must be an absolute path without '..'");
+            } else {
+                *root = t;
+            }
+        }
+        for name in &mut self.index_files {
+            *name = name.trim().to_string();
+            if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+                return invalid("index_files are plain file names (index.html, index.htm, ...)");
+            }
+        }
+        if self.upstreams.is_empty() && self.redirect_url.is_none() && self.respond.is_none() && self.file_root.is_none() {
+            return invalid("a proxy rule needs at least one upstream (or redirect_url, respond or file_root)");
         }
         for u in &mut self.upstreams {
             u.url = u.url.trim().to_string();

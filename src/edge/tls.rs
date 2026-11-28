@@ -11,7 +11,29 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Certificates other tools keep on disk (`--tls-cert-dir`), see [`super::certdir`].
+static DISK_CERTS: OnceLock<Arc<super::certdir::DiskCerts>> = OnceLock::new();
+/// The name to answer for when a client sends no server name (`--tls-default-sni`),
+/// e.g. the node's IP address for clients that connect by address.
+static DEFAULT_SNI: OnceLock<String> = OnceLock::new();
+
+pub fn set_disk_certs(certs: Arc<super::certdir::DiskCerts>) {
+    let _ = DISK_CERTS.set(certs);
+}
+
+pub fn set_default_sni(name: &str) {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !name.is_empty() {
+        let _ = DEFAULT_SNI.set(name);
+    }
+}
+
+/// A certificate for `host` from the disk, if there is one.
+pub fn disk_cert(host: &str) -> Option<Arc<CertifiedKey>> {
+    DISK_CERTS.get()?.get(host)
+}
 
 /// Parse and sanity-check a PEM certificate chain and its private key.
 pub fn parse_cert(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, String> {
@@ -183,11 +205,15 @@ impl ResolvesServerCert for CertResolver {
             // A CA validating a challenge: only the challenge certificate will do.
             return self.store.snapshot().acme_tls.get(sni.as_deref()?).cloned();
         }
-        let Some(sni) = sni else { return Some(self.default.clone()) };
+        let Some(sni) = sni.or_else(|| DEFAULT_SNI.get().cloned()) else { return Some(self.default.clone()) };
         let snap = self.store.snapshot();
         let wildcard = sni.split_once('.').map(|(_, parent)| format!("*.{parent}"));
         if let Some(c) = snap.certs.get(&sni).or_else(|| snap.certs.get(wildcard.as_deref()?)) {
             return Some(c.clone());
+        }
+        // what other tools issued, on disk
+        if let Some(c) = disk_cert(&sni) {
+            return Some(c);
         }
         // Only mint certificates for zones we host (bounded by configuration).
         let Some(zone) = snap.find_zone(&sni) else { return Some(self.default.clone()) };

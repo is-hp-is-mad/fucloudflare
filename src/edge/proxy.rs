@@ -210,6 +210,33 @@ pub async fn forward(
         return Ok(out);
     }
 
+    // a fixed answer (Caddy's `respond`) or files (`file_server`): no upstream involved
+    let local = if let Some(r) = &rule.respond {
+        let mut out = Response::new(full(if req.method() == Method::HEAD { Bytes::new() } else { Bytes::from(r.body.clone()) }));
+        *out.status_mut() = StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK);
+        let ct = r.content_type.as_deref().unwrap_or("text/plain; charset=utf-8");
+        if let Ok(v) = HeaderValue::from_str(ct) {
+            out.headers_mut().insert(header::CONTENT_TYPE, v);
+        }
+        Some(out)
+    } else if let Some(root) = &rule.file_root {
+        let raw_pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let pq = rewrite_proxy_pq(rule, raw_pq);
+        let path = pq.split('?').next().unwrap_or("/");
+        Some(super::files::serve(root, &rule.index_files, path, req.method(), req.headers()).await)
+    } else {
+        None
+    };
+    if let Some(mut out) = local {
+        for name in &rule.strip_response_headers {
+            if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+                out.headers_mut().remove(hn);
+            }
+        }
+        set_headers(out.headers_mut(), &rule.set_response_headers);
+        return Ok(out);
+    }
+
     let orig_host_header = req
         .headers()
         .get(header::HOST)

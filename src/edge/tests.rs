@@ -1837,3 +1837,44 @@ async fn origin_that_is_the_edge_itself_is_explained_on_the_dashboard_only() {
     let e = events.iter().find(|e| e.source == "origin").expect("logged for the dashboard");
     assert!(e.rule_id == "530" && e.description.contains("origin_node") && e.description.starts_with(ORIGIN_MISCONFIGURED.zh), "{e:?}");
 }
+
+#[tokio::test]
+async fn proxy_rules_answer_by_themselves_and_serve_files() {
+    let env = setup().await;
+    let base = std::env::temp_dir().join(format!("fucf-www-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(base.join("site/docs")).unwrap();
+    std::fs::write(base.join("site/docs/index.html"), "<p>docs</p>").unwrap();
+    std::fs::write(base.join("site/app.js"), "console.log(1)").unwrap();
+    super::files::set_allowed_roots(vec![base.clone()]);
+    env.store.save_proxy_rule(None, json!({
+        "name": "well-known",
+        "hosts": ["example.com"],
+        "path_prefix": "/.well-known/matrix/server",
+        "exact_path": true,
+        "respond": { "status": 200, "body": "{\"m.server\":\"example.com:443\"}", "content_type": "application/json" },
+        "set_response_headers": { "access-control-allow-origin": "*" },
+        "priority": 1
+    })).unwrap();
+    env.store.save_proxy_rule(None, json!({
+        "name": "static",
+        "hosts": ["example.com"],
+        "path_prefix": "/static",
+        "strip_prefix": true,
+        "file_root": base.join("site").to_str().unwrap(),
+        "priority": 2
+    })).unwrap();
+    assert!(env.store.save_proxy_rule(None, json!({ "name": "nothing", "hosts": ["example.com"] })).is_err(), "a rule has to do something");
+    assert!(env.store.save_proxy_rule(None, json!({ "name": "rel", "hosts": ["x.example"], "file_root": "www/../etc" })).is_err());
+
+    let r = get(&env, "example.com", "/.well-known/matrix/server").await;
+    assert_eq!((r.status, r.header("content-type"), r.header("access-control-allow-origin")), (200, Some("application/json"), Some("*")));
+    assert_eq!(r.body, "{\"m.server\":\"example.com:443\"}");
+    let r = get(&env, "example.com", "/static/app.js").await;
+    assert_eq!((r.status, r.header("content-type"), r.body.as_str()), (200, Some("text/javascript; charset=utf-8"), "console.log(1)"));
+    let r = get(&env, "example.com", "/static/docs/").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "<p>docs</p>"));
+    assert_eq!(get(&env, "example.com", "/static/../Cargo.toml").await.status, 404);
+    // what no rule covers still goes to the origin
+    assert!(get(&env, "example.com", "/hello").await.body.contains("origin=main"));
+    let _ = std::fs::remove_dir_all(base);
+}
