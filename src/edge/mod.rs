@@ -2,6 +2,7 @@
 //! (host lookup -> WAF -> worker -> cache -> origin).
 
 pub mod cache;
+pub mod cachekey;
 pub mod certdir;
 pub mod cgi;
 pub mod autofw;
@@ -1557,10 +1558,15 @@ impl Edge {
         let settings = &zone.zone.settings;
         let rule = zone.cache_rules.iter().find(|(_, e)| e.matches(&info)).map(|(r, _)| r);
         let (force, ttl_override) = (rule.is_some_and(|r| r.cache), rule.and_then(|r| r.edge_ttl).map(u64::from));
+        let keyed: &[String] = rule.map_or(&[], |r| &r.cache_key_headers);
         let eligible = !zone.zone.paused && !settings.development_mode && cache::request_cacheable(&method, &headers);
-        let use_cache = eligible && rule.is_none_or(|r| r.cache);
-        // a rule may keep one copy whatever the query string
-        let key = cache::cache_key(info.ssl, &info.host, if rule.is_some_and(|r| r.ignore_query) { &info.path } else { &uri }, &headers);
+        // a rule may keep one copy whatever the query string, and one per
+        // value of the headers and cookies it names
+        let custom = rule.map(|r| cachekey::part(&r.cache_key_headers, &r.cache_key_cookies, &headers)).unwrap_or_default();
+        let path = if rule.is_some_and(|r| r.ignore_query) { &info.path } else { &uri };
+        let key = cache::cache_key(info.ssl, &info.host, path, &custom, &headers);
+        // a key the visitor's values made too long is neither looked up nor stored
+        let use_cache = eligible && rule.is_none_or(|r| r.cache) && (custom.is_empty() || cachekey::fits(&key));
         let conditional = Conditional::of(&headers);
 
         let mut status_label = if eligible && !use_cache { "BYPASS" } else { "DYNAMIC" };
@@ -1719,7 +1725,7 @@ impl Edge {
                     merged.insert(name, v.clone());
                 }
             }
-            let ttl = match cache::decide(&info.path, entry.status, &merged, force, ttl_override) {
+            let ttl = match cache::decide(&info.path, entry.status, &merged, force, ttl_override, keyed) {
                 Decision::Store(ttl) => ttl,
                 _ => entry.ttl,
             };
@@ -1740,7 +1746,7 @@ impl Edge {
         let (mut parts, body) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
         let decision = if storable {
-            cache::decide(&info.path, parts.status, &parts.headers, force, ttl_override)
+            cache::decide(&info.path, parts.status, &parts.headers, force, ttl_override, keyed)
         } else {
             Decision::Dynamic
         };

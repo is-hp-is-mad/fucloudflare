@@ -35,7 +35,7 @@
 - 单元测试：分数在 1–99 内；缺指纹的裸 TLS 客户端比完整浏览器低；已知爬虫分数稳定。
 - 可选延伸（主体完成后）：JA3 摘要（MD5 可手写 16 字节 hex 格式化，不引 md5 crate）放在 JA4 旁边。HTTP/2 指纹不要碰（要拆帧）。
 
-### [ ] N2 自定义缓存键（请求头 / Cookie 参与键）
+### [x] N2 自定义缓存键（请求头 / Cookie 参与键）
 
 - 缓存规则（`src/items.rs` 搜 `pub struct CacheRule`）新增可选字段 `cache_key_headers`、`cache_key_cookies`（字符串数组，serde default）。
 - 求值：`src/edge/mod.rs` 搜 `cache::cache_key(` 调用处，键里追加指定头/Cookie 的值（不存在按空串）；键总长设上限（如 2 KB），超长跳过缓存写入，避免键爆炸；头名小写统一、值里控制字符剔除。
@@ -133,3 +133,9 @@
 - 接线：`src/edge/mod.rs` 在 `rep.assess` 处一次取得威胁分和"已验证爬虫"（`reputation.rs` 新增 `Assessment::verified_crawler()`），算出 `ReqInfo.bot_score`；trace 加 `bot=`；`src/expr.rs` 的 `Val::BotScore` 识别 `fcf.bot_score` / `cf.bot_management.score`。已验证爬虫固定 50 分，自称爬虫但不在自家网络的按脚本算；边缘自己发的请求（Worker 子请求、健康检查）为 0。
 - JA3 没做：要手写 MD5 和第二套 ClientHello 解析，而且 Chrome 打乱扩展顺序后 JA3 不稳定，JA4 已经够用。面板只在防火墙页的示例说明里加了一行（面板没有字段列表）。
 - 留待能跑真实流量的人核对：权重是经验值；`ja4::peek` 对分片到达的大 ClientHello 只等约 30 ms，慢链路上的真浏览器可能拿不到指纹、被扣 25 分（仍在 50 以上）。
+
+### N2
+- 新文件 `src/edge/cachekey.rs`：缓存规则的 `cache_key_headers` / `cache_key_cookies` 把这些请求头 / Cookie 的值加进缓存键（每对以控制字符 0x1f 开头，值去掉控制字符、`%` 和非 ASCII 字节转成 %XX，所以不同取值不会撞键）；`cache::cache_key` 多了 `custom` 参数，插在 `|ae=` 之前，未压缩副本照样共用；没配这两个字段时键和以前逐字节相同。清除按 `Entry.url` 匹配，同一 URL 的各取值一起清掉（有测试）。
+- 校验：各最多 8 个、名字 1–64 字符、不能重复；头名限字母数字 `-` `_` 并存成小写，Cookie 名用 RFC 6265 token 字符、保留大小写。缺失按空值；同名 Cookie 取第一个。加了这些值后键超过 2048 字节的请求不查也不存（`BYPASS`），上限只对加了这些字段的规则生效。额外放宽：源站 `Vary` 指向键里已有的头时照常缓存。
+- Rulesets：映射到 `action_parameters.cache_key.custom_key.header.include` / `cookie.include`，`check_presence` 只接受空，`exclude_origin` 等其他字段一律 400；`ignore_query` 仍不映射、经 Rulesets 修改时保留。
+- 没把握：滚动升级期间旧节点不认识新字段，会不区分取值地缓存（按 Cookie 区分个人内容时可能串给别人，升级完之前不要这样用）；头名存成小写，Terraform 写大写可能一直显示差异；Terraform provider 若总是带 `exclude_origin: false`，PUT 会失败。

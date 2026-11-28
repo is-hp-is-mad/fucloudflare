@@ -442,7 +442,8 @@ CRUD   /zones/{id}/rate_limits            {"expression", "threshold", "period", 
 CRUD   /zones/{id}/redirect_rules         {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
 CRUD   /zones/{id}/transform_rules        {"expression", "rewrite_path", "set_request_headers", "remove_request_headers",
                                            "set_response_headers", "remove_response_headers", "priority"}
-CRUD   /zones/{id}/cache_rules            {"expression", "cache", "edge_ttl", "priority"}
+CRUD   /zones/{id}/cache_rules            {"expression", "cache", "edge_ttl", "ignore_query", "cache_key_headers",
+                                           "cache_key_cookies", "priority"}
 CRUD   /zones/{id}/origin_rules           {"expression", "origin_host", "origin_node", "origin_port", "origin_scheme",
                                            "host_header", "sni", "priority"}
 ```
@@ -453,7 +454,7 @@ CRUD   /zones/{id}/origin_rules           {"expression", "origin_host", "origin_
 | rate limits | `threshold` (≥ 1) requests per client address per `period` (1 to 86400 s); `mitigation_timeout` 0 to 86400 s; `action`: `block` (default), `log` |
 | redirect rules | `target_url`: an `http(s)://` URL or a path; `status_code`: 301, 302 (default), 303, 307, 308 |
 | transform rules | at least one action; `rewrite_path` starts with `/` and has no query; `host`, `content-length`, `transfer-encoding`, `connection` and `upgrade` cannot be set or removed. Every matching rule applies. |
-| cache rules | `cache`: `true` caches whatever the file type, `false` never caches; `edge_ttl` 1 to 31536000 s. The first matching rule wins. |
+| cache rules | `cache`: `true` caches whatever the file type, `false` never caches; `edge_ttl` 1 to 31536000 s; `ignore_query`: one copy whatever the query string; `cache_key_headers` / `cache_key_cookies`: one copy per value of these request headers / cookies (see below). The first matching rule wins. |
 | origin rules | at least one of the overrides; `origin_scheme`: `http`, `https`; `origin_node`: an edge node to go through |
 
 ```sh
@@ -466,6 +467,36 @@ curl -s -X POST $BASE/zones/$ZONE/redirect_rules -H "Authorization: Bearer $TOKE
   "preserve_query_string": true
 }'
 ```
+
+#### Custom cache keys
+
+By default a cached copy is keyed by scheme, host, path and query (without tracking parameters such
+as `utm_*`) and the compressions the client takes. A cache rule can add the values of some request
+headers and cookies, for an origin that answers differently by them (a language, a device class, an
+A/B variant held in a cookie): each value then gets a copy of its own.
+
+```sh
+curl -s -X POST $BASE/zones/$ZONE/cache_rules -H "Authorization: Bearer $TOKEN" -d '{
+  "expression": "starts_with(http.request.uri.path, \"/shop/\")", "cache": true, "edge_ttl": 600,
+  "cache_key_headers": ["Accept-Language"], "cache_key_cookies": ["variant"]
+}'
+```
+
+- At most 8 names in each list, none empty or longer than 64 characters. Header names may hold
+  letters, digits, `-` and `_` and are stored in lower case; cookie names may hold the token
+  characters of RFC 6265 (letters, digits and ``!#$%&'*+-.^_`|~``) and keep their case
+  (`Sess` and `sess` are two cookies). A name listed twice is refused.
+- A header or cookie the request does not carry counts as an empty value. A header sent more than
+  once counts as its values joined by commas; a cookie named more than once counts by its first
+  value. Control characters in values are dropped.
+- A key that grows past 2048 bytes this way is neither looked up nor stored: such a request goes to
+  the origin and is answered `fcf-cache-status: BYPASS`, so long header values cannot fill the
+  cache. Rules without these fields key exactly as before, with no length limit.
+- Purges find every copy: by URL or prefix they match the URL, whatever the header and cookie values.
+- An origin's `Vary` may name `Accept-Encoding` and the headers in `cache_key_headers`, which the
+  key already holds; a `Vary` on anything else (`Cookie` and `*` included) still keeps the response
+  out of the cache. Each name multiplies the copies kept of every matching URL, so name only what
+  the origin really varies on.
 
 ### Rulesets
 
@@ -499,7 +530,7 @@ whole, and a new `action` starts without the old action's parameters. `position`
 | `http_request_transform` | transform rules (path) | `rewrite`; `action_parameters.uri.path.value` |
 | `http_request_late_transform` | transform rules (request headers) | `rewrite`; `action_parameters.headers.{name}`: `{"operation": "set", "value"}` or `{"operation": "remove"}` |
 | `http_response_headers_transform` | transform rules (response headers) | as above |
-| `http_request_cache_settings` | cache rules | `set_cache_settings`; `action_parameters.cache` (required), `edge_ttl`: `{"mode": "override_origin", "default"}` or `{"mode": "respect_origin"}` |
+| `http_request_cache_settings` | cache rules | `set_cache_settings`; `action_parameters.cache` (required), `edge_ttl`: `{"mode": "override_origin", "default"}` or `{"mode": "respect_origin"}`, `cache_key.custom_key`: `header.include`, `cookie.include` (`check_presence` only empty) |
 | `http_request_origin` | origin rules | `route`; `action_parameters`: `host_header`, `origin.host`, `origin.port`, `sni.value` |
 
 - Whatever a rule says that this server cannot do is refused with a 400 that names the field

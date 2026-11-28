@@ -1061,6 +1061,13 @@ pub struct CacheRule {
     /// One copy whatever the query string: the key is the path alone.
     #[serde(default)]
     pub ignore_query: bool,
+    /// Request headers whose values are part of the key: one copy per
+    /// value (crate::edge::cachekey). Stored in lower case.
+    #[serde(default)]
+    pub cache_key_headers: Vec<String>,
+    /// Cookies whose values are part of the key; names keep their case.
+    #[serde(default)]
+    pub cache_key_cookies: Vec<String>,
 }
 
 impl Item for CacheRule {
@@ -1070,6 +1077,8 @@ impl Item for CacheRule {
         if self.edge_ttl.is_some_and(|t| t == 0 || t > 31_536_000) {
             return invalid("edge_ttl must be between 1 and 31536000 seconds");
         }
+        crate::edge::cachekey::check_headers(&mut self.cache_key_headers).map_err(StoreError::Invalid)?;
+        crate::edge::cachekey::check_cookies(&self.cache_key_cookies).map_err(StoreError::Invalid)?;
         Ok(())
     }
 }

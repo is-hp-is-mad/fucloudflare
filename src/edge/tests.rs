@@ -810,6 +810,63 @@ async fn redirect_transform_and_cache_rules() {
 }
 
 #[tokio::test]
+async fn a_cache_rule_keeps_one_copy_per_value_of_the_headers_and_cookies_it_names() {
+    let env = setup().await;
+    let rule = json!({
+        "expression": "starts_with(http.request.uri.path, \"/keyed/\")", "cache": true,
+        "cache_key_headers": ["X-Lang"], "cache_key_cookies": ["variant"],
+    });
+    let saved = env.store.save_item::<CacheRule>(&env.zone, None, rule, true).unwrap();
+    assert_eq!(saved.cache_key_headers, vec!["x-lang"], "header names are kept in lower case");
+    let ask = |extra: String| {
+        let env = &env;
+        async move {
+            let r = send(env, "GET", "example.com", "/keyed/page?x=1", &extra, "").await;
+            let hit = r.body.rsplit("hit=").next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
+            (r.header("fcf-cache-status").map(String::from), hit)
+        }
+    };
+    let s = |v: &str| v.to_string();
+    let first = ask(s("X-Lang: en\r\n")).await;
+    assert_eq!(first.0.as_deref(), Some("MISS"));
+    assert_eq!(ask(s("X-Lang: en\r\n")).await, (Some(s("HIT")), first.1.clone()));
+    assert_eq!(ask(s("x-lang: en\r\nCookie: other=1\r\n")).await, (Some(s("HIT")), first.1.clone()), "other cookies do not count");
+    assert_eq!(ask(s("X-Lang: de\r\n")).await.0.as_deref(), Some("MISS"), "another value, another copy");
+    assert_eq!(ask(s("")).await.0.as_deref(), Some("MISS"), "a missing header is a value of its own");
+    let with_cookie = ask(s("X-Lang: en\r\nCookie: a=1;  variant=b\r\n")).await;
+    assert_eq!(with_cookie.0.as_deref(), Some("MISS"));
+    assert_eq!(ask(s("X-Lang: en\r\nCookie: variant=b; a=2\r\n")).await, (Some(s("HIT")), with_cookie.1.clone()));
+    assert_eq!(ask(s("X-Lang: de\r\n")).await.0.as_deref(), Some("HIT"));
+
+    // a purge by URL finds every copy of it, whatever the values
+    assert_eq!(env.edge.cache.purge_urls(&env.zone, &["https://example.com/keyed/page?x=1".into()], false), 4);
+    assert_eq!(ask(s("X-Lang: en\r\n")).await.0.as_deref(), Some("MISS"));
+    assert_eq!(env.edge.cache.purge_urls(&env.zone, &["example.com/keyed/".into()], true), 1, "and a purge by prefix");
+
+    // values that would make the key too long are neither stored nor looked up
+    let long = format!("X-Lang: {}\r\n", "l".repeat(crate::edge::cachekey::MAX_KEY));
+    let a = ask(long.clone()).await;
+    let b = ask(long).await;
+    assert_eq!((a.0.as_deref(), b.0.as_deref()), (Some("BYPASS"), Some("BYPASS")));
+    assert_ne!(a.1, b.1, "both went to the origin");
+
+    // without the rule's names, the key is the URL's as before: headers and cookies do not count
+    let plain = |extra: &'static str| send(&env, "GET", "example.com", "/plain/app.js", extra, "");
+    assert_eq!(plain("X-Lang: en\r\n").await.header("fcf-cache-status"), Some("MISS"));
+    assert_eq!(plain("X-Lang: de\r\nCookie: variant=b\r\n").await.header("fcf-cache-status"), Some("HIT"));
+    let long = format!("X-Lang: {}\r\n", "l".repeat(crate::edge::cachekey::MAX_KEY));
+    let r = send(&env, "GET", "example.com", "/plain/app.js", &long, "").await;
+    assert_eq!(r.header("fcf-cache-status"), Some("HIT"), "the limit is only for keys a rule added to");
+
+    // names the rule may not hold are refused
+    for bad in [json!({ "cache_key_headers": ["x a"] }), json!({ "cache_key_cookies": ["a=b"] }), json!({ "cache_key_headers": [""] })] {
+        let mut body = json!({ "expression": "", "cache": true });
+        body.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        assert!(env.store.save_item::<CacheRule>(&env.zone, None, body, true).is_err(), "{bad}");
+    }
+}
+
+#[tokio::test]
 async fn revalidates_and_answers_conditional_requests() {
     let env = setup().await;
     let first = get(&env, "example.com", "/etag/doc").await;

@@ -745,12 +745,25 @@ impl Mapped for CacheRule {
         if let Some(ttl) = self.edge_ttl {
             params.insert("edge_ttl".into(), json!({ "mode": "override_origin", "default": ttl }));
         }
+        // `ignore_query` has no words here yet: it is not shown, and a change
+        // through this API leaves it as it is
+        let mut custom = Map::new();
+        if !self.cache_key_headers.is_empty() {
+            custom.insert("header".into(), json!({ "include": self.cache_key_headers }));
+        }
+        if !self.cache_key_cookies.is_empty() {
+            custom.insert("cookie".into(), json!({ "include": self.cache_key_cookies }));
+        }
+        if !custom.is_empty() {
+            params.insert("cache_key".into(), json!({ "custom_key": custom }));
+        }
         map(json!({ "action": "set_cache_settings", "action_parameters": params }))
     }
     fn parse(kind: Kind, c: &Common, base: &str) -> Result<Map<String, Value>, StoreError> {
         action_in(c, &["set_cache_settings"], kind, base)?;
         let params = at(base, "action_parameters");
-        only(&c.params, &["cache", "edge_ttl"], &params)?;
+        only(&c.params, &["cache", "edge_ttl", "cache_key"], &params)?;
+        let (cache_key_headers, cache_key_cookies) = custom_key(&c.params, &params)?;
         let cache = required(flag(&c.params, "cache", &params)?, &params, "cache")?;
         let edge_ttl = match maybe(&c.params, "edge_ttl", &params)? {
             None => None,
@@ -770,8 +783,46 @@ impl Mapped for CacheRule {
                 }
             }
         };
-        Ok(map(json!({ "cache": cache, "edge_ttl": edge_ttl })))
+        Ok(map(json!({
+            "cache": cache,
+            "edge_ttl": edge_ttl,
+            "cache_key_headers": cache_key_headers,
+            "cache_key_cookies": cache_key_cookies,
+        })))
     }
+}
+
+/// The headers and cookies of `cache_key.custom_key` whose values go into
+/// the key (`header.include`, `cookie.include`); a rule without them keys
+/// by URL alone. Only what changes the key the way this server does is
+/// taken: `check_presence` only empty; `exclude_origin` and the other parts
+/// of a custom key (query string, host, user) not at all.
+fn custom_key(params: &Map<String, Value>, base: &str) -> Result<(Vec<String>, Vec<String>), StoreError> {
+    let Some(cache_key) = maybe(params, "cache_key", base)? else { return Ok((Vec::new(), Vec::new())) };
+    let base = at(base, "cache_key");
+    only(cache_key, &["custom_key"], &base)?;
+    let Some(custom) = maybe(cache_key, "custom_key", &base)? else { return Ok((Vec::new(), Vec::new())) };
+    let base = at(&base, "custom_key");
+    only(custom, &["header", "cookie"], &base)?;
+    let mut lists = [Vec::new(), Vec::new()];
+    for (key, list) in ["header", "cookie"].into_iter().zip(lists.iter_mut()) {
+        let Some(part) = maybe(custom, key, &base)? else { continue };
+        let path = at(&base, key);
+        only(part, &["include", "check_presence"], &path)?;
+        if part.get("check_presence").is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty())) {
+            return invalid(format!("{} is not supported by this server: only values are part of the key", at(&path, "check_presence")));
+        }
+        let names = match part.get("include") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>().ok_or_else(|| {
+                StoreError::Invalid(format!("{} must be a list of strings", at(&path, "include")))
+            })?,
+            Some(_) => return invalid(format!("{} must be a list of strings", at(&path, "include"))),
+        };
+        *list = names;
+    }
+    let [headers, cookies] = lists;
+    Ok((headers, cookies))
 }
 
 impl Mapped for OriginRule {
@@ -1727,6 +1778,70 @@ mod tests {
         assert_eq!(now.origin_scheme.as_deref(), Some("https"));
         assert_eq!(now.sni.as_deref(), Some("example.net"));
         assert_eq!(now.host_header, None, "action_parameters is replaced as a whole");
+    }
+
+    #[tokio::test]
+    async fn a_cache_rule_keys_by_the_headers_and_cookies_of_its_custom_key() {
+        let (store, z) = setup();
+        let phase = "http_request_cache_settings";
+        let custom = json!({ "header": { "include": ["accept-language", "x-variant"] }, "cookie": { "include": ["Sess"] } });
+        let rule = json!({
+            "action": "set_cache_settings", "expression": "true", "description": "", "enabled": true,
+            "action_parameters": { "cache": true, "cache_key": { "custom_key": custom } },
+        });
+        let rs = put_entrypoint(&store, &z, phase, json!({ "rules": [rule.clone()] })).await.unwrap();
+        assert_eq!(rules(&rs), vec![rule], "given back as given");
+        let stored = store.items::<CacheRule>(&z).unwrap().remove(0);
+        assert_eq!(stored.cache_key_headers, vec!["accept-language", "x-variant"]);
+        assert_eq!(stored.cache_key_cookies, vec!["Sess"]);
+
+        // header names are stored in lower case; an empty check_presence is fine
+        let mut upper = rules(&rs)[0].clone();
+        upper["id"] = rs["rules"][0]["id"].clone();
+        upper["action_parameters"]["cache_key"]["custom_key"] = json!({ "header": { "include": ["X-Device"], "check_presence": [] } });
+        let rs = put_entrypoint(&store, &z, phase, json!({ "rules": [upper] })).await.unwrap();
+        assert_eq!(rs["rules"][0]["action_parameters"]["cache_key"], json!({ "custom_key": { "header": { "include": ["x-device"] } } }));
+        assert!(store.items::<CacheRule>(&z).unwrap()[0].cache_key_cookies.is_empty(), "what the rule no longer says is gone");
+
+        // a rule without a cache_key keys by URL alone again, and shows none
+        let mut plain = rules(&rs)[0].clone();
+        plain["id"] = rs["rules"][0]["id"].clone();
+        plain["action_parameters"].as_object_mut().unwrap().remove("cache_key");
+        let rs = put_entrypoint(&store, &z, phase, json!({ "rules": [plain] })).await.unwrap();
+        assert!(rs["rules"][0]["action_parameters"].get("cache_key").is_none());
+        assert!(store.items::<CacheRule>(&z).unwrap()[0].cache_key_headers.is_empty());
+        let kept = ids(&rs);
+
+        // what this server cannot do is refused by name, and nothing changes
+        let refused = |custom: Value| json!({ "rules": [{ "action": "set_cache_settings", "expression": "true", "action_parameters": { "cache": true, "cache_key": custom } }] });
+        for (body, field) in [
+            (json!({ "cache_deception_armor": true }), "cache_key.cache_deception_armor"),
+            (json!({ "custom_key": { "query_string": { "exclude": { "all": true } } } }), "custom_key.query_string"),
+            (json!({ "custom_key": { "header": { "include": ["x-a"], "exclude_origin": true } } }), "header.exclude_origin"),
+            (json!({ "custom_key": { "header": { "check_presence": ["x-a"] } } }), "header.check_presence"),
+            (json!({ "custom_key": { "cookie": { "include": "sess" } } }), "cookie.include must be a list of strings"),
+            (json!({ "custom_key": { "cookie": { "include": [1] } } }), "cookie.include must be a list of strings"),
+            (json!({ "custom_key": { "header": { "include": [""] } } }), "cache_key_headers"),
+            (json!({ "custom_key": { "cookie": { "include": ["a=b"] } } }), "cache_key_cookies"),
+        ] {
+            let m = err(put_entrypoint(&store, &z, phase, refused(body.clone())).await);
+            assert!(m.contains(field), "{body}: {m}");
+        }
+        assert_eq!(ids(&entrypoint(&store, &z, phase).unwrap()), kept, "the refused PUTs replaced nothing");
+    }
+
+    #[tokio::test]
+    async fn a_change_through_rulesets_leaves_ignore_query_as_it_is() {
+        let (store, z) = setup();
+        let r = store
+            .save_item_async::<CacheRule>(&z, None, json!({ "expression": "", "cache": true, "ignore_query": true, "cache_key_headers": ["x-a"] }), true)
+            .await
+            .unwrap();
+        let rs_id = ruleset_id(&z, "http_request_cache_settings");
+        update_rule(&store, &z, &rs_id, &r.meta.id, json!({ "action_parameters": { "cache": true } })).await.unwrap();
+        let now = store.item::<CacheRule>(&z, &r.meta.id).unwrap();
+        assert!(now.ignore_query);
+        assert!(now.cache_key_headers.is_empty(), "the custom key is Cloudflare's to say");
     }
 
     #[tokio::test]

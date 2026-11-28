@@ -336,6 +336,11 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
   边缘自己拒绝或失败的请求（WAF、限流、源站不可达）以 gRPC 状态码返回而不是错误页。gRPC-Web 是普通 HTTP，不走这条路径。
 - 故障转移：一个主机名有多条代理 A/AAAA 记录时轮询；连接被拒的地址 10 秒内排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
 - 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份）。首条匹配生效。
+- 自定义缓存键：缓存规则的 `cache_key_headers`（请求头名）和 `cache_key_cookies`（Cookie 名）让这些值也进缓存键，每个取值各存一份，
+  适合按语言、设备或 Cookie 里的实验分组返回不同内容的源站。各最多 8 个名字；请求头名不区分大小写（存成小写），Cookie 名区分大小写；
+  请求里没有的按空值算，同名 Cookie 取第一个，值里的控制字符会被去掉。加了这些值后键超过 2048 字节的请求不查也不存缓存（`BYPASS`），
+  防止超长头把缓存撑爆；没配这两个字段的规则缓存键和以前完全一样。源站的 `Vary` 可以指向这些请求头（其他 `Vary` 照旧不缓存）。
+  按 URL 或前缀清除时，同一 URL 的各个取值一起清掉。
 - 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象；或给 `tags`：清掉源站用 `Cache-Tag` 响应头（逗号分隔）标记过的对象，该响应头不会发给访客。
 - `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本。
 

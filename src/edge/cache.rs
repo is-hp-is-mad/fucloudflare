@@ -153,8 +153,11 @@ fn tracking(param: &str) -> bool {
 }
 
 /// The key of a request: scheme, host, path and query (without tracking
-/// parameters), and which compressions the client takes.
-pub fn cache_key(ssl: bool, host: &str, uri: &str, req_headers: &HeaderMap) -> String {
+/// parameters), what a cache rule adds (`custom`, from
+/// crate::edge::cachekey; empty for most), and which compressions the
+/// client takes. `custom` goes before the compression part so that
+/// [`identity_key`] still finds the copy every compression shares.
+pub fn cache_key(ssl: bool, host: &str, uri: &str, custom: &str, req_headers: &HeaderMap) -> String {
     let uri = match uri.split_once('?') {
         Some((path, query)) if query.split('&').any(tracking) => {
             let kept: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && !tracking(p)).collect();
@@ -162,7 +165,7 @@ pub fn cache_key(ssl: bool, host: &str, uri: &str, req_headers: &HeaderMap) -> S
         }
         _ => uri.to_string(),
     };
-    format!("{}|{host}{uri}|{ENC}{}", if ssl { "https" } else { "http" }, accept_encoding_bucket(req_headers))
+    format!("{}|{host}{uri}{custom}|{ENC}{}", if ssl { "https" } else { "http" }, accept_encoding_bucket(req_headers))
 }
 
 /// Marks the compression part of a key from [`cache_key`].
@@ -176,8 +179,10 @@ fn identity_key(key: &str) -> Option<String> {
 }
 
 /// `force` makes any content type eligible ("cache everything"); `ttl`
-/// overrides the origin's freshness directives.
-pub fn decide(path: &str, status: StatusCode, headers: &HeaderMap, force: bool, ttl: Option<u64>) -> Decision {
+/// overrides the origin's freshness directives. `keyed`: the request
+/// headers a cache rule made part of the key (lower case), which the
+/// origin's `Vary` may name too.
+pub fn decide(path: &str, status: StatusCode, headers: &HeaderMap, force: bool, ttl: Option<u64>, keyed: &[String]) -> Decision {
     let cc = directives(headers);
     let has = |name: &str| cc.iter().any(|(k, _)| k == name);
     let secs = |name: &str| cc.iter().find(|(k, _)| k == name).and_then(|(_, v)| v.as_ref()?.parse::<u64>().ok());
@@ -201,13 +206,15 @@ pub fn decide(path: &str, status: StatusCode, headers: &HeaderMap, force: bool, 
     if forbidden || headers.contains_key(header::SET_COOKIE) {
         return Decision::Bypass;
     }
-    // Only `Vary: Accept-Encoding` is supported (it is part of the key).
+    // Only `Vary` on what is part of the key is supported: `Accept-Encoding`,
+    // and the headers a cache rule added to it.
     let vary_ok = headers
         .get_all(header::VARY)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .all(|v| v.trim().eq_ignore_ascii_case("accept-encoding"));
+        .map(str::trim)
+        .all(|v| v.eq_ignore_ascii_case("accept-encoding") || keyed.iter().any(|k| v.eq_ignore_ascii_case(k)));
     if !vary_ok {
         return Decision::Bypass;
     }
@@ -691,11 +698,11 @@ mod tests {
     #[test]
     fn decisions() {
         let ok = StatusCode::OK;
-        let decide = |p, s, h: &HeaderMap| super::decide(p, s, h, false, None);
+        let decide = |p, s, h: &HeaderMap| super::decide(p, s, h, false, None, &[]);
         let html = h(&[("cache-control", "private")]);
-        assert_eq!(super::decide("/index.html", ok, &h(&[]), true, None), Decision::Store(Duration::from_secs(7200)));
-        assert_eq!(super::decide("/index.html", ok, &html, true, None), Decision::Bypass);
-        assert_eq!(super::decide("/index.html", ok, &html, true, Some(30)), Decision::Store(Duration::from_secs(30)));
+        assert_eq!(super::decide("/index.html", ok, &h(&[]), true, None, &[]), Decision::Store(Duration::from_secs(7200)));
+        assert_eq!(super::decide("/index.html", ok, &html, true, None, &[]), Decision::Bypass);
+        assert_eq!(super::decide("/index.html", ok, &html, true, Some(30), &[]), Decision::Store(Duration::from_secs(30)));
         assert_eq!(decide("/a/app.js", ok, &h(&[])), Decision::Store(Duration::from_secs(7200)));
         assert_eq!(decide("/index.html", ok, &h(&[])), Decision::Dynamic);
         assert_eq!(decide("/api", ok, &h(&[("cache-control", "max-age=60")])), Decision::Dynamic);
@@ -711,6 +718,14 @@ mod tests {
         assert_eq!(decide("/a.css", ok, &h(&[("set-cookie", "a=b")])), Decision::Bypass);
         assert_eq!(decide("/a.css", ok, &h(&[("vary", "Cookie")])), Decision::Bypass);
         assert!(matches!(decide("/a.css", ok, &h(&[("vary", "Accept-Encoding")])), Decision::Store(_)));
+        // a Vary on headers a cache rule keys by is covered by the key; any other is not
+        let keyed = ["accept-language".to_string()];
+        let vary = h(&[("vary", "Accept-Encoding, Accept-Language")]);
+        assert_eq!(decide("/a.css", ok, &vary), Decision::Bypass);
+        assert!(matches!(super::decide("/a.css", ok, &vary, false, None, &keyed), Decision::Store(_)));
+        for other in ["Accept-Language, Cookie", "*", "Accept-Language-X"] {
+            assert_eq!(super::decide("/a.css", ok, &h(&[("vary", other)]), false, None, &keyed), Decision::Bypass, "{other}");
+        }
         assert_eq!(decide("/a.css", StatusCode::NOT_FOUND, &h(&[])), Decision::Store(Duration::from_secs(180)));
         assert_eq!(decide("/a.css", StatusCode::INTERNAL_SERVER_ERROR, &h(&[])), Decision::Dynamic);
     }
@@ -796,9 +811,9 @@ mod tests {
             }
             h
         };
-        let k = cache_key(true, "a.test", "/x.js?v=2&utm_source=tw&fbclid=1", &ae("gzip, br"));
+        let k = cache_key(true, "a.test", "/x.js?v=2&utm_source=tw&fbclid=1", "", &ae("gzip, br"));
         assert_eq!(k, "https|a.test/x.js?v=2|ae=br,gzip");
-        assert_eq!(cache_key(true, "a.test", "/x.js?utm_medium=a", &ae("")), "https|a.test/x.js|ae=");
+        assert_eq!(cache_key(true, "a.test", "/x.js?utm_medium=a", "", &ae("")), "https|a.test/x.js|ae=");
         assert_eq!(identity_key(&k).as_deref(), Some("https|a.test/x.js?v=2|ae="));
         assert_eq!(identity_key("https|a.test/x.js|ae="), None);
         assert_eq!(identity_key("warp|some|key"), None, "other keys are left alone");
@@ -813,11 +828,43 @@ mod tests {
         };
         cache.put(k.clone(), entry(false));
         for bucket in ["", "gzip", "br", "gzip, br"] {
-            assert!(cache.get(&cache_key(true, "a.test", "/x.js?v=2", &ae(bucket))).is_some(), "{bucket}");
+            assert!(cache.get(&cache_key(true, "a.test", "/x.js?v=2", "", &ae(bucket))).is_some(), "{bucket}");
         }
-        let br = cache_key(true, "a.test", "/y.js", &ae("br"));
+        let br = cache_key(true, "a.test", "/y.js", "", &ae("br"));
         cache.put(br.clone(), entry(true));
-        assert!(cache.get(&br).is_some() && cache.get(&cache_key(true, "a.test", "/y.js", &ae("gzip"))).is_none(), "compressed copies stay apart");
+        assert!(cache.get(&br).is_some() && cache.get(&cache_key(true, "a.test", "/y.js", "", &ae("gzip"))).is_none(), "compressed copies stay apart");
+    }
+
+    #[test]
+    fn a_custom_key_part_keeps_variants_apart_and_purges_still_find_them() {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let (en, de) = ("\u{1f}hx-lang=en", "\u{1f}hx-lang=de");
+        let k_en = cache_key(true, "a.test", "/p?v=1&utm_source=x", en, &h);
+        assert_eq!(k_en, "https|a.test/p?v=1\u{1f}hx-lang=en|ae=gzip");
+        assert_eq!(identity_key(&k_en).as_deref(), Some("https|a.test/p?v=1\u{1f}hx-lang=en|ae="), "the part stays in the shared key");
+
+        let cache = Cache::new(1 << 20);
+        let entry = |body: &'static [u8]| Entry {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(body),
+            stored: Instant::now(),
+            ttl: Duration::from_secs(60),
+            zone_id: "z".into(),
+            url: "a.test/p?v=1".into(),
+        };
+        cache.put(k_en.clone(), entry(b"en"));
+        cache.put(cache_key(true, "a.test", "/p?v=1", de, &h), entry(b"de"));
+        cache.put(cache_key(true, "a.test", "/other", de, &h), Entry { url: "a.test/other".into(), ..entry(b"o") });
+        assert_eq!(&cache.get(&k_en).unwrap().body[..], b"en");
+        assert_eq!(&cache.get(&cache_key(true, "a.test", "/p?v=1", de, &HeaderMap::new())).unwrap().body[..], b"de");
+        assert!(cache.get(&cache_key(true, "a.test", "/p?v=1", "", &h)).is_none(), "no part, no variant");
+
+        // purges match the stored URL, so every variant of it goes
+        assert_eq!(cache.purge_urls("z", &["https://a.test/p?v=1".into()], false), 2);
+        assert!(cache.get(&k_en).is_none());
+        assert_eq!(cache.purge_urls("z", &["a.test/oth".into()], true), 1, "by prefix too");
     }
 
     #[test]
