@@ -136,6 +136,12 @@ fn mark_cache(resp: &mut Response<Body>, colo: &str) {
 
 /// Set on panel requests a node passes on to the node that runs the panel.
 const PANEL_HOP: &str = "fucf-panel-hop";
+/// Set (with the same seal) on sync requests a node sends to another node by
+/// its address: that node answers them itself instead of passing them on.
+pub const SYNC_DIRECT: &str = "fucf-sync-direct";
+/// Panel requests bodies up to this size are kept, to be answered here should
+/// the panel's node not be reached.
+const PANEL_RETRY_BODY: usize = 1 << 20;
 
 /// Where a node that does not run the panel sends the panel's requests:
 /// `origin` (`ip[:port]`, port 443 by default) over HTTPS, under the panel
@@ -1036,6 +1042,9 @@ pub struct Edge {
     handing_over: tokio::sync::watch::Sender<bool>,
     /// Requests being answered right now.
     busy: AtomicUsize,
+    /// Until when (unix seconds) the panel's node is taken as unreachable:
+    /// panel requests are answered by this node's own API meanwhile.
+    panel_down_until: std::sync::atomic::AtomicU64,
 }
 
 /// Counts a request as under way for as long as it lives.
@@ -1296,6 +1305,7 @@ impl Edge {
             leaving: std::sync::atomic::AtomicBool::new(false),
             handing_over: tokio::sync::watch::channel(false).0,
             busy: AtomicUsize::new(0),
+            panel_down_until: Default::default(),
         })
     }
 
@@ -1970,23 +1980,30 @@ impl Edge {
             // passed on by another node of the fleet: it proves that with a value derived from the fleet's token
             // (a node's address alone is not enough: other programs on that host can connect from it too)
             let seal = self.panel_seal.get();
-            let hopped = req.headers().get(PANEL_HOP).is_some_and(|v| seal.is_some_and(|seal| v.as_bytes() == seal.as_bytes()));
-            let from_node = hopped && cgi::is_fucf_node(ip, &self.store.snapshot().nodes);
+            let sealed = |name: &str| req.headers().get(name).is_some_and(|v| seal.is_some_and(|seal| v.as_bytes() == seal.as_bytes()));
+            let hopped = sealed(PANEL_HOP);
+            let is_node = cgi::is_fucf_node(ip, &self.store.snapshot().nodes);
+            let from_node = hopped && is_node;
+            // another node syncing with this one by its address: answered here
+            let direct = sealed(SYNC_DIRECT) && is_node && req.uri().path().starts_with("/client/v4/replication/");
+            let local = Target {
+                host: api.ip().to_string(),
+                alternates: Vec::new(),
+                port: api.port(),
+                tls: Tls::Off,
+                sni: String::new(),
+                host_header: host.clone(),
+                h2: false,
+                block_private_ips: false,
+            };
             let target = match self.panel_origin.get() {
+                _ if direct => local.clone(),
                 // another node runs the panel; never send on what a node already sent on
                 Some(origin) if !hopped => origin.clone(),
                 Some(_) => return Err(EdgeError::new(508, "Loop detected", "the panel request went from node to node")),
-                None => Target {
-                    host: api.ip().to_string(),
-                    alternates: Vec::new(),
-                    port: api.port(),
-                    tls: Tls::Off,
-                    sni: String::new(),
-                    host_header: host.clone(),
-                    h2: false,
-                    block_private_ips: false,
-                },
+                None => local.clone(),
             };
+            let forwarding = !direct && self.panel_origin.get().is_some();
             // the visitor's address: as the node that passed the request on names it
             let visitor = from_node
                 .then(|| req.headers().get("x-forwarded-for")?.to_str().ok()?.rsplit(',').next()?.trim().parse::<IpAddr>().ok())
@@ -1996,12 +2013,14 @@ impl Edge {
             if let Ok(v) = HeaderValue::from_str(&visitor.to_string()) {
                 req.headers_mut().insert("x-forwarded-for", v);
             }
-            if let (Some(_), Some(seal)) = (self.panel_origin.get(), seal.and_then(|s| HeaderValue::from_str(s).ok())) {
+            req.headers_mut().remove(SYNC_DIRECT);
+            if let (true, Some(seal)) = (forwarding, seal.and_then(|s| HeaderValue::from_str(s).ok())) {
                 req.headers_mut().insert(PANEL_HOP, seal);
             } else {
                 req.headers_mut().remove(PANEL_HOP);
             }
-            let (mut parts, body) = self.upstream.send(&target, req).await?.into_parts();
+            let answer = if forwarding { self.clone().to_panel(&target, &local, req).await? } else { self.upstream.send(&target, req).await? };
+            let (mut parts, body) = answer.into_parts();
             strip_hop_by_hop(&mut parts.headers);
             if ssl {
                 parts.headers.insert(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=31536000"));
@@ -2319,6 +2338,49 @@ pub fn with_script(page: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(SCRIPT_TAG.as_bytes());
     out.extend_from_slice(&page[at..]);
     Some(out)
+}
+
+impl Edge {
+    /// A panel request for the panel's node. When that node cannot be reached
+    /// (gone, or cut off from here), this node's own API answers instead for
+    /// a minute: every peer holds the accounts and the configuration, and
+    /// what is changed here reaches the others by sync. (Not on accelerate
+    /// nodes: they hold no accounts.)
+    async fn to_panel(self: Arc<Self>, origin: &Target, local: &Target, req: Request<Body>) -> Result<Response<hyper::body::Incoming>, EdgeError> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if self.accelerate.load(Ordering::Relaxed) {
+            return Ok(self.upstream.send(origin, req).await?);
+        }
+        let (mut parts, body) = req.into_parts();
+        if self.panel_down_until.load(Ordering::Relaxed) > now {
+            parts.headers.remove(PANEL_HOP);
+            return Ok(self.upstream.send(local, Request::from_parts(parts, body)).await?);
+        }
+        let (chunks, rest) = read_up_to(body, PANEL_RETRY_BODY).await.map_err(|_| EdgeError::new(400, "Bad request", "reading the request body failed"))?;
+        if let Some(rest) = rest {
+            // too big to keep (a release upload): the panel's node or nothing
+            return Ok(self.upstream.send(origin, Request::from_parts(parts, Prefixed { head: chunks.into(), rest }.boxed())).await?);
+        }
+        let bytes = Bytes::from(chunks.concat());
+        let copy = |parts: &hyper::http::request::Parts, hop: bool, body: Bytes| {
+            let mut b = Request::builder().method(parts.method.clone()).uri(parts.uri.clone()).version(parts.version);
+            if let Some(h) = b.headers_mut() {
+                *h = parts.headers.clone();
+                if !hop {
+                    h.remove(PANEL_HOP);
+                }
+            }
+            b.body(full(body)).map_err(|e| EdgeError::new(400, "Bad request", e.to_string()))
+        };
+        match self.upstream.send(origin, copy(&parts, true, bytes.clone())?).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                tracing::warn!("the panel's node is not reached ({e:?}): this node answers panel requests for a minute");
+                self.panel_down_until.store(now + 60, Ordering::Relaxed);
+                Ok(self.upstream.send(local, copy(&parts, false, bytes)?).await?)
+            }
+        }
+    }
 }
 
 /// Run the pipeline and stamp the edge's own response headers.

@@ -458,15 +458,21 @@ async fn main() -> anyhow::Result<()> {
         (None, Some(_)) => anyhow::bail!("--panel-origin needs --panel-host"),
         _ => None,
     };
-    // a peer known by the panel's name is where the panel runs: go there directly
+    // a peer known by the panel's name is where the panel runs: go there directly;
+    // a peer named by its address is that node itself, spoken to under the panel's name
+    // (its certificate) and answering sync itself (see edge, SYNC_DIRECT)
     let peer_targets: Vec<edge::upstream::Target> = peer_targets
         .into_iter()
         .map(|mut t| {
             if let Some(origin) = panel_origin.as_ref().filter(|_| panel_host.as_deref() == Some(t.host.as_str())) {
                 (t.host, t.port) = (origin.host.clone(), origin.port);
+            } else if let (Ok(_), Some(host)) = (t.host.parse::<IpAddr>(), panel_host.as_ref()) {
+                (t.sni, t.host_header) = (host.clone(), host.clone());
             }
             t
         })
+        // not with itself
+        .filter(|t| !t.host.parse::<IpAddr>().is_ok_and(|ip| args.edge_ips.contains(&ip)) || panel_host.as_deref().is_some_and(|h| t.sni != *h))
         .collect();
 
     let fleet_self = fleet::self_name(&store, &args.edge_ips, args.node_name.as_deref());
@@ -919,8 +925,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    if !accel {
-        // bans from the security events (zones that switched it on)
+    if !accel && edge.panel_origin.get().is_none() {
+        // bans from the security events (zones that switched it on): on the panel's node
+        // only, one writer for the rules (every peer has the events)
         edge::autofw::spawn(store.clone(), waf.clone(), edge.reputation.get().cloned());
     }
     let edge_at_stop = edge.clone();

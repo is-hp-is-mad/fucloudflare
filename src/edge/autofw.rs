@@ -195,7 +195,15 @@ async fn keep(
 /// Bring one zone's automatic rules up to date: the addresses, the networks,
 /// and the security level during a surge. Returns how many addresses are banned.
 pub async fn update_zone(store: &Store, waf: &Waf, zone_id: &str, settings: &Settings, now: u64, spared: &HashSet<IpAddr>) -> Result<usize, crate::store::StoreError> {
-    let rules = store.items::<FirewallRule>(zone_id)?;
+    let mut rules = store.items::<FirewallRule>(zone_id)?;
+    // one rule of each kind (two writers, once, may have made two)
+    for by in [MANAGED_BY, MANAGED_BY_NETWORKS] {
+        let extra: Vec<String> = rules.iter().filter(|r| r.managed_by == by).skip(1).map(|r| r.meta.id.clone()).collect();
+        for id in &extra {
+            store.delete_item_async::<FirewallRule>(zone_id, id).await?;
+        }
+        rules.retain(|r| r.managed_by != by || !extra.contains(&r.meta.id));
+    }
     let events = if settings.auto_firewall { waf.events(zone_id, usize::MAX) } else { Vec::new() };
     let on = settings.auto_firewall;
 
