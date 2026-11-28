@@ -935,3 +935,80 @@ test("Security audit fixes: IDOR session revoke, unverified OAuth email, duplica
     Object.defineProperty(crypto.subtle, "deriveBits", { value: origDeriveBits, configurable: true });
   }
 });
+
+test("Admin: registration switch, roles, apps and providers are set on the auth site", async () => {
+  const env = makeEnv({ LINUXDO_CLIENT_ID: "", LINUXDO_CLIENT_SECRET: "" });
+  const base = "https://auth.fucloudflare.com";
+  const reg = async (username) => {
+    const r = await worker.fetch(new Request(base + "/register", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: `${username}@example.com`, username, password: "a long password here" }),
+    }), env, {});
+    return r;
+  };
+  const r1 = await reg("boss");
+  assert.equal(r1.status, 201);
+  const boss = extractCookie(r1, "fucf_auth_sid");
+  const r2 = await reg("someone");
+  const someone = extractCookie(r2, "fucf_auth_sid");
+
+  // not an admin yet: the page says so, the API refuses
+  const denied = await worker.fetch(new Request(base + "/admin", { headers: { cookie: boss } }), env, {});
+  assert.equal(denied.status, 403);
+  await env.AUTH_DB.prepare("UPDATE users SET role = 'admin' WHERE username = ?").bind("boss").run();
+
+  const page = await worker.fetch(new Request(base + "/admin", { headers: { cookie: boss } }), env, {});
+  assert.equal(page.status, 200);
+  const html = await page.text();
+  assert.ok(html.includes("管理") && html.includes("Administration") && html.includes("someone"));
+  const csrf = /var csrfToken = "([^"]+)"/.exec(html)[1];
+  const acc = await (await worker.fetch(new Request(base + "/account", { headers: { cookie: boss } }), env, {})).text();
+  assert.ok(acc.includes('href="/admin"'), "admins see the way to the admin page");
+
+  const api = (cookie, data, token = csrf) => worker.fetch(new Request(base + "/admin/api", {
+    method: "POST",
+    headers: Object.assign({ "content-type": "application/json", origin: base, cookie }, token ? { "x-csrf-token": token } : {}),
+    body: JSON.stringify(data),
+  }), env, {});
+  assert.equal((await api(someone, { action: "registration", value: "closed" })).status, 403, "only admins");
+  assert.equal((await api(boss, { action: "registration", value: "closed" }, "")).status, 403, "the CSRF token is required");
+
+  // close registration: no sign-up, no new users through a provider, the tab is gone
+  assert.equal((await api(boss, { action: "registration", value: "closed" })).status, 200);
+  const closed = await reg("latecomer");
+  assert.equal(closed.status, 403);
+  assert.equal((await closed.json()).error, "registration_closed");
+  const login = await (await worker.fetch(new Request(base + "/login"), env, {})).text();
+  assert.ok(login.includes('class="tabs hidden"'));
+  const withError = await (await worker.fetch(new Request(base + "/login?error=registration_closed"), env, {})).text();
+  assert.ok(withError.includes("注册已关闭"));
+  assert.equal((await api(boss, { action: "registration", value: "open" })).status, 200);
+  assert.equal((await reg("latecomer")).status, 201);
+
+  // roles: the last admin stays
+  const ids = Object.fromEntries(((await env.AUTH_DB.prepare("SELECT id, username FROM users").all()).results).map((u) => [u.username, u.id]));
+  assert.equal((await api(boss, { action: "role", id: ids.boss, role: "user" })).status, 409);
+  assert.equal((await api(boss, { action: "role", id: ids.someone, role: "admin" })).status, 200);
+  assert.equal((await env.AUTH_DB.prepare("SELECT role FROM users WHERE id = ?").bind(ids.someone).first()).role, "admin");
+
+  // apps: a confidential client gets its secret once, stored only as a hash
+  const created = await api(boss, { action: "client-create", name: "Blog", redirect_uris: ["https://blog.example.com/cb"], scopes: "openid email", confidential: true });
+  assert.equal(created.status, 200);
+  const c = await created.json();
+  assert.ok(c.client_id.startsWith("app_") && c.client_secret.startsWith("sec_"));
+  const row = await env.AUTH_DB.prepare("SELECT client_secret_hash, require_pkce FROM oauth_clients WHERE client_id = ?").bind(c.client_id).first();
+  assert.ok(row.client_secret_hash && row.client_secret_hash !== c.client_secret && row.require_pkce === 0);
+  assert.equal((await api(boss, { action: "client-create", name: "Bad", redirect_uris: ["http://evil.example.com/cb"] })).status, 400, "plain http only for localhost");
+  assert.equal((await api(boss, { action: "client-delete", id: "dashboard-fucloudflare" })).status, 403, "the dashboard's client stays");
+  assert.equal((await api(boss, { action: "client-delete", id: c.client_id })).status, 200);
+
+  // providers: saved, shown on the sign-in page, secret kept when editing, can be switched off
+  const prov = { action: "provider-save", id: "linuxdo", name: "Linux.do Connect", authorize_url: "https://connect.linux.do/oauth2/authorize",
+    token_url: "https://connect.linux.do/oauth2/token", userinfo_url: "https://connect.linux.do/api/user", client_id: "cid", client_secret: "csecret", scopes: "read" };
+  assert.equal((await api(boss, prov)).status, 200);
+  assert.ok((await (await worker.fetch(new Request(base + "/login"), env, {})).text()).includes("Continue with Linux.do Connect"));
+  assert.equal((await api(boss, Object.assign({}, prov, { editing: true, client_secret: "", name: "Linux.do" }))).status, 200);
+  assert.equal((await env.AUTH_DB.prepare("SELECT client_secret FROM oauth_providers WHERE id = 'linuxdo'").first()).client_secret, "csecret");
+  assert.equal((await api(boss, { action: "provider-toggle", id: "linuxdo", enabled: false })).status, 200);
+  assert.ok(!(await (await worker.fetch(new Request(base + "/login"), env, {})).text()).includes("Linux.do"));
+});

@@ -497,6 +497,10 @@ async function ensureSchema(env) {
       expires_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS oauth_providers (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -713,6 +717,24 @@ async function getUserProviders(env, userId) {
   return (res && res.results) || [];
 }
 
+// ---- Settings an admin changes on /admin ----
+
+const SETTING_DEFAULTS = { registration: "open" };
+
+async function getSetting(env, key) {
+  const row = await env.AUTH_DB.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
+  return row ? row.value : SETTING_DEFAULTS[key];
+}
+
+async function setSetting(env, key, value) {
+  await env.AUTH_DB.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+    .bind(key, String(value)).run();
+}
+
+async function registrationOpen(env) {
+  return (await getSetting(env, "registration")) !== "closed";
+}
+
 async function listConfiguredOAuthProviders(env) {
   const providers = [];
   if (env.LINUXDO_CLIENT_ID && env.LINUXDO_CLIENT_SECRET) {
@@ -897,6 +919,9 @@ const ERROR_TEXT = {
   forbidden: ["没有权限执行这个操作。", "You are not allowed to do this."],
   session_not_found: ["这个会话已不存在。", "This session no longer exists."],
   invalid_request: ["请求不完整或格式有误。", "The request is incomplete or malformed."],
+  registration_closed: ["注册已关闭，请联系管理员。", "Registration is closed. Ask an administrator."],
+  admin_only: ["只有管理员可以这样做。", "Only administrators can do this."],
+  last_admin: ["至少要保留一位管理员。", "At least one administrator must remain."],
 };
 
 function errorText(code) {
@@ -979,7 +1004,7 @@ const B64U_SCRIPT = `
     return new TextEncoder().encode(c).buffer;
   }`;
 
-function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
+function renderLoginPage({ providers, returnTo, pendingId, errorMsg, canRegister = true }) {
   const nextTarget = pendingId
     ? `/authorize?pending=${encodeURIComponent(pendingId)}`
     : safeReturnTo(returnTo, "/account");
@@ -1004,7 +1029,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
 
   <div class="divider">${t("或使用邮箱和密码", "or use email and password")}</div>
 
-  <div class="tabs" role="tablist">
+  <div class="tabs${canRegister ? "" : " hidden"}" role="tablist">
     <button type="button" class="tab on" id="tab-login" role="tab">${t("登录", "Sign in")}</button>
     <button type="button" class="tab" id="tab-register" role="tab">${t("注册", "Create account")}</button>
   </div>
@@ -1291,7 +1316,285 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
 })();
 </script>
 `;
-  return renderShell("账户 Account", body, { wide: true });
+  const navRight = user.role === "admin" ? `<a class="btn ghost sm" href="/admin">${t("管理", "Admin")}</a>` : "";
+  return renderShell("账户 Account", body, { wide: true, navRight });
+}
+
+// ---- Administration (/admin): everything about this sign-in service is set here ----
+
+const PROVIDER_PRESETS = {
+  linuxdo: { name: "Linux.do Connect", authorize_url: "https://connect.linux.do/oauth2/authorize", token_url: "https://connect.linux.do/oauth2/token", userinfo_url: "https://connect.linux.do/api/user", scopes: "read" },
+  github: { name: "GitHub", authorize_url: "https://github.com/login/oauth/authorize", token_url: "https://github.com/login/oauth/access_token", userinfo_url: "https://api.github.com/user", scopes: "read:user user:email" },
+  google: { name: "Google", authorize_url: "https://accounts.google.com/o/oauth2/v2/auth", token_url: "https://oauth2.googleapis.com/token", userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo", scopes: "openid email profile" },
+};
+const BUILTIN_CLIENT = "dashboard-fucloudflare";
+
+function fmtDate(sec) {
+  return sec ? new Date(sec * 1000).toISOString().slice(0, 10) : "";
+}
+
+function renderAdminPage({ me, users, clients, providers, envProviders, registration, csrfToken, origin }) {
+  const userRows = users.map((u) => `
+    <div class="row">
+      <div><b>${escapeHtml(u.name || u.username || u.email)} ${u.role === "admin" ? `<span class="tag pri">${t("管理员", "Admin")}</span>` : ""} ${u.id === me.id ? `<span class="tag">${t("你", "You")}</span>` : ""}</b>
+        <small>${escapeHtml(u.username || "")} · ${escapeHtml(u.email || "")} · ${t("注册于", "joined")} ${fmtDate(u.created_at)}</small></div>
+      ${u.role === "admin"
+        ? `<button type="button" class="sm" data-act="role" data-id="${escapeHtml(u.id)}" data-role="user">${t("设为普通用户", "Make regular user")}</button>`
+        : `<button type="button" class="sm" data-act="role" data-id="${escapeHtml(u.id)}" data-role="admin">${t("设为管理员", "Make admin")}</button>`}
+    </div>`).join("") || `<p class="empty">${t("还没有用户。", "No users yet.")}</p>`;
+
+  const clientRows = clients.map((c) => {
+    let uris = [];
+    try { uris = JSON.parse(c.redirect_uris || "[]"); } catch (e) {}
+    const builtin = c.client_id === BUILTIN_CLIENT;
+    return `
+    <div class="row">
+      <div><b>${escapeHtml(c.name)} ${builtin ? `<span class="tag">${t("内置", "Built-in")}</span>` : ""} <span class="tag">${c.client_secret_hash ? t("机密客户端", "Confidential") : t("公开客户端 + PKCE", "Public + PKCE")}</span>${c.trusted ? ` <span class="tag ok">${t("免确认", "No consent screen")}</span>` : ""}</b>
+        <small><span class="mono">${escapeHtml(c.client_id)}</span> · ${escapeHtml(c.scopes)}</small>
+        <small class="mono">${uris.map(escapeHtml).join("<br>")}</small></div>
+      ${builtin ? "" : `<button type="button" class="outbad sm" data-act="client-delete" data-id="${escapeHtml(c.client_id)}">${t("删除", "Delete")}</button>`}
+    </div>`;
+  }).join("") || `<p class="empty">${t("还没有应用。", "No apps yet.")}</p>`;
+
+  const envRows = envProviders.map((p) => `
+    <div class="row"><div><b>${escapeHtml(p.name)} <span class="tag">${t("来自环境变量", "From environment")}</span></b><small class="mono">${escapeHtml(p.client_id)}</small></div></div>`).join("");
+  const providerRows = providers.map((p) => `
+    <div class="row">
+      <div><b>${escapeHtml(p.name)} ${p.enabled ? `<span class="tag ok">${t("已启用", "Enabled")}</span>` : `<span class="tag">${t("已停用", "Disabled")}</span>`}</b>
+        <small><span class="mono">${escapeHtml(p.id)}</span> · ${t("回调地址", "Callback")} <span class="mono">${escapeHtml(origin)}/login/oauth/${escapeHtml(p.id)}/callback</span></small></div>
+      <div style="display:flex;gap:6px">
+        <button type="button" class="sm" data-act="provider-edit" data-id="${escapeHtml(p.id)}">${t("编辑", "Edit")}</button>
+        <button type="button" class="sm" data-act="provider-toggle" data-id="${escapeHtml(p.id)}" data-on="${p.enabled ? 0 : 1}">${p.enabled ? t("停用", "Disable") : t("启用", "Enable")}</button>
+        <button type="button" class="outbad sm" data-act="provider-delete" data-id="${escapeHtml(p.id)}">${t("删除", "Delete")}</button>
+      </div>
+    </div>`).join("");
+  const providerData = Object.fromEntries(providers.map((p) => [p.id, { id: p.id, name: p.name, authorize_url: p.authorize_url, token_url: p.token_url, userinfo_url: p.userinfo_url, client_id: p.client_id, scopes: p.scopes }]));
+  const open = registration !== "closed";
+
+  const body = `
+<h1>${t("管理", "Administration")}</h1>
+<p class="sub">${t("这个登录服务的所有设置都在这里。", "Everything about this sign-in service is set here.")} <a href="/account">${t("返回我的账户", "Back to my account")}</a></p>
+<div id="msg" class="alert hidden" role="status"></div>
+
+<div class="card">
+  <div class="hd"><div><h2>${t("注册", "Registration")}</h2><small style="color:var(--sub)">${t("关闭后，新用户无法注册，也无法通过第三方登录自动创建账户；已有用户不受影响。", "When closed, nobody new can sign up or be created through a sign-in provider; existing users are not affected.")}</small></div>
+    <div class="tabs" style="margin:0;flex:none;width:200px">
+      <button type="button" class="tab${open ? " on" : ""}" data-act="registration" data-value="open">${t("开放", "Open")}</button>
+      <button type="button" class="tab${open ? "" : " on"}" data-act="registration" data-value="closed">${t("关闭", "Closed")}</button>
+    </div></div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2>${t("用户", "Users")} <span class="tag">${users.length}</span></h2></div>
+  <div class="bd">${userRows}</div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2>${t("应用（OAuth 客户端）", "Apps (OAuth clients)")}</h2><button type="button" class="pri sm" data-act="client-new">${t("添加应用", "Add an app")}</button></div>
+  <div class="bd">
+    <form id="client-form" class="hidden" style="padding:8px 0 16px">
+      <label for="c-name">${t("名称", "Name")}</label><input id="c-name" required maxlength="80">
+      <label for="c-uris">${t("回调地址（每行一个）", "Redirect URIs (one per line)")}</label>
+      <textarea id="c-uris" rows="3" required style="width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:.6rem;background:var(--control);color:var(--fg);font:13px/1.5 var(--mono)" placeholder="https://app.example.com/oauth/callback"></textarea>
+      <label for="c-scopes">${t("权限范围", "Scopes")}</label><input id="c-scopes" value="openid profile email">
+      <label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" id="c-secret" style="width:auto;height:auto" checked> ${t("机密客户端（服务器端应用，生成密钥）", "Confidential (server-side app: issue a secret)")}</label>
+      <label style="display:flex;gap:8px;align-items:center;font-weight:400;margin-top:4px"><input type="checkbox" id="c-trusted" style="width:auto;height:auto"> ${t("自家应用，跳过授权确认页", "Our own app: skip the consent screen")}</label>
+      <div style="display:flex;gap:8px;margin-top:14px"><button type="submit" class="pri">${t("创建", "Create")}</button><button type="button" data-act="client-cancel">${t("取消", "Cancel")}</button></div>
+    </form>
+    ${clientRows}
+  </div>
+</div>
+
+<div class="card">
+  <div class="hd"><h2>${t("第三方登录", "Sign-in providers")}</h2>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">${Object.keys(PROVIDER_PRESETS).map((k) => `<button type="button" class="sm" data-act="provider-new" data-preset="${k}">+ ${escapeHtml(PROVIDER_PRESETS[k].name)}</button>`).join("")}<button type="button" class="sm" data-act="provider-new" data-preset="">+ ${t("自定义", "Custom")}</button></div></div>
+  <div class="bd">
+    <form id="provider-form" class="hidden" style="padding:8px 0 16px">
+      <label for="p-id">${t("标识（用于回调地址）", "Id (part of the callback URL)")}</label><input id="p-id" required pattern="[a-z0-9_-]{1,32}" maxlength="32">
+      <label for="p-name">${t("显示名称", "Display name")}</label><input id="p-name" required maxlength="60">
+      <label for="p-auth">Authorize URL</label><input id="p-auth" required type="url">
+      <label for="p-token">Token URL</label><input id="p-token" required type="url">
+      <label for="p-user">Userinfo URL</label><input id="p-user" required type="url">
+      <label for="p-cid">Client ID</label><input id="p-cid" required>
+      <label for="p-secret">Client Secret <small style="font-weight:400;color:var(--sub)">${t("（编辑时留空表示不修改）", "(leave empty to keep it when editing)")}</small></label><input id="p-secret" type="password" autocomplete="off">
+      <label for="p-scopes">${t("权限范围", "Scopes")}</label><input id="p-scopes">
+      <p class="sub" style="margin:10px 0 0">${t("在对方平台登记的回调地址：", "Callback URL to register with the provider:")} <span class="mono" id="p-cb"></span></p>
+      <div style="display:flex;gap:8px;margin-top:14px"><button type="submit" class="pri">${t("保存", "Save")}</button><button type="button" data-act="provider-cancel">${t("取消", "Cancel")}</button></div>
+    </form>
+    ${envRows}${providerRows || (envRows ? "" : `<p class="empty">${t("还没有第三方登录。", "No sign-in providers yet.")}</p>`)}
+  </div>
+</div>
+
+<script>
+(function() {
+  var csrfToken = ${JSON.stringify(csrfToken)}, origin = ${JSON.stringify(origin)};
+  var PRESETS = ${JSON.stringify(PROVIDER_PRESETS)}, EXISTING = ${JSON.stringify(providerData)};
+  ${ERROR_SCRIPT}
+  var msg = document.getElementById("msg");
+  function say(text, ok) { msg.textContent = text; msg.className = "alert" + (ok ? " ok" : ""); window.scrollTo(0, 0); }
+  async function call(data) {
+    var r = await fetch("/admin/api", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify(data) });
+    var d = {}; try { d = await r.json(); } catch (e) {}
+    if (!r.ok) { say(E(d.error, "操作失败", "That did not work")); return null; }
+    return d;
+  }
+  var $ = function(id) { return document.getElementById(id); };
+  var pf = $("provider-form"), cf = $("client-form");
+  function fillProvider(v, editing) {
+    $("p-id").value = v.id || ""; $("p-id").readOnly = !!editing;
+    $("p-name").value = v.name || ""; $("p-auth").value = v.authorize_url || ""; $("p-token").value = v.token_url || "";
+    $("p-user").value = v.userinfo_url || ""; $("p-cid").value = v.client_id || ""; $("p-secret").value = "";
+    $("p-secret").required = !editing; $("p-scopes").value = v.scopes || "";
+    $("p-cb").textContent = origin + "/login/oauth/" + ($("p-id").value || "<id>") + "/callback";
+    pf.dataset.editing = editing ? "1" : ""; pf.classList.remove("hidden"); $("p-id").focus();
+  }
+  $("p-id").oninput = function() { $("p-cb").textContent = origin + "/login/oauth/" + (this.value || "<id>") + "/callback"; };
+  pf.onsubmit = async function(e) {
+    e.preventDefault();
+    var d = await call({ action: "provider-save", editing: !!pf.dataset.editing, id: $("p-id").value.trim(), name: $("p-name").value.trim(),
+      authorize_url: $("p-auth").value.trim(), token_url: $("p-token").value.trim(), userinfo_url: $("p-user").value.trim(),
+      client_id: $("p-cid").value.trim(), client_secret: $("p-secret").value, scopes: $("p-scopes").value.trim() });
+    if (d) location.reload();
+  };
+  cf.onsubmit = async function(e) {
+    e.preventDefault();
+    var d = await call({ action: "client-create", name: $("c-name").value.trim(), redirect_uris: $("c-uris").value.split(/\\s+/).filter(Boolean),
+      scopes: $("c-scopes").value.trim(), confidential: $("c-secret").checked, trusted: $("c-trusted").checked });
+    if (!d) return;
+    cf.classList.add("hidden");
+    say(L("已创建。Client ID：", "Created. Client ID: ") + d.client_id + (d.client_secret ? L("　Client Secret（只显示这一次，请立即保存）：", "  Client secret (shown only now, keep it): ") + d.client_secret : ""), true);
+  };
+  document.addEventListener("click", async function(e) {
+    var b = e.target.closest && e.target.closest("[data-act]");
+    if (!b) return;
+    var act = b.getAttribute("data-act"), id = b.getAttribute("data-id");
+    if (act === "registration") { if (await call({ action: "registration", value: b.getAttribute("data-value") })) location.reload(); }
+    else if (act === "role") {
+      var admin = b.getAttribute("data-role") === "admin";
+      if (confirm(admin ? L("把这个用户设为管理员？", "Make this user an administrator?") : L("取消这个用户的管理员身份？", "Remove this user's administrator role?")))
+        if (await call({ action: "role", id: id, role: b.getAttribute("data-role") })) location.reload();
+    }
+    else if (act === "client-new") { cf.classList.remove("hidden"); $("c-name").focus(); }
+    else if (act === "client-cancel") cf.classList.add("hidden");
+    else if (act === "client-delete") { if (confirm(L("删除这个应用？使用它的登录会立即失效。", "Delete this app? Sign-ins through it stop working at once."))) if (await call({ action: "client-delete", id: id })) location.reload(); }
+    else if (act === "provider-new") { var pre = PRESETS[b.getAttribute("data-preset")] || {}; fillProvider(Object.assign({ id: b.getAttribute("data-preset") || "" }, pre), false); }
+    else if (act === "provider-edit") fillProvider(EXISTING[id] || {}, true);
+    else if (act === "provider-cancel") pf.classList.add("hidden");
+    else if (act === "provider-toggle") { if (await call({ action: "provider-toggle", id: id, enabled: b.getAttribute("data-on") === "1" })) location.reload(); }
+    else if (act === "provider-delete") { if (confirm(L("删除这个第三方登录？已绑定的账户会失去这种登录方式。", "Delete this provider? Linked accounts lose this way of signing in."))) if (await call({ action: "provider-delete", id: id })) location.reload(); }
+  });
+})();
+</script>
+`;
+  return renderShell("管理 Admin", body, { wide: true });
+}
+
+async function requireAdmin(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return { error: jsonResponse({ error: "login_required" }, 401) };
+  if (session.user.role !== "admin") return { error: jsonResponse({ error: "admin_only" }, 403) };
+  return { session };
+}
+
+async function handleAdminPage(request, env, url) {
+  const session = await getSession(request, env);
+  if (!session) return Response.redirect(url.origin + "/login?return_to=%2Fadmin", 302);
+  if (session.user.role !== "admin") return htmlResponse(renderShell("Admin", `<div class="login"><h1>${t("需要管理员权限", "Administrators only")}</h1><p class="sub">${t("你的账户不是管理员。", "Your account is not an administrator.")}</p><a class="btn" href="/account">${t("返回我的账户", "Back to my account")}</a></div>`), 403);
+  const users = ((await env.AUTH_DB.prepare("SELECT id, email, username, name, role, created_at FROM users ORDER BY created_at").all()).results) || [];
+  const clients = ((await env.AUTH_DB.prepare("SELECT client_id, client_secret_hash, name, redirect_uris, scopes, trusted, created_at FROM oauth_clients ORDER BY created_at").all()).results) || [];
+  const providers = ((await env.AUTH_DB.prepare("SELECT id, name, authorize_url, token_url, userinfo_url, client_id, scopes, enabled FROM oauth_providers ORDER BY created_at").all()).results) || [];
+  const dbIds = new Set(providers.map((p) => p.id));
+  const envProviders = (await listConfiguredOAuthProviders(env)).filter((p) => !dbIds.has(p.id));
+  return htmlResponse(renderAdminPage({
+    me: session.user, users, clients, providers, envProviders,
+    registration: await getSetting(env, "registration"),
+    csrfToken: session.sess.csrf_token || "", origin: url.origin,
+  }));
+}
+
+function validUrl(v, allowLocalHttp) {
+  try {
+    const u = new URL(String(v));
+    if (u.protocol === "https:") return true;
+    return allowLocalHttp && u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  } catch (e) { return false; }
+}
+
+async function handleAdminApi(request, env, url) {
+  if (!verifySameOrigin(request, url)) return jsonResponse({ error: "csrf_origin_mismatch" }, 403);
+  const gate = await requireAdmin(request, env);
+  if (gate.error) return gate.error;
+  const { session } = gate;
+  const body = await parseRequestParams(request);
+  const supplied = request.headers.get("x-csrf-token") || body.csrf_token;
+  if (!supplied || !session.sess.csrf_token || !timingSafeEqual(String(supplied), session.sess.csrf_token)) {
+    return jsonResponse({ error: "invalid_csrf_token" }, 403);
+  }
+  const db = env.AUTH_DB;
+  const now = Math.floor(Date.now() / 1000);
+  const id = String(body.id || "");
+  switch (body.action) {
+    case "registration": {
+      if (body.value !== "open" && body.value !== "closed") return jsonResponse({ error: "invalid_request" }, 400);
+      await setSetting(env, "registration", body.value);
+      return jsonResponse({ ok: true });
+    }
+    case "role": {
+      if (body.role !== "admin" && body.role !== "user") return jsonResponse({ error: "invalid_request" }, 400);
+      if (body.role === "user") {
+        const admins = await db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND id != ?").bind(id).first();
+        if (!admins || Number(admins.n) < 1) return jsonResponse({ error: "last_admin" }, 409);
+      }
+      await db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").bind(body.role, now, id).run();
+      return jsonResponse({ ok: true });
+    }
+    case "client-create": {
+      const name = String(body.name || "").trim().slice(0, 80);
+      const uris = Array.isArray(body.redirect_uris) ? body.redirect_uris.map(String) : [];
+      if (!name || !uris.length || uris.length > 10 || !uris.every((u) => validUrl(u, true))) return jsonResponse({ error: "invalid_request" }, 400);
+      const scopes = String(body.scopes || "openid profile email").split(/\s+/).filter((x) => /^[a-z_:.]{1,40}$/.test(x)).join(" ") || "openid";
+      const clientId = "app_" + randomToken(12);
+      const secret = body.confidential ? "sec_" + randomToken(32) : null;
+      await db.prepare("INSERT INTO oauth_clients (client_id, client_secret_hash, name, redirect_uris, scopes, require_pkce, trusted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(clientId, secret ? await sha256Hex(secret) : null, name, JSON.stringify(uris), scopes, secret ? 0 : 1, body.trusted ? 1 : 0, now).run();
+      return jsonResponse({ ok: true, client_id: clientId, client_secret: secret });
+    }
+    case "client-delete": {
+      if (id === BUILTIN_CLIENT) return jsonResponse({ error: "forbidden" }, 403);
+      await db.prepare("DELETE FROM oauth_clients WHERE client_id = ?").bind(id).run();
+      await db.prepare("DELETE FROM consents WHERE client_id = ?").bind(id).run().catch(() => {});
+      return jsonResponse({ ok: true });
+    }
+    case "provider-save": {
+      const p = {
+        id: String(body.id || "").trim().toLowerCase(), name: String(body.name || "").trim().slice(0, 60),
+        authorize_url: String(body.authorize_url || ""), token_url: String(body.token_url || ""), userinfo_url: String(body.userinfo_url || ""),
+        client_id: String(body.client_id || "").trim(), client_secret: String(body.client_secret || ""), scopes: String(body.scopes || "").trim().slice(0, 200),
+      };
+      if (!/^[a-z0-9_-]{1,32}$/.test(p.id) || !p.name || !p.client_id || ![p.authorize_url, p.token_url, p.userinfo_url].every((u) => validUrl(u, false))) {
+        return jsonResponse({ error: "invalid_request" }, 400);
+      }
+      const existing = await db.prepare("SELECT client_secret FROM oauth_providers WHERE id = ?").bind(p.id).first();
+      if (existing && !body.editing) return jsonResponse({ error: "invalid_request", error_description: "id in use" }, 409);
+      const secret = p.client_secret || (existing && existing.client_secret);
+      if (!secret) return jsonResponse({ error: "invalid_request" }, 400);
+      await db.prepare(`INSERT INTO oauth_providers (id, name, authorize_url, token_url, userinfo_url, client_id, client_secret, scopes, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, authorize_url = excluded.authorize_url,
+        token_url = excluded.token_url, userinfo_url = excluded.userinfo_url, client_id = excluded.client_id, client_secret = excluded.client_secret, scopes = excluded.scopes`)
+        .bind(p.id, p.name, p.authorize_url, p.token_url, p.userinfo_url, p.client_id, secret, p.scopes || "read", now).run();
+      return jsonResponse({ ok: true });
+    }
+    case "provider-toggle": {
+      await db.prepare("UPDATE oauth_providers SET enabled = ? WHERE id = ?").bind(body.enabled ? 1 : 0, id).run();
+      return jsonResponse({ ok: true });
+    }
+    case "provider-delete": {
+      await db.prepare("DELETE FROM oauth_providers WHERE id = ?").bind(id).run();
+      return jsonResponse({ ok: true });
+    }
+    default:
+      return jsonResponse({ error: "invalid_request" }, 400);
+  }
 }
 
 // ---- OAuth2 / OIDC Core Logic ----
@@ -1388,7 +1691,7 @@ async function handleAuthorize(request, env, url) {
       return Response.redirect(errUrl.toString(), 302);
     }
     const providers = await listConfiguredOAuthProviders(env);
-    return htmlResponse(renderLoginPage({ providers, pendingId }));
+    return htmlResponse(renderLoginPage({ providers, pendingId, canRegister: await registrationOpen(env) }));
   }
 
   const client = await env.AUTH_DB.prepare("SELECT * FROM oauth_clients WHERE client_id = ?").bind(params.client_id).first();
@@ -1965,6 +2268,11 @@ async function handleExternalOAuthCallback(request, env, url, providerId) {
     const byEmail = await env.AUTH_DB.prepare("SELECT id FROM users WHERE lower(email) = lower(?)").bind(profile.email).first();
     if (byEmail) userId = byEmail.id;
   }
+  if (!userId && !(await registrationOpen(env))) {
+    const back = new URL("/login", url.origin);
+    back.searchParams.set("error", "registration_closed");
+    return Response.redirect(back.toString(), 302);
+  }
   if (!userId) {
     userId = crypto.randomUUID();
     const verifiedEmail = (profile.emailVerified && profile.email && !profile.email.endsWith(`@${providerId}.local`))
@@ -2025,6 +2333,7 @@ async function handlePasswordLogin(request, env, url) {
 }
 
 async function handleRegister(request, env, url) {
+  if (!(await registrationOpen(env))) return jsonResponse({ error: "registration_closed" }, 403);
   const body = await parseRequestParams(request);
   const email = String(body.email || "").trim().toLowerCase();
   const username = String(body.username || "").trim();
@@ -2175,6 +2484,8 @@ export default {
         providers,
         returnTo: url.searchParams.get("return_to") || "/account",
         pendingId: url.searchParams.get("pending") || "",
+        errorMsg: (url.searchParams.get("error") || "").slice(0, 64),
+        canRegister: await registrationOpen(env),
       }));
     }
     if (path === "/login/password" && method === "POST") return handlePasswordLogin(request, env, url);
@@ -2197,6 +2508,8 @@ export default {
     }
 
     if ((path === "/" || path === "/account") && method === "GET") return handleAccountPage(request, env);
+    if (path === "/admin" && method === "GET") return handleAdminPage(request, env, url);
+    if (path === "/admin/api" && method === "POST") return handleAdminApi(request, env, url);
 
     if (path === "/account/passkey/delete" && method === "POST") {
       const session = await getSession(request, env);

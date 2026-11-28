@@ -1121,50 +1121,6 @@ async function viewProxy() {
 }
 
 // ------------------------------------------------- OAuth / SSO (auth.*) ----
-async function viewOauth() {
-  let clients = [], providers = [], cfg = {}, apiMissing = false;
-  try {
-    const [cRes, pRes, cfgRes] = await Promise.all([
-      api("GET", "/oauth/clients").catch(e => { if (/404|No route/i.test(e.message)) { apiMissing = true; return []; } throw e; }),
-      api("GET", "/oauth/providers").catch(() => []),
-      api("GET", "/oauth/config").catch(() => ({})),
-    ]);
-    clients = Array.isArray(cRes) ? cRes : [];
-    providers = Array.isArray(pRes) ? pRes : [];
-    cfg = cfgRes || {};
-  } catch (e) { throw e; }
-  C.oauthClients = clients;
-  C.oauthProviders = providers;
-  C.oauthConfig = cfg;
-  const infoCard = card("面板 SSO 配置 (/client/v4/oauth/config)", btn("oauthConfigEdit", "编辑面板 SSO", {}, "sm"), `<div class="cb"><dl class="kv">
-    <dt>SSO 状态</dt><dd>${cfg.enabled ? '<span class="st ok">已启用</span>' : '<span class="st">未启用</span>'}</dd>
-    <dt>Issuer URL</dt><dd><code class="mono">${esc(cfg.issuer_url || "未配置")}</code></dd>
-    <dt>Client ID</dt><dd><code class="mono">${esc(cfg.client_id || "未配置")}</code></dd>
-    <dt>自动创建账户</dt><dd>${cfg.auto_provision ? `是（默认角色：${esc(cfg.default_role || "viewer")}）` : "否（仅限已有账户）"}</dd>
-    <dt>面板 SSO 登录</dt><dd><code class="mono">/client/v4/auth/oauth/login</code>（PKCE S256 + 跨节点无状态 Cookie）</dd>
-  </dl></div>`);
-  const warn = apiMissing ? '<div class="note warn">当前后端节点尚未启用 <code>/client/v4/oauth/*</code> 管理接口（M4）。请确认已部署 <code>auth.fucloudflare.com</code> Worker 路由。</div>' : "";
-  return {
-    title: "OAuth 2.0 / SSO",
-    sub: "管理 auth.fucloudflare.com 的 OAuth 2.0 客户端应用与第三方身份源（Passkey、Linux.do Connect 等）。",
-    acts: btn("oauthClientEdit", "添加 OAuth 客户端", {}, "pri"),
-    body: warn + infoCard +
-      card(`OAuth 客户端 <span class="cnt">${clients.length}</span>`, "", table([
-        { label: "名称", fmt: c => `<b>${esc(c.name || c.client_id)}</b>` },
-        { label: "Client ID", fmt: c => `<code class="mono">${esc(c.client_id || c.id)}</code>` },
-        { label: "回调地址 (Redirect URIs)", fmt: c => chips(c.redirect_uris || []) },
-        { label: "Scopes", fmt: c => chips(c.scopes || ["openid", "profile", "email"], "blue") },
-      ], clients, c => rowActs("oauthClientEdit", "oauthClientDel", { id: c.id || c.client_id }), "<b>还没有 OAuth 客户端</b>点击右上角添加一个应用客户端。")) +
-      card(`外部身份源 (Providers) <span class="cnt">${providers.length}</span>`, btn("oauthProvEdit", "添加身份源", {}, "sm"), table([
-        { label: "标识", fmt: p => `<b class="mono">${esc(p.id || p.name)}</b>` },
-        { label: "显示名称", k: "display_name" },
-        { label: "Authorize URL", fmt: p => `<code class="expr">${esc(p.authorize_url)}</code>` },
-        { label: "状态", fmt: p => (p.enabled !== false ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
-      ], providers, p => rowActs("oauthProvEdit", "oauthProvDel", { id: p.id }), "<b>还没有配置第三方 OAuth 提供商</b>支持 Linux.do Connect、GitHub 及自定义 OIDC。")),
-  };
-}
-
-// -------------------------------------------------------------- sign in ----
 async function open(path, body) {
   const r = await fetch("/client/v4" + path, { method: body === undefined ? "GET" : "POST", headers: { "Content-Type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   const d = await r.json();
@@ -1403,11 +1359,10 @@ const NAV = [
   ["steering", "调度与 DNS 屏蔽", "route"],
   ["workers", "Workers & 存储", "code"],
   ["proxy", "反向代理 (Caddy)", "proxy"],
-  ["oauth", "OAuth / SSO", "key"],
   ["account", "账户与安全", "lock"],
   ["users", "用户与审计", "shield", "admin"],
 ];
-const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, oauth: viewOauth, fleet: viewFleet, account: viewAccount, users: viewUsers };
+const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, fleet: viewFleet, account: viewAccount, users: viewUsers };
 function parseHash() {
   const p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (p[0] === "zone" && p[1]) return { view: "zone", zone: p[1], tab: p[2] || "overview" };
@@ -1608,43 +1563,6 @@ const A = {
     });
   },
   proxyDel: d => del("/proxy/rules/" + d.id, "这条代理规则"),
-  oauthConfigEdit: () => {
-    const c = C.oauthConfig || {};
-    openForm("编辑面板 SSO 配置", [
-      { k: "enabled", label: "启用面板 OAuth SSO", type: "check" },
-      { k: "issuer_url", label: "OAuth Issuer URL", hint: "例如 https://auth.example.com" },
-      { k: "client_id", label: "Client ID" },
-      { k: "client_secret", label: "Client Secret（留空或 *** 保持不变）", type: "password", opt: 1 },
-      { k: "scopes", label: "Scopes", def: "openid profile email" },
-      { k: "auto_provision", label: "首次登录自动创建面板账户", type: "check" },
-      { k: "default_role", label: "自动创建账户默认角色", type: "select", def: "viewer", options: [["viewer", "Viewer (只读)"], ["editor", "Editor (编辑)"], ["admin", "Admin (管理员)"]] },
-      { k: "redirect_base_url", label: "回调基础 URL（留空自动识别）", opt: 1 },
-    ], c, v => api("PUT", "/oauth/config", v));
-  },
-  oauthClientEdit: d => {
-    const c = (C.oauthClients || []).find(x => (x.id || x.client_id) === d.id) || {};
-    openForm(d.id ? "编辑 OAuth 客户端" : "添加 OAuth 客户端", [
-      { k: "name", label: "应用名称" },
-      { k: "client_id", label: "Client ID", readonly: !!d.id },
-      { k: "redirect_uris", label: "Redirect URIs（逗号分隔）", type: "list" },
-      { k: "scopes", label: "允许的 Scopes", type: "list", def: ["openid", "profile", "email"] },
-    ], c, v => api(d.id ? "PUT" : "POST", "/oauth/clients" + (d.id ? "/" + d.id : ""), v));
-  },
-  oauthClientDel: d => del("/oauth/clients/" + d.id, "OAuth 客户端"),
-  oauthProvEdit: d => {
-    const p = (C.oauthProviders || []).find(x => x.id === d.id) || {};
-    openForm(d.id ? "编辑身份源" : "添加身份源", [
-      { k: "id", label: "Provider ID", readonly: !!d.id, hint: "例如 linuxdo, github" },
-      { k: "display_name", label: "显示名称" },
-      { k: "client_id", label: "Client ID" },
-      { k: "client_secret", label: "Client Secret（不会回显）", type: "password" },
-      { k: "authorize_url", label: "Authorize URL" },
-      { k: "token_url", label: "Token URL" },
-      { k: "userinfo_url", label: "Userinfo URL" },
-      { k: "enabled", label: "启用", type: "check", def: true },
-    ], p, v => api(d.id ? "PUT" : "POST", "/oauth/providers" + (d.id ? "/" + d.id : ""), v));
-  },
-  oauthProvDel: d => del("/oauth/providers/" + d.id, "身份源"),
   zoneAdd: () => openForm("添加域名", [
     { k: "name", label: "域名", hint: "如 example.com" },
     { k: "type", label: "接入方式", type: "select", options: [["full", "完全托管：把域名的 NS 指向本平台，全部 DNS 记录在这里管理"], ["partial", "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来"], ["cert", "仅证书：只为这个域名签发和续期证书（如泛域名），给反向代理等使用；不解析、不代理"]] },
