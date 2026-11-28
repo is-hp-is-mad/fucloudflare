@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn signals_follow_the_transport_of_the_request() {
         let info = ReqInfo::default();
-        let tls = super::super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new() };
+        let tls = super::super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new(), client_cert_verified: false };
         let mut req = Request::builder().version(Version::HTTP_2).body(()).unwrap();
         assert!(!Signals::of(&req, &info, false).fingerprint_expected, "no TLS, no fingerprint");
         req.extensions_mut().insert(tls.clone());

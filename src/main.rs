@@ -22,6 +22,7 @@ mod lists;
 mod log;
 mod mail;
 mod node;
+mod origin_ca;
 mod release;
 mod reports;
 mod rtt;
@@ -221,6 +222,13 @@ struct Args {
     /// The private key (PEM) of --origin-client-cert.
     #[arg(long, env = "FUCF_ORIGIN_CLIENT_KEY", requires = "origin_client_cert")]
     origin_client_key: Option<PathBuf>,
+
+    /// Visitors' client certificates (mTLS): the CA certificates (PEM) they
+    /// are checked against. The HTTPS and HTTP/3 listeners then ask every
+    /// visitor for one; zones with the setting `mtls: on` refuse the
+    /// visitors without a valid one. Unset: no certificate is asked for.
+    #[arg(long, env = "FUCF_MTLS_CA")]
+    mtls_ca: Option<PathBuf>,
 
     /// SMTP listener for inbound e-mail routing (e.g. `0.0.0.0:25`). Off unless set.
     #[arg(long, env = "FUCF_SMTP_LISTEN")]
@@ -549,6 +557,10 @@ async fn main() -> anyhow::Result<()> {
     if let (Some(cert), Some(key)) = (&args.origin_client_cert, &args.origin_client_key) {
         let read = |p: &PathBuf| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
         edge::tls::present_to_origins(&read(cert)?, &read(key)?).map_err(|e| anyhow::anyhow!("--origin-client-cert: {e}"))?;
+    }
+    if let Some(ca) = &args.mtls_ca {
+        let pem = std::fs::read_to_string(ca).with_context(|| format!("reading {}", ca.display()))?;
+        edge::tls::verify_visitors(&pem).map_err(|e| anyhow::anyhow!("--mtls-ca: {e}"))?;
     }
     let telemetry = if accel {
         waf.set_outbox_only();

@@ -141,6 +141,8 @@ impl Edge {
             ("limit", limit.as_str().to_string()),
             ("threat", assessment.score.to_string()),
             ("bot", bot.to_string()),
+            // a client certificate `--mtls-ca` verified (crate::edge::mtls)
+            ("client_cert", if tls.is_some_and(|t| t.client_cert_verified) { "verified" } else { "none" }.to_string()),
             ("region", location.region.unwrap_or_default()),
         ];
         let body: String = lines.iter().map(|(key, value)| format!("{key}={value}\n")).collect();

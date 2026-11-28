@@ -35,6 +35,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--dns-rrl` | `100` | 权威 DNS 的 UDP 响应限速（每个网络每个名字每秒的应答数），`0` 关闭，见"DNS 响应限速与内核层封禁" |
 | `--ban-export` | 无 | 把自动防火墙封禁的地址写成 nftables 脚本的文件路径，见"DNS 响应限速与内核层封禁" |
 | `--origin-client-cert` / `--origin-client-key` | 无 | 回源时出示的客户端证书和私钥（PEM），两个要一起给，见"回源时出示客户端证书" |
+| `--mtls-ca` | 无 | 签发访客客户端证书的 CA（PEM，可多张）。配置后 HTTPS 和 HTTP/3 监听向访客要客户端证书（不强制），见"访客客户端证书（mTLS）" |
 | `--release-key` | 无 | 发布公钥（见"滚动更新与自动回滚"）。配置后本节点接受机群滚动发布的新版本，新版本不能用时自动退回；不配置则只能手动替换二进制 |
 | `--proxy-protocol` | 关 | 边缘 TCP 连接必须以 PROXY protocol v1 头开始（仅用于只经可信四层代理可达的监听） |
 | `--api-listen` | `127.0.0.1:8787` | 管理 API 与面板 |
@@ -81,6 +82,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/settings[/{name}]            GET PATCH        {"value": ...}
 /zones/{id}/purge_cache                  POST             {"purge_everything":true} | {"files":[...]} | {"prefixes":[...]} | {"hosts":[...]} | {"tags":[...]}
 /zones/{id}/custom_certificates[/{id}]   CRUD             {"certificate": PEM, "private_key": PEM, "hosts": [...]}；返回值带 expires_on
+/zones/{id}/origin_ca                    GET POST DELETE  区域自己的源站 CA：创建（已有则 409）、查看 CA 证书（从不返回 CA 私钥）、删除，见"源站 CA"
+/zones/{id}/origin_ca/sign               POST             {"hostnames": [...], "days": 365}：为源站签发证书，返回证书和只显示这一次的私钥
 /zones/{id}/ssl/certificate_packs[/{id}] GET POST PATCH DELETE   {"hosts": [...], "validation_method": "auto|dns|tls-alpn|http"}；PATCH 立即重试
 /zones/{id}/firewall/rules[/{id}]        CRUD             {"expression", "action", "priority", "enabled", "description"}
 /zones/{id}/rate_limits[/{id}]           CRUD             {"expression", "threshold", "period", "mitigation_timeout", "action", "characteristics", "status_codes"}，见"限速的计数方式"
@@ -135,6 +138,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | 名称 | 取值 | 说明 |
 |------|------|------|
 | `ssl` | `flexible`(默认) / `full` / `strict` | 回源用 HTTP / HTTPS 不验证书 / HTTPS 验证书 |
+| `mtls` | `off`(默认) / `on` | 只接受出示了有效客户端证书的访客，其余一律 403，见"访客客户端证书（mTLS）" |
 | `always_use_https` | bool | HTTP 301 到 HTTPS |
 | `waf` | `block`(默认) / `log` / `off` | 托管规则集模式 |
 | `development_mode` | bool | 绕过缓存 |
@@ -170,6 +174,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   `http.request.headers["name"]` `ip.src` `ssl`
   `ip.geoip.country` `ip.geoip.continent` `ip.geoip.asnum` `ip.geoip.as_org`（需要 GeoIP 库）
   `cf.threat_score`（或 `fcf.threat_score`，见"安全级别、IP 纯净度与页面内人机验证"）`fcf.ja4`（或 `cf.bot_management.ja4`，见"TLS 指纹（JA4）"）
+  `cf.tls_client_auth.cert_verified`（或 `fcf.client_cert_verified`，访客出示了经节点验证的客户端证书，见"访客客户端证书（mTLS）"）
 - 运算符：`eq ne contains matches in lt le gt ge`（及 `== != ~ < <= > >=`），`and or not`（及 `&& || !`）
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
 - IP 列表：`ip.src in $office`（见下面的"IP 列表"）。
@@ -234,6 +239,28 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 `--origin-client-cert` / `--origin-client-key`（`FUCF_ORIGIN_CLIENT_CERT` / `FUCF_ORIGIN_CLIENT_KEY`，PEM）：回源的 TLS 握手里出示这张证书。
 源站要求并校验客户端证书后，就只接受本机群的回源请求，别人即使知道源站地址也连不上。各节点用同一张证书。
+
+### 访客客户端证书（mTLS）
+
+节点用 `--mtls-ca <文件>`（`FUCF_MTLS_CA`，一张或多张 PEM 格式的 CA 证书）启动后，HTTPS 和 HTTP/3 监听在握手时向访客要这些 CA 签发的客户端证书，但不强制：
+不出示证书的访客照常访问。出示了却验证不过（别的 CA 签的、过期了、不是客户端认证用的）的，握手直接失败，对这个节点上的所有主机名都一样。不配置时不要证书，TLS 和原来完全一样。
+服务这类区域的节点应配同一个 CA 文件。
+
+区域设置 `mtls` 为 `on` 时，没有经验证的客户端证书的请求一律 403，在区域的 `/cdn-cgi/`、各种规则和回源之前就拒绝。明文 HTTP、HTTP/3 前置以及其他看不到证书的入口都按没有证书算，
+所以没配 `--mtls-ca` 的节点上这种区域拒绝所有人。面板自己的主机名和机群 ACME HTTP-01 质询的应答不受影响。
+不管这个设置开没开，规则里都能用 `cf.tls_client_auth.cert_verified`（或 `fcf.client_cert_verified`）判断；`/cdn-cgi/fucf-trace` 的 `client_cert=` 显示 `verified` 或 `none`。
+CA 是节点级的，不是区域级的：它签发的证书能通过所有开了 `mtls` 的区域。面板：域名 → SSL/TLS → 访客客户端证书。
+
+### 源站 CA
+
+每个区域可以有一个自己的私有 CA，为源站签发证书，源站不用公共 CA 也能提供 HTTPS（类似 Cloudflare 的 Origin CA）。`POST /zones/{id}/origin_ca` 创建，已有时 409；
+换 CA 要先 `DELETE` 再 `POST`，旧 CA 签的证书随之失效。`GET` 返回 CA 证书、名称、创建时间和到期时间，任何接口都不返回 CA 私钥（它随区域配置保存，和 DKIM 私钥一样，所以每个节点都能签）。
+CA 有效期 20 年，名称约束在本区域，只签服务器证书（扩展用途只有 `serverAuth`），所以它签的证书不能当访客客户端证书用。
+
+`POST /zones/{id}/origin_ca/sign` 签发：`hostnames`（或 `names`）1–50 个名字，必须是区域本身或其下的名字，通配符只能写在最前面（`*.example.com`），不能是 IP；
+`days`（或 `requested_validity`，必填）1–5475 天，到期时间超过 CA 的不签。返回 `certificate`、`private_key`（为这张证书新生成，平台不保存，只显示这一次）、`ca_certificate`、
+`hostnames`、`requested_validity` 和 `expires_on`。源站装上后，回源用 `ssl` = `full`；`strict` 只认公共 CA。API 令牌需要 SSL and Certificates 读/写权限。
+面板：域名 → SSL/TLS → 源站 CA。
 
 ### TLS 指纹（JA4）
 
@@ -300,7 +327,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 `loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、`sni`（`plaintext` / `off`）、
 `warp`（访客地址是本机群的节点时为 `fucf`，是 Cloudflare 的地址时为 `cloudflare`，否则 `off`）、`kex`；
 后面是自有的——`ja4`（本连接的 JA4 指纹，见"TLS 指纹（JA4）"）、`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
-`limit`（本节点的限流状态）、`threat`（访客地址的威胁分）、`bot`（Bot 分，见"Bot 分"）、`region`（省或州，未知为空）。
+`limit`（本节点的限流状态）、`threat`（访客地址的威胁分）、`bot`（Bot 分，见"Bot 分"）、`client_cert`（`verified` / `none`，见"访客客户端证书（mTLS）"）、`region`（省或州，未知为空）。
 
 ```bash
 curl https://<任意接入的主机名>/cdn-cgi/fucf-trace      # 看请求落在哪个节点、节点看到的 IP / 协议 / 地区

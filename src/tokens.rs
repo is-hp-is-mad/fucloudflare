@@ -198,7 +198,7 @@ pub fn need(path: &str) -> Need {
                 "settings" | "dnssec" => Area::ZoneSettings,
                 "purge_cache" => Area::CachePurge,
                 "firewall" | "rate_limits" | "security" => Area::Firewall,
-                "ssl" | "custom_certificates" => Area::Ssl,
+                "ssl" | "custom_certificates" | "origin_ca" => Area::Ssl,
                 "origin_rules" => Area::OriginRules,
                 "redirect_rules" => Area::RedirectRules,
                 "transform_rules" => Area::TransformRules,

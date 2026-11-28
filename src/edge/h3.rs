@@ -59,6 +59,11 @@ pub async fn serve_with_proxy(endpoint: quinn::Endpoint, edge: Arc<Edge>, is_pro
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             let peer = conn.remote_address();
+            // rustls keeps a client's certificates only once the verifier (`--mtls-ca`) took them
+            let client_cert_verified = conn
+                .peer_identity()
+                .and_then(|identity| identity.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>().ok())
+                .is_some_and(|chain| !chain.is_empty());
             edge.measured(peer.ip(), conn.rtt());
             let Ok(mut h3) = h3::server::builder()
                 .enable_extended_connect(true)
@@ -71,7 +76,7 @@ pub async fn serve_with_proxy(endpoint: quinn::Endpoint, edge: Arc<Edge>, is_pro
                 let edge = edge.clone();
                 tokio::spawn(async move {
                     if let Ok((req, stream)) = resolver.resolve_request().await {
-                        let _ = serve_request(edge, peer, port, is_proxy, req, stream).await;
+                        let _ = serve_request(edge, peer, port, is_proxy, client_cert_verified, req, stream).await;
                     }
                 });
             }
@@ -84,9 +89,12 @@ async fn serve_request(
     peer: SocketAddr,
     port: u16,
     is_proxy: bool,
-    req: Request<()>,
+    client_cert_verified: bool,
+    mut req: Request<()>,
     stream: RequestStream,
 ) -> Result<(), BoxError> {
+    // QUIC is always TLS 1.3, and has no handshake without a server name to speak of
+    req.extensions_mut().insert(super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new(), client_cert_verified });
     if req.method() == hyper::Method::CONNECT
         && req
             .extensions()
@@ -112,8 +120,6 @@ async fn serve_request(
     });
     let body: Body = ChannelBody(rx).boxed();
     let mut req = req.map(|_| body);
-    // QUIC is always TLS 1.3, and has no handshake without a server name to speak of
-    req.extensions_mut().insert(super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new() });
     req.extensions_mut().insert(super::proxy::ListenerInfo { port, is_proxy, is_front: false });
     let resp = respond(edge, peer, true, req).await;
 

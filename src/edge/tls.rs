@@ -7,7 +7,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{ring as provider, CryptoProvider};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use std::collections::HashMap;
@@ -330,13 +331,48 @@ pub fn share_tickets(secret: &[u8]) {
     let _ = TICKETS.set(Arc::new(FleetTickets { secret: secret.to_vec() }));
 }
 
-fn base_server_config(store: Arc<Store>) -> anyhow::Result<(ServerConfig, Arc<CertResolver>)> {
+/// Checks the client certificates visitors present (`--mtls-ca`); unset:
+/// none are asked for, and the handshake is exactly what it was without it.
+static VISITOR_CA: OnceLock<Arc<dyn ClientCertVerifier>> = OnceLock::new();
+
+/// A verifier of client certificates issued by the CA certificates in
+/// `ca_pem`. A visitor without a certificate is still let in: whether one is
+/// needed is the zone's (`mtls` setting, decided per request in
+/// crate::edge::mtls), and the certificate resolver cannot make that choice
+/// per server name during the handshake. A certificate that is presented and
+/// does not verify fails the handshake.
+pub fn visitor_verifier(ca_pem: &str) -> Result<Arc<dyn ClientCertVerifier>, String> {
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        let cert = cert.map_err(|e| format!("invalid certificate PEM: {e}"))?;
+        roots.add(cert).map_err(|e| format!("not a usable CA certificate: {e}"))?;
+    }
+    if roots.is_empty() {
+        return Err("the file holds no certificate".into());
+    }
+    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), crypto())
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| format!("cannot verify client certificates with it: {e}"))
+}
+
+/// Have the visitor-facing TLS configurations made from now on (TCP and QUIC,
+/// not mail's) ask for client certificates issued by the CA in `ca_pem`.
+pub fn verify_visitors(ca_pem: &str) -> Result<(), String> {
+    let verifier = visitor_verifier(ca_pem)?;
+    let _ = VISITOR_CA.set(verifier);
+    Ok(())
+}
+
+fn base_server_config(store: Arc<Store>, client_auth: Option<Arc<dyn ClientCertVerifier>>) -> anyhow::Result<(ServerConfig, Arc<CertResolver>)> {
     let default = self_signed("fucf.invalid").ok_or_else(|| anyhow::anyhow!("cannot generate default certificate"))?;
     let resolver = Arc::new(CertResolver { store, generated: RwLock::default(), default });
-    let mut cfg = ServerConfig::builder_with_provider(crypto())
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+    let builder = ServerConfig::builder_with_provider(crypto()).with_safe_default_protocol_versions()?;
+    let builder = match client_auth {
+        Some(verifier) => builder.with_client_cert_verifier(verifier),
+        None => builder.with_no_client_auth(),
+    };
+    let mut cfg = builder.with_cert_resolver(resolver.clone());
     if let Some(tickets) = TICKETS.get() {
         cfg.ticketer = tickets.clone();
     }
@@ -345,19 +381,26 @@ fn base_server_config(store: Arc<Store>) -> anyhow::Result<(ServerConfig, Arc<Ce
 
 /// TLS config and resolver for the TCP listener (HTTP/2 and HTTP/1.1).
 pub fn server_config_with_resolver(store: Arc<Store>) -> anyhow::Result<(Arc<ServerConfig>, Arc<CertResolver>)> {
-    let (mut cfg, resolver) = base_server_config(store)?;
+    server_config_verifying(store, VISITOR_CA.get().cloned())
+}
+
+/// As [`server_config_with_resolver`], with the given client certificate
+/// verifier (or none) instead of the one of `--mtls-ca`.
+pub fn server_config_verifying(store: Arc<Store>, client_auth: Option<Arc<dyn ClientCertVerifier>>) -> anyhow::Result<(Arc<ServerConfig>, Arc<CertResolver>)> {
+    let (mut cfg, resolver) = base_server_config(store, client_auth)?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok((Arc::new(cfg), resolver))
 }
 
-/// TLS config for the TCP listener (HTTP/2 and HTTP/1.1).
+/// TLS config that never asks for a client certificate, for listeners other
+/// than the visitors' (mail's STARTTLS) and for tests.
 pub fn server_config(store: Arc<Store>) -> anyhow::Result<Arc<ServerConfig>> {
-    Ok(server_config_with_resolver(store)?.0)
+    Ok(server_config_verifying(store, None)?.0)
 }
 
 /// TLS config for the QUIC listener (HTTP/3).
 pub fn quic_server_config(store: Arc<Store>) -> anyhow::Result<Arc<ServerConfig>> {
-    let (mut cfg, resolver) = base_server_config(store)?;
+    let (mut cfg, resolver) = base_server_config(store, VISITOR_CA.get().cloned())?;
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(resolver.watch());
     }
@@ -418,8 +461,13 @@ pub fn present_to_origins(cert_pem: &str, key_pem: &str) -> Result<(), String> {
 }
 
 pub fn client_config(verify: bool) -> anyhow::Result<Arc<ClientConfig>> {
+    client_config_presenting(verify, ORIGIN_IDENTITY.get().map(|(chain, key)| (chain.clone(), key.clone_key())))
+}
+
+/// As [`client_config`], presenting `identity` (a chain and its key) to
+/// servers that ask for a client certificate.
+pub fn client_config_presenting(verify: bool, identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>) -> anyhow::Result<Arc<ClientConfig>> {
     let builder = ClientConfig::builder_with_provider(crypto()).with_safe_default_protocol_versions()?;
-    let identity = ORIGIN_IDENTITY.get().map(|(chain, key)| (chain.clone(), key.clone_key()));
     let builder = if verify {
         builder.with_root_certificates(RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
     } else {

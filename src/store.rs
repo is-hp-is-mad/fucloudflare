@@ -46,6 +46,10 @@ pub struct Zone {
     /// kept here rather than in `settings`, which the API shows as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email_dkim: Option<crate::dkim::DkimKey>,
+    /// The zone's private CA for origin certificates (crate::origin_ca); its
+    /// key, like the DKIM key, is never answered by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_ca: Option<crate::origin_ca::OriginCa>,
     /// The id of the user the zone belongs to (crate::tenancy); none: the
     /// administrators' only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1765,6 +1769,25 @@ impl Store {
         .await
     }
 
+    /// Make or remove a zone's origin CA (crate::origin_ca). As with the DKIM
+    /// key, `update` sees the zone inside the write, so two requests at once
+    /// cannot both find it without a CA.
+    pub async fn set_origin_ca_async<F>(&self, zone_id: &str, update: F) -> Result<Zone, StoreError>
+    where
+        F: FnOnce(&Zone) -> Result<Option<crate::origin_ca::OriginCa>, StoreError> + Send + 'static,
+    {
+        let zone_id = zone_id.to_string();
+        self.mutate_async(move |d, clock, sync_node| {
+            let pos = d.zones.iter().position(|z| z.id == zone_id).ok_or(StoreError::ZoneNotFound)?;
+            let ca = update(&d.zones[pos])?;
+            let sync = stamp_next(d, clock, sync_node, false);
+            let z = &mut d.zones[pos];
+            (z.origin_ca, z.modified_on, z.sync) = (ca, now(), sync);
+            Ok(z.clone())
+        })
+        .await
+    }
+
     #[allow(dead_code)]
     pub fn set_zone_kind(&self, id: &str, kind: &str) -> Result<Zone, StoreError> {
         let (id_owned, kind_owned) = (id.to_string(), kind.to_string());
@@ -2353,6 +2376,7 @@ fn apply_create_zone(
         settings: Settings::default(),
         dnssec: None,
         email_dkim: None,
+        origin_ca: None,
         owner: None,
         created_on: ts.clone(),
         modified_on: ts,

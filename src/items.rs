@@ -196,6 +196,9 @@ pub struct Settings {
     /// let go is fetched again by itself. 0, or from one chunk to
     /// crate::edge::cache::MAX_OBJECT.
     pub cache_chunking: u64,
+    /// Visitors' client certificates (crate::edge::mtls): `on` refuses (403)
+    /// every request that did not come with a certificate `--mtls-ca` verified.
+    pub mtls: String,
 }
 
 impl Default for Settings {
@@ -233,6 +236,7 @@ impl Default for Settings {
             dns_transfer_to: Vec::new(),
             cache_tier_node: String::new(),
             cache_chunking: 0,
+            mtls: "off".into(),
         }
     }
 }
@@ -243,6 +247,7 @@ impl Settings {
         one_of("waf", &self.waf, &["off", "log", "block"])?;
         one_of("security_level", &self.security_level, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
         one_of("auto_firewall_action", &self.auto_firewall_action, &["block", "managed_challenge", "js_challenge"])?;
+        one_of("mtls", &self.mtls, &["off", crate::edge::mtls::ON])?;
         if !(1..=100_000).contains(&self.auto_firewall_threshold)
             || !(60..=86_400).contains(&self.auto_firewall_window)
             || !(60..=30 * 86_400).contains(&self.auto_firewall_ban)

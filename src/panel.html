@@ -988,7 +988,10 @@ const ZONE = {
         sel("ssl", s.ssl, [["flexible", "flexible：HTTP 回源"], ["full", "full：HTTPS，不验证"], ["strict", "strict：HTTPS，验证证书"]], "回源加密")) +
         setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS")) +
         setRow("源站健康检查", "一个主机名有多条代理 A/AAAA 记录时，每个节点定期用这个路径请求每个源站地址；连续两次失败（无应答或 4xx/5xx）的地址排到最后，恢复后自动回来。留空为不检查。", `<input data-set="origin_check_path" value="${esc(s.origin_check_path || "")}" placeholder="/healthz" spellcheck="false" aria-label="源站健康检查路径">`) +
-        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) + await originHealthCard(z) + await ruleSection(z.id, "cert") };
+        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) +
+      card("访客客户端证书（mTLS）", "", setRow("只接受带有效证书的访客", "开启后，没有出示有效客户端证书的请求一律 403（经 HTTP、HTTP/3 前置或任何其他入口都一样）。证书由节点的 <code>--mtls-ca</code> 指定的 CA 签发；节点没配 <code>--mtls-ca</code> 时不会向访客要证书，开启等于全部拒绝。规则里可用 <code>cf.tls_client_auth.cert_verified</code>。",
+        sel("mtls", s.mtls || "off", [["off", "关闭"], ["on", "开启：无有效证书 403"]], "访客客户端证书"))) +
+      await originCaCard(z) + await originHealthCard(z) + await ruleSection(z.id, "cert") };
   },
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
@@ -1121,6 +1124,21 @@ async function viewZone() {
 // with less than expected, or nothing yet, shows an empty state rather than breaking the page.
 const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
 const agoText = s => (Number(s) > 0 ? dur(s) + "前" : "刚刚");
+// GET /zones/{id}/origin_ca: { present, certificate, common_name, created_on, expires_on }; never the CA's key.
+async function originCaCard(z) {
+  const r = await api("GET", `/zones/${z.id}/origin_ca`).catch(e => ({ error: e.message }));
+  const write = me.role !== "viewer";
+  const intro = `<p class="hint" style="padding:0 16px">这个域名自己的私有 CA，给源站签发证书（只能签 ${esc(z.name)} 及其下的名字，只作服务器证书）。源站装上签出的证书后，回源加密用 full；strict 只认公共 CA。</p>`;
+  if (isObj(r) && typeof r.error === "string") return card("源站 CA", "", `<div class="empty"><b>读不到源站 CA</b>${esc(r.error)}</div>`);
+  if (!isObj(r) || !r.present) return card("源站 CA", write ? btn("originCaCreate", "创建 CA", {}, "pri") : "", intro + '<div class="empty"><b>还没有源站 CA</b>创建后可以为源站签发证书；CA 私钥保存在配置里，任何接口都不返回。</div>');
+  return card("源站 CA", write ? btn("originCaSign", "签发证书", {}, "pri") + btn("originCaDel", "删除 CA", {}, "danger") : "", intro +
+    `<dl class="kv pad"><dt>名称</dt><dd>${esc(r.common_name || "—")}</dd><dt>创建于</dt><dd>${r.created_on ? when(r.created_on) : "—"}</dd><dt>有效期至</dt><dd>${r.expires_on ? when(r.expires_on) : "—"}</dd></dl>` +
+    (typeof r.certificate === "string" ? `<details style="margin:0 20px 14px"><summary>CA 证书（PEM，装到需要信任它的地方）</summary><div class="secret" style="white-space:pre-wrap">${esc(r.certificate)}</div><button type="button" data-copy="${esc(r.certificate)}">复制</button></details>` : ""));
+}
+// What signing answered: the certificate, its key (shown this once, kept nowhere) and the CA.
+const signedBox = r => showBox("证书已签发", `<p>私钥<b>只显示这一次</b>，平台不保存，请马上存到源站：</p>
+  <p class="hint">证书 · ${esc((r.hostnames || []).join(", "))} · 有效期至 ${r.expires_on ? when(r.expires_on) : "—"}</p><div class="secret" style="white-space:pre-wrap">${esc(r.certificate)}</div><button type="button" data-copy="${esc(r.certificate)}">复制证书</button>
+  <p class="hint">私钥</p><div class="secret" style="white-space:pre-wrap">${esc(r.private_key)}</div><button type="button" data-copy="${esc(r.private_key)}">复制私钥</button>`, "我已保存");
 // GET /zones/{id}/origins/health: [{ name, address, healthy, failures, checked_at, detail }]
 async function originHealthCard(z) {
   const r = await api("GET", `/zones/${z.id}/origins/health`).catch(e => ({ error: e.message }));
@@ -1853,6 +1871,27 @@ const A = {
     });
   },
   recDel: d => del(`/zones/${S.zone}/dns_records/${d.id}`, "这条记录"),
+  originCaCreate: async () => {
+    await api("POST", `/zones/${S.zone}/origin_ca`);
+    toast("源站 CA 已创建"); render();
+  },
+  originCaSign: () => {
+    const name = (C.zone && C.zone.name) || "";
+    openForm("用源站 CA 签发证书", [
+      { k: "hostnames", label: "主机名", type: "list", hint: `逗号分隔，最多 50 个；必须是 ${name} 或其下的名字，通配只能写在最前面，如 *.${name}` },
+      { k: "days", label: "有效期（天）", type: "number", min: 1, max: 5475, def: 365, hint: "1 到 5475 天（15 年）" }],
+      { hostnames: name ? [name, "*." + name] : [] },
+      async v => {
+        if (!v.hostnames.length) throw new Error("至少填一个主机名");
+        if (!(v.days >= 1 && v.days <= 5475)) throw new Error("有效期是 1 到 5475 天");
+        const r = await api("POST", `/zones/${S.zone}/origin_ca/sign`, v);
+        setTimeout(() => signedBox(r), 50);
+      });
+  },
+  originCaDel: async () => {
+    if (!(await confirmBox("删除源站 CA？", "CA 私钥随之删除，之后只能新建一个；已签发的证书不会链到新的 CA。"))) return;
+    await api("DELETE", `/zones/${S.zone}/origin_ca`); toast("已删除"); render();
+  },
   dnssecToggle: async d => {
     const enable = d.enable === "1";
     await api("PATCH", `/zones/${S.zone}/dnssec`, { status: enable ? "active" : "disabled" });

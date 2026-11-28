@@ -18,6 +18,7 @@ pub mod compress;
 pub mod front;
 pub mod h3;
 pub mod ja4;
+pub mod mtls;
 pub mod proxy;
 pub mod quic_mux;
 pub mod reqlog;
@@ -630,6 +631,9 @@ pub struct TlsInfo {
     pub kex: String,
     /// The JA4 fingerprint of the ClientHello (see [`ja4`]), as far as known.
     pub ja4: String,
+    /// The visitor presented a client certificate that `--mtls-ca` verified
+    /// (see [`mtls`]); false wherever that is not known.
+    pub client_cert_verified: bool,
 }
 
 /// Is this a gRPC request? (gRPC-Web is not: that one is plain HTTP.)
@@ -1210,6 +1214,8 @@ pub(crate) async fn open_upstream_websocket(
     {
         return Err(EdgeError::new(403, "Forbidden", "host is not in this accelerate node's allowlist"));
     }
+    // WebSockets over HTTP/2 and HTTP/3 come here without passing `process`'s check
+    mtls::check(edge, &host, &req_parts.extensions)?;
 
     let snap = edge.store.snapshot();
     let node_name = edge.node_name.get().map(String::as_str);
@@ -2037,6 +2043,10 @@ impl Edge {
             }
         }
 
+        // A zone that takes only visitors with a verified client certificate:
+        // before anything of it (its `/cdn-cgi/`, proxy rules, origin) is reached.
+        mtls::check(&self, &host, req.extensions())?;
+
         // The edge's own `/cdn-cgi/*` endpoints: allow explicit LocalProxyRule
         // (per-node or global) or WorkerRoute overrides before built-in fallback.
         if let Some(endpoint) = cgi::endpoint(req.uri().path()).map(str::to_string) {
@@ -2191,6 +2201,7 @@ impl Edge {
             query,
             headers: header_pairs(req.headers()),
             ja4: req.extensions().get::<TlsInfo>().map(|t| t.ja4.clone()).unwrap_or_default(),
+            client_cert_verified: mtls::verified(req.extensions()),
             ..Default::default()
         };
 
@@ -2989,6 +3000,8 @@ async fn serve_with_options(
                             sni: session.server_name().is_some(),
                             kex: session.negotiated_key_exchange_group().map(|group| format!("{:?}", group.name())).unwrap_or_default(),
                             ja4: fingerprint,
+                            // rustls keeps a client's certificates only once the verifier took them
+                            client_cert_verified: session.peer_certificates().is_some_and(|chain| !chain.is_empty()),
                         };
                         serve_conn(tls, peer, Some(info), alpn_h2, linfo, edge).await;
                     }

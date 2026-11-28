@@ -571,6 +571,122 @@ async fn serves_https_with_sni_certificates() {
     assert!(bad.is_err(), "certificates may only cover hosts of their own zone");
 }
 
+/// What a client presents to servers that ask for a certificate (none: nothing).
+type Identity = Option<(Vec<rustls::pki_types::CertificateDer<'static>>, rustls::pki_types::PrivateKeyDer<'static>)>;
+
+/// One request over TLS to `port` presenting `identity`: the status and the
+/// whole answer, or None when the handshake or the exchange failed.
+async fn ask_tls(port: u16, identity: Identity, path: &str) -> Option<(u16, String)> {
+    let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let connector = tokio_rustls::TlsConnector::from(tls::client_config_presenting(false, identity).unwrap());
+    let mut s = connector.connect(rustls::pki_types::ServerName::try_from("example.com").unwrap(), tcp).await.ok()?;
+    s.write_all(raw("GET", "example.com", path, "", "").as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text.split(' ').nth(1).and_then(|s| s.parse().ok())?;
+    Some((status, text))
+}
+
+#[tokio::test]
+async fn a_zone_with_mtls_on_takes_only_visitors_with_a_verified_client_certificate() {
+    let env = setup().await;
+    let ca = mtls::test_certs::ca("fucf test client CA");
+    let (cfg, _) = tls::server_config_verifying(env.store.clone(), Some(tls::visitor_verifier(&ca.pem).unwrap())).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve(listener, env.edge.clone(), Some(cfg), false));
+    let valid = || Some(mtls::test_certs::client(&ca));
+    let foreign = || Some(mtls::test_certs::client(&mtls::test_certs::ca("another CA")));
+    let line = |text: &str, wanted: &str| text.lines().any(|l| l == wanted);
+
+    // off (the default): a certificate is asked for, not needed; the trace tells which
+    assert_eq!(env.store.get_zone(&env.zone).unwrap().settings.mtls, "off");
+    let (status, text) = ask_tls(port, None, "/hello").await.expect("no certificate is fine");
+    assert!(status == 200 && text.contains("origin=main"), "{text}");
+    let (status, text) = ask_tls(port, None, "/cdn-cgi/fucf-trace").await.unwrap();
+    assert!(status == 200 && line(&text, "client_cert=none"), "{text}");
+    let (status, text) = ask_tls(port, valid(), "/cdn-cgi/fucf-trace").await.unwrap();
+    assert!(status == 200 && line(&text, "client_cert=verified"), "{text}");
+    // one that does not verify fails the handshake, whatever the zone
+    assert!(ask_tls(port, foreign(), "/hello").await.is_none_or(|(status, _)| status != 200));
+    // rules see it
+    let rule = env
+        .store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "not cf.tls_client_auth.cert_verified and http.request.uri.path eq \"/ruled\"", "action": "block" }), true)
+        .unwrap();
+    assert_eq!(ask_tls(port, None, "/ruled").await.unwrap().0, 403);
+    assert_eq!(ask_tls(port, valid(), "/ruled").await.unwrap().0, 200);
+    env.store.delete_item::<FirewallRule>(&env.zone, &rule.meta.id).unwrap();
+
+    // on: nobody without a verified certificate gets anything of the zone, by any way in
+    assert!(env.store.update_setting(&env.zone, "mtls", json!("yes")).is_err());
+    assert!(env.store.update_setting(&env.zone, "mtls", json!(true)).is_err());
+    env.store.update_setting(&env.zone, "mtls", json!("on")).unwrap();
+    let (status, text) = ask_tls(port, valid(), "/hello").await.unwrap();
+    assert!(status == 200 && text.contains("origin=main"), "{text}");
+    assert_eq!(ask_tls(port, valid(), "/cdn-cgi/fucf-trace").await.unwrap().0, 200);
+    for path in ["/hello", "/cdn-cgi/fucf-trace", "/.well-known/acme-challenge/nothing-here"] {
+        assert_eq!(ask_tls(port, None, path).await.map(|(status, _)| status), Some(403), "{path}");
+    }
+    assert!(ask_tls(port, foreign(), "/hello").await.is_none_or(|(status, _)| status == 403));
+    // other names of the zone, plain HTTP, and a listener that asks for no certificate (it never sees one)
+    assert_eq!(ask_tls(port, None, "/hello").await.unwrap().0, 403);
+    assert_eq!(get(&env, "www.example.com", "/hello").await.status, 403);
+    assert_eq!(get(&env, "direct.example.com", "/hello").await.status, 403);
+    assert_eq!(get(&env, "example.com", "/hello").await.status, 403);
+    assert_eq!(send(&env, "GET", "example.com", "/ws", "Upgrade: websocket\r\nConnection: upgrade\r\n", "").await.status, 403);
+    assert_eq!(ask_tls(env.tls_port, valid(), "/hello").await.unwrap().0, 403);
+    // the HTTP/3 front passes on no certificate
+    let front_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let front_port = front_listener.local_addr().unwrap().port();
+    tokio::spawn(front::serve(front_listener, env.edge.clone()));
+    let forwarded = "X-Forwarded-For: 198.51.100.7\r\nX-Forwarded-Proto: https\r\n";
+    let r = exchange(TcpStream::connect(("127.0.0.1", front_port)).await.unwrap(), raw("GET", "example.com", "/hello", forwarded, "")).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    // nor does HTTP/3 without a certificate
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(b"h3")).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+    let conn = endpoint.connect(([127, 0, 0, 1], env.tls_port).into(), "example.com").unwrap().await.unwrap();
+    let (mut driver, mut h3_sender) = ::h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+    tokio::spawn(async move {
+        std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+    });
+    let mut stream = h3_sender.send_request(Request::builder().uri("https://example.com/hello").body(()).unwrap()).await.unwrap();
+    stream.finish().await.unwrap();
+    assert_eq!(stream.recv_response().await.unwrap().status(), StatusCode::FORBIDDEN);
+    // HTTP/3 on a QUIC listener that asks for certificates: with one, and without
+    let (quic_tls, _) = tls::server_config_verifying(env.store.clone(), Some(tls::visitor_verifier(&ca.pem).unwrap())).unwrap();
+    let mut quic_tls = (*quic_tls).clone();
+    quic_tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(quic_tls)).unwrap();
+    let quic = quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(quic_crypto)), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let quic_port = quic.local_addr().unwrap().port();
+    tokio::spawn(h3::serve(quic, env.edge.clone()));
+    for (identity, expected) in [(valid(), StatusCode::OK), (None, StatusCode::FORBIDDEN)] {
+        let mut client_tls = (*tls::client_config_presenting(false, identity).unwrap()).clone();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap())));
+        let conn = endpoint.connect(([127, 0, 0, 1], quic_port).into(), "example.com").unwrap().await.unwrap();
+        let (mut driver, mut h3_sender) = ::h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        tokio::spawn(async move {
+            std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        let mut stream = h3_sender.send_request(Request::builder().uri("https://example.com/hello").body(()).unwrap()).await.unwrap();
+        stream.finish().await.unwrap();
+        assert_eq!(stream.recv_response().await.unwrap().status(), expected);
+    }
+    // a host of no zone is not concerned
+    assert_eq!(get(&env, "stranger.org", "/cdn-cgi/fucf-trace").await.status, 200);
+
+    // off again: as before
+    env.store.update_setting(&env.zone, "mtls", json!("off")).unwrap();
+    assert_eq!(ask_tls(port, None, "/hello").await.unwrap().0, 200);
+    assert_eq!(get(&env, "example.com", "/hello").await.status, 200);
+}
+
 #[tokio::test]
 async fn proxies_protocol_upgrades() {
     let env = setup().await;
@@ -1400,6 +1516,7 @@ async fn cdn_cgi_is_the_edge_itself() {
     let expected = [
         ("h", "example.com"), ("ip", "127.0.0.1"), ("visit_scheme", "http"), ("uag", "probe/1.0"), ("colo", "AU"), ("dc", "1"),
         ("http", "http/1.1"), ("loc", "XX"), ("tls", "off"), ("sni", "off"), ("warp", "off"), ("zone", "example.com"), ("limit", "ok"),
+        ("client_cert", "none"),
     ];
     for (key, value) in expected {
         assert_eq!(t.get(key).map(String::as_str), Some(value), "{key} in {}", r.body);

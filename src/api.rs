@@ -198,6 +198,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<TransformRule>("/zones/{zone_id}/transform_rules"))
         .merge(crud::<CacheRule>("/zones/{zone_id}/cache_rules"))
         .route("/zones/{zone_id}/email", get(email_zone).patch(patch_email))
+        .route("/zones/{zone_id}/origin_ca", get(get_origin_ca).post(create_origin_ca).delete(delete_origin_ca))
+        .route("/zones/{zone_id}/origin_ca/sign", post(sign_origin_ca))
         .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
         .route("/zones/{zone_id}/rulesets", get(list_rulesets).post(create_ruleset))
         .route("/zones/{zone_id}/rulesets/phases/{phase}/entrypoint", get(get_entrypoint).put(put_entrypoint))
@@ -2282,6 +2284,29 @@ async fn email_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
 async fn patch_email(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
     crate::dkim::patch(&st.store, &zone_id, &body::<Value>(&bytes)?).await?;
     email_zone(State(st), Path(zone_id)).await
+}
+
+// ----------------------------------------------------------- origin CA ----
+
+/// A zone's private origin CA (crate::origin_ca): its certificate, never its key.
+async fn get_origin_ca(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(crate::origin_ca::view(&st.store.get_zone(&zone_id)?))
+}
+
+/// Make the zone's origin CA (409 if it has one).
+async fn create_origin_ca(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(crate::origin_ca::view(&crate::origin_ca::create(&st.store, &zone_id).await?))
+}
+
+async fn delete_origin_ca(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    crate::origin_ca::remove(&st.store, &zone_id).await?;
+    ok(json!({ "id": zone_id }))
+}
+
+/// Sign a certificate for names of the zone; its key is in this answer only.
+async fn sign_origin_ca(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    ok(crate::origin_ca::sign(&zone, &body(&bytes)?)?)
 }
 
 // ------------------------------------------------- cache and security ----
@@ -4670,6 +4695,128 @@ mod tests {
         assert_eq!(sc, StatusCode::OK);
         let (sc, _) = call(&mut app, "GET", &format!("{base}/{id}"), vec![]).await;
         assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_zone_makes_one_origin_ca_signs_with_it_and_never_answers_its_key() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-origin-ca-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        for (email, role) in [("admin@example.com", Role::Admin), ("editor@example.com", Role::Editor), ("other@example.com", Role::Editor), ("viewer@example.com", Role::Viewer)] {
+            st.accounts.create_user(email, role, Some("strong-pass-123"), email, &Client::default()).unwrap();
+        }
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (admin, editor, other, viewer) = (session("admin@example.com"), session("editor@example.com"), session("other@example.com"), session("viewer@example.com"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let z = zone.id.clone();
+        give(&st, &z, "editor@example.com").await;
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let ca = format!("/client/v4/zones/{z}/origin_ca");
+        let sign = format!("{ca}/sign");
+        let stored = || st.store.get_zone(&z).unwrap().origin_ca;
+        // the CA's key: neither its PEM nor any part of it in an answer
+        let leaks = |b: &[u8], key: &str| {
+            let text = String::from_utf8_lossy(b);
+            let middle: String = key.lines().filter(|l| !l.starts_with("-----")).collect::<String>().chars().skip(20).take(40).collect();
+            text.contains(&middle) || text.contains(&key.replace('\n', "\\n"))
+        };
+        let mut as_user = async |bearer: &str, method: &str, path: &str, body: Value| {
+            let h = vec![("authorization", bearer), ("content-type", "application/json")];
+            let (sc, _, b) = call_raw(&mut app, method, path, h, if body.is_null() { vec![] } else { body.to_string().into_bytes() }).await;
+            (sc, b)
+        };
+
+        // none yet; the zone's owner makes it, once
+        let (sc, b) = as_user(&editor, "GET", &ca, Value::Null).await;
+        assert_eq!((sc, json_of(&b)["result"].clone()), (StatusCode::OK, json!({ "present": false })));
+        let (sc, b) = as_user(&editor, "POST", &sign, json!({ "hostnames": ["example.com"], "days": 30 })).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "no CA to sign with: {}", String::from_utf8_lossy(&b));
+        let (sc, b) = as_user(&editor, "POST", &ca, Value::Null).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let key = stored().unwrap().private_key;
+        assert!(!leaks(&b, &key));
+        let made = json_of(&b)["result"].clone();
+        assert_eq!((made["present"].clone(), made["certificate"].clone()), (json!(true), json!(stored().unwrap().certificate)));
+        assert!(made["expires_on"].is_string() && made.get("private_key").is_none(), "{made}");
+        let (sc, b) = as_user(&editor, "POST", &ca, Value::Null).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(stored().unwrap().private_key, key, "the refused second one changed nothing");
+        // nothing that shows the zone shows the key
+        for path in [ca.clone(), format!("/client/v4/zones/{z}"), format!("/client/v4/zones/{z}/settings"), "/client/v4/zones".to_string()] {
+            let (sc, b) = as_user(&admin, "GET", &path, Value::Null).await;
+            assert!(sc == StatusCode::OK && !leaks(&b, &key), "{path}: {}", String::from_utf8_lossy(&b));
+        }
+
+        // signing: a certificate and its key, for names of the zone, for a bounded time
+        let (sc, b) = as_user(&editor, "POST", &sign, json!({ "hostnames": ["example.com", "*.example.com"], "days": 365 })).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(!leaks(&b, &key));
+        let signed = json_of(&b)["result"].clone();
+        assert!(crate::edge::tls::parse_cert(signed["certificate"].as_str().unwrap(), signed["private_key"].as_str().unwrap()).is_ok(), "{signed}");
+        assert_eq!((signed["hostnames"].clone(), signed["ca_certificate"].clone()), (json!(["example.com", "*.example.com"]), made["certificate"].clone()));
+        let (sc, _) = as_user(&editor, "POST", &sign, json!({ "names": ["origin.example.com"], "requested_validity": 5475 })).await;
+        assert_eq!(sc, StatusCode::OK, "Cloudflare's field names");
+        for body in [
+            json!({ "hostnames": ["example.net"], "days": 30 }),
+            json!({ "hostnames": ["www.example.com", "evil.example.org"], "days": 30 }),
+            json!({ "hostnames": [], "days": 30 }),
+            json!({ "hostnames": ["example.com"], "days": 0 }),
+            json!({ "hostnames": ["example.com"], "days": 5476 }),
+            json!({ "hostnames": ["example.com"] }),
+            json!({ "hostnames": ["example.com"], "days": 30, "ca_private_key": "x" }),
+            json!("example.com"),
+        ] {
+            let (sc, b) = as_user(&editor, "POST", &sign, body.clone()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{body}: {}", String::from_utf8_lossy(&b));
+            assert!(!leaks(&b, &key));
+        }
+
+        // who may: a viewer reads, other users see no such zone, tokens need the SSL permission
+        let (sc, _) = as_user(&viewer, "GET", &ca, Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "a viewer sees only zones given to them");
+        give(&st, &z, "viewer@example.com").await;
+        let (sc, _) = as_user(&viewer, "GET", &ca, Value::Null).await;
+        assert_eq!(sc, StatusCode::OK);
+        for (method, path) in [("POST", &sign), ("POST", &ca), ("DELETE", &ca)] {
+            let (sc, _) = as_user(&viewer, method, path, json!({ "hostnames": ["example.com"], "days": 1 })).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        give(&st, &z, "editor@example.com").await;
+        for (method, path) in [("GET", &ca), ("POST", &sign), ("DELETE", &ca)] {
+            let (sc, _) = as_user(&other, method, path, json!({ "hostnames": ["example.com"], "days": 1 })).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "another user's zone: {method} {path}");
+        }
+        let (sc, _) = as_user(&admin, "POST", "/client/v4/zones/0123456789abcdef0123456789abcdef/origin_ca", Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let (sc, b) = as_user(&admin, "POST", "/client/v4/user/tokens", spec).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let (settings, read, write) = (token("Zone Settings Write").await, token("SSL and Certificates Read").await, token("SSL and Certificates Write").await);
+        let ask = json!({ "hostnames": ["example.com"], "days": 1 });
+        assert_eq!(as_user(&settings, "GET", &ca, Value::Null).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(as_user(&settings, "POST", &sign, ask.clone()).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(as_user(&read, "GET", &ca, Value::Null).await.0, StatusCode::OK);
+        assert_eq!(as_user(&read, "POST", &sign, ask.clone()).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(as_user(&write, "POST", &sign, ask.clone()).await.0, StatusCode::OK);
+
+        // rotation: remove it, make another; the first one is gone for good
+        let (sc, _) = as_user(&editor, "DELETE", &ca, Value::Null).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert!(stored().is_none());
+        assert_eq!(as_user(&editor, "DELETE", &ca, Value::Null).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(as_user(&editor, "POST", &ca, Value::Null).await.0, StatusCode::OK);
+        assert_ne!(stored().unwrap().private_key, key);
 
         let _ = std::fs::remove_dir_all(dir);
     }

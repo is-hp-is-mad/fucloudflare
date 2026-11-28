@@ -193,8 +193,9 @@ async fn handle(edge: Arc<Edge>, front: SocketAddr, port: u16, req: Request<Inco
         tracing::warn!("the HTTP/3 front does not say who its visitors are (X-Forwarded-For): they all count as {}", front.ip());
     }
     if tls {
-        // QUIC is always TLS 1.3, and has no handshake without a server name to speak of
-        req.extensions_mut().insert(TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new() });
+        // QUIC is always TLS 1.3, and has no handshake without a server name to speak of;
+        // the front passes on no client certificate, so none counts as verified (crate::edge::mtls)
+        req.extensions_mut().insert(TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new(), client_cert_verified: false });
         req.extensions_mut().insert(ViaFront);
     }
     req.extensions_mut().insert(super::proxy::ListenerInfo { port, is_proxy: false, is_front: true });

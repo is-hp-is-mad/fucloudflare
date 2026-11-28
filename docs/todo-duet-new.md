@@ -74,7 +74,7 @@
 - 单元测试：分片/合并的纯逻辑（片边界、尾部不足一片、Range 解析映射到片号）；不要试图盲写并信 streaming 的正确性，集成验证留给最后。
 - 谨慎：这是全任务单里风险最高的一项，放在第二批第一个做，做完交接里写清哪些路径没把握。
 
-### [ ] N7 访客客户端证书 mTLS + 源站私有 CA
+### [x] N7 访客客户端证书 mTLS + 源站私有 CA
 
 - rcgen 已在依赖里（`Cargo.toml` 36 行），不引新依赖。
 - TLS 层（`src/edge/tls.rs` 搜 `fn base_server_config`）：新增全局开关 `--mtls-ca <pem 文件>`（env `FUCF_MTLS_CA`）。设置后用 rustls 0.23 的 `rustls::server::AllowAnyAnonymousOrAuthenticatedClient::new(roots)` 包进 `builder.with_client_cert_verifier(...)`（`roots` 用 `RootCertStore::empty()` + 逐张 `add(CertificateDer)`，PEM 解析照抄本文件 `parse_cert` 的 `pem_slice_iter` 用法）。不带证书的连接照常接受，验证结果在 HTTP 层裁决——因为 rustls 的 SNI 证书解析不支持按主机名决定是否要求客户端证书。
@@ -163,3 +163,9 @@
 - 取：`chunked::serve` 按 `cached_response` 同样的规则（有逐条对比测试）只读涉及的片；缺片时 `Edge::refill` 只对缺的那段发 `Range`+`If-Range`（强 ETag，否则 Last-Modified）+`Accept-Encoding: identity`，只接受跨度、总长、ETag/Last-Modified 都对得上的 206；源站回 200 就直接用这份、这一次整份存放；其他应答丢元数据后照不分片回源；没有校验值的整份重取。过期副本只在片齐时给 UPDATING/STALE，不做 304 续期。
 - 写：仍是整份读完才发给访客（边读边切片、切好的片直接作应答体），单对象上限仍 32 MiB；真正的边收边发、冷 Range 请求的部分填充留待以后。磁盘层元数据写成 `.k` 文件，防止降级后旧二进制把空体当对象发出去。
 - 留待能跑真实流量的人：分层缓存上层节点之间的 Range 补片、慢源站下补片的时延、磁盘上 64 片逐个读的速度、滚动升级时旧节点改设置会丢掉 `cache_chunking`、整份重存后旧片要等淘汰或清除才消失（不会被发出去）。
+
+### N7
+- 访客 mTLS：`--mtls-ca` / `FUCF_MTLS_CA` 只对访客监听（TCP HTTPS、QUIC/h3）启用 `WebPkiClientVerifier`，`allow_unauthenticated`；不配置时 TLS 与原来完全一样，邮件 STARTTLS 永不要证书。
+- 区域设置 `mtls: on` 由 `src/edge/mtls.rs::check` 在 `process()`（`/cdn-cgi/` 之前）和 `open_upstream_websocket` 拦截；明文 HTTP、HTTP/3 前置、拿不到 `TlsInfo` 的路径（含 Worker 子请求）都算未验证。规则字段为 `cf.tls_client_auth.cert_verified` / `fcf.client_cert_verified`，trace 字段为 `client_cert=`。已知的 ACME HTTP-01 令牌照常放行，面板主机不受限。
+- 源站 CA 在 `src/origin_ca.rs`：私钥存在 `Zone.origin_ca`（仿 DKIM），API 永不返回；名称约束到本区域，叶子证书只有 serverAuth；`days` 必填 1–5475；每个区域只能有一个，轮换要先 DELETE 再 POST（多加了 DELETE）；令牌属于 SSL 区域。
+- 留待能跑真实节点的人：出示无效证书会让该节点上所有主机名的握手失败；访客 CA 是整节点的，不分区域；没配 `--mtls-ca` 的节点上 `mtls: on` 的区域拒绝所有人；`strict` 不信任源站 CA（用 `full`）；滚动升级时旧节点可能经同步丢掉 `origin_ca`。

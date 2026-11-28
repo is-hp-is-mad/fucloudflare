@@ -84,7 +84,7 @@ by `id` or by `name`:
 | DNS Read / DNS Write | zone | `/zones/{id}/dns_records…` |
 | Cache Purge | zone | `/zones/{id}/purge_cache` |
 | Firewall Services Read / Write | zone | firewall rules, rate limits, security events |
-| SSL and Certificates Read / Write | zone | certificate packs, custom certificates |
+| SSL and Certificates Read / Write | zone | certificate packs, custom certificates, `/zones/{id}/origin_ca…` |
 | Origin Rules, Dynamic Redirect, Transform Rules, Cache Rules Read / Write | zone | the rule lists of those names |
 | Workers Routes Read / Write | zone | `/zones/{id}/workers/routes` |
 | Email Routing Rules Read / Write | zone | `/zones/{id}/email…` |
@@ -185,7 +185,9 @@ language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.use
 `ip.geoip.as_org`, `cf.threat_score` (also `fcf.threat_score`), `cf.bot_management.score` (also
 `fcf.bot_score`), `fcf.ja4` (also
 `cf.bot_management.ja4`: the JA4 fingerprint of the visitor's TLS ClientHello, empty over plain HTTP
-and HTTP/3; `/cdn-cgi/fucf-trace` shows it as `ja4=`), with `eq ne lt le gt ge contains
+and HTTP/3; `/cdn-cgi/fucf-trace` shows it as `ja4=`), `cf.tls_client_auth.cert_verified` (also
+`fcf.client_cert_verified`: whether the visitor presented a client certificate the node verified,
+see [Visitor client certificates](#visitor-client-certificates-mtls)), with `eq ne lt le gt ge contains
 matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
@@ -366,6 +368,7 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | Setting | Values (default first) |
 | --- | --- |
 | `ssl` | `flexible` (HTTP to the origin), `full` (HTTPS, certificate not checked), `strict` (HTTPS, checked) |
+| `mtls` | `off`, `on`: only visitors with a verified client certificate, see [Visitor client certificates](#visitor-client-certificates-mtls) |
 | `always_use_https` | `false`, `true`: 301 from HTTP to HTTPS |
 | `waf` | `block`, `log`, `off`: the managed ruleset |
 | `development_mode` | `false`, `true`: bypass the cache |
@@ -595,6 +598,55 @@ Without `hosts`, a certificate is for the apex and its wildcard. A pack answers 
 (`pending`, `active`, `failed`), `error`, `issued_on`, `expires_on`, `attempts`, `next_attempt`, and,
 when the edge has a `--cname-base`, `dns_delegation`: the CNAME records a zone hosted elsewhere adds
 once so that DNS-01 can be answered here. Private keys are never answered.
+
+#### Visitor client certificates (mTLS)
+
+A node started with `--mtls-ca <file>` (`FUCF_MTLS_CA`: one or more PEM CA certificates) asks every
+visitor on its HTTPS and HTTP/3 listeners for a client certificate signed by one of them. It does not
+require one: a visitor without a certificate goes on as before. A certificate that does not verify
+(another CA, expired, not made for client authentication) fails the TLS handshake, for any host of
+that node. Without the flag, nothing is asked and TLS is as before. Every node that serves such a zone
+should have the same CA file.
+
+A zone with the setting `mtls` at `on` answers 403 to every request without a verified certificate,
+before its `/cdn-cgi/` paths, rules and origin. Plain HTTP, the HTTP/3 front (`--h3-front-listen`) and any
+other way in that cannot see a verified certificate count as without one, so on a node without
+`--mtls-ca` such a zone refuses everyone. The panel's own host and the answers to the fleet's ACME
+HTTP-01 challenges are not affected. Rules can test `cf.tls_client_auth.cert_verified` (also
+`fcf.client_cert_verified`) whatever the setting, and `/cdn-cgi/fucf-trace` shows
+`client_cert=verified` or `client_cert=none`.
+
+The CA is the node's, not the zone's: a certificate it signed passes every zone with `mtls` on.
+
+#### Origin CA
+
+```
+GET    /zones/{id}/origin_ca          {"present": false}, or {"present": true, "certificate": PEM, "common_name",
+                                      "created_on", "expires_on"}; never the CA's private key
+POST   /zones/{id}/origin_ca          make the zone's CA (409 if it has one already)
+DELETE /zones/{id}/origin_ca          remove it with its key; certificates it signed no longer chain to a new one
+POST   /zones/{id}/origin_ca/sign     {"hostnames": [...], "days": 365}: sign a certificate for the origin
+```
+
+A zone can have its own private CA that signs certificates for its origin servers, so an origin can
+serve HTTPS without a public CA. The CA is valid for 20 years, is constrained to the zone's names and
+signs server certificates only (extended key usage `serverAuth`), so its certificates do not pass as
+[visitor client certificates](#visitor-client-certificates-mtls). Its private key is kept with the zone,
+like a DKIM key, so any node can sign; no answer ever holds it. There is one CA per zone: to rotate it,
+`DELETE` it and `POST` a new one.
+
+Signing takes `hostnames` (or `names`): 1 to 50 names, each the zone itself or a name below it, a
+wildcard only as a leading `*.`, no IP addresses; and `days` (or `requested_validity`, required): 1 to
+5475. A certificate that would outlive the CA is refused. The answer holds `certificate`,
+`private_key` (made for this certificate and kept nowhere: it is shown this once), `ca_certificate`,
+`hostnames`, `requested_validity` and `expires_on`. An origin serving such a certificate works with
+`ssl` at `full`; `strict` checks against the public CAs only and refuses it.
+
+```sh
+curl -s -X POST $BASE/zones/$ZONE/origin_ca -H "Authorization: Bearer $TOKEN"
+curl -s -X POST $BASE/zones/$ZONE/origin_ca/sign -H "Authorization: Bearer $TOKEN" \
+  -d '{"hostnames": ["example.com", "*.example.com"], "days": 365}'
+```
 
 ### Rules
 

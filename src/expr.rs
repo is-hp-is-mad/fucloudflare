@@ -41,6 +41,8 @@ pub struct ReqInfo {
     /// How human the request looks, 1 (a bot) to 99 (a human); 0 where it
     /// was not scored, on requests the edge makes itself (see crate::edge::botscore).
     pub bot_score: i64,
+    /// The visitor presented a client certificate the edge verified (see crate::edge::mtls).
+    pub client_cert_verified: bool,
 }
 
 impl ReqInfo {
@@ -78,6 +80,7 @@ enum Val {
     Ja4,
     Threat,
     BotScore,
+    CertVerified,
     Lower(Box<Val>),
     Upper(Box<Val>),
     UrlDecode(Box<Val>),
@@ -229,7 +232,7 @@ impl Val {
     fn ty(&self) -> Ty {
         match self {
             Val::IpSrc => Ty::Ip,
-            Val::Ssl | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
+            Val::Ssl | Val::CertVerified | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
             Val::Len(_) | Val::Asn | Val::Threat | Val::BotScore => Ty::Int,
             _ => Ty::Str,
         }
@@ -404,6 +407,7 @@ impl Parser<'_> {
             "fcf.threat_score" | "cf.threat_score" | "ip.threat_score" => Val::Threat,
             "fcf.bot_score" | "cf.bot_management.score" => Val::BotScore,
             "ssl" => Val::Ssl,
+            "cf.tls_client_auth.cert_verified" | "fcf.client_cert_verified" => Val::CertVerified,
             _ => return Err(format!("unknown field '{word}'")),
         })
     }
@@ -485,6 +489,7 @@ impl Val {
             Val::AsOrg => V::S(Cow::Borrowed(&r.as_org)),
             Val::Ja4 => V::S(Cow::Borrowed(&r.ja4)),
             Val::Ssl => V::B(r.ssl),
+            Val::CertVerified => V::B(r.client_cert_verified),
             Val::Lower(v) => V::S(Cow::Owned(s(v).to_lowercase())),
             Val::Upper(v) => V::S(Cow::Owned(s(v).to_uppercase())),
             Val::UrlDecode(v) => V::S(Cow::Owned(url_decode(&s(v)))),
@@ -661,6 +666,22 @@ mod tests {
         assert!(at("cf.bot_management.score in {1 2 3}", 2));
         assert!(at(r#"fcf.bot_score lt 30 and not http.request.uri.path contains "/robots.txt""#, 5));
         for bad in ["fcf.bot_score eq \"1\"", "fcf.bot_score contains \"1\"", "fcf.bot_score", "cf.bot_management.scores lt 30", "fcf.bot_score lt"] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn the_verified_client_certificate_is_a_boolean_under_either_name() {
+        let at = |src: &str, verified: bool| {
+            let e = Expr::parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            e.matches(&ReqInfo { client_cert_verified: verified, ..req() })
+        };
+        assert!(at("cf.tls_client_auth.cert_verified", true));
+        assert!(!at("cf.tls_client_auth.cert_verified", false));
+        assert!(at("not fcf.client_cert_verified", false));
+        assert!(at(r#"not cf.tls_client_auth.cert_verified and http.request.uri.path contains "/Admin""#, false));
+        assert!(!req().client_cert_verified, "unknown means not verified");
+        for bad in ["cf.tls_client_auth.cert_verified eq true", "cf.tls_client_auth.cert_verified eq \"1\"", "cf.tls_client_auth.cert_verified contains \"x\"", "cf.tls_client_auth.verified"] {
             assert!(Expr::parse(bad).is_err(), "{bad} should fail");
         }
     }
