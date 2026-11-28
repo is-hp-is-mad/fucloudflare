@@ -13,6 +13,7 @@ __pycache__/
 Thumbs.db
 AGENTS.md
 HANDOFF.md
+todo.md
 scripts/deploy/add-site.sh
 scripts/deploy/bootstrap.sh
 scripts/deploy/check.sh
