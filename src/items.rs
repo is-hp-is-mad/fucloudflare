@@ -1372,10 +1372,12 @@ impl LocalProxyRule {
 
         let mut normalized_hosts = Vec::with_capacity(self.hosts.len());
         for h in &self.hosts {
-            let h = h.trim().trim_end_matches('.').to_ascii_lowercase();
+            let h = h.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
             if h.is_empty() {
                 continue;
             }
+            // IP addresses in canonical form, as requests are matched
+            let h = h.parse::<std::net::IpAddr>().map(|ip| ip.to_string()).unwrap_or(h);
             if h != "*" {
                 let check = h.strip_prefix("*.").unwrap_or(&h);
                 check_host("hosts", check)?;

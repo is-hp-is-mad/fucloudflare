@@ -31,6 +31,10 @@ pub struct Zone {
     pub serial: u32,
     /// `full`: the domain's NS records point at us. `partial`: the domain
     /// stays with another DNS provider and CNAMEs individual hosts to us.
+    /// `cert`: only certificates are managed for it (DNS-01 through a CNAME
+    /// delegation of `_acme-challenge`); it is not served -- no DNS answers,
+    /// no CDN, not exported to the SNI split -- so its names can belong to
+    /// other services or to proxy rules.
     #[serde(default = "Zone::default_kind", rename = "type")]
     pub kind: String,
     #[serde(default)]
@@ -321,6 +325,8 @@ impl Snapshot {
         let mut by_id: HashMap<&str, ZoneSnap> = data
             .zones
             .iter()
+            // certificate-only zones are not served (their packs still count, see `certs` below)
+            .filter(|z| z.kind != "cert")
             .map(|z| {
                 let id = z.id.as_str();
                 let mut routes: Vec<WorkerRoute> =
@@ -1943,8 +1949,8 @@ fn apply_create_zone(
     kind: &str,
     default_ns: Vec<String>,
 ) -> Result<Zone, StoreError> {
-    if !matches!(kind, "full" | "partial") {
-        return invalid("zone type must be 'full' or 'partial'");
+    if !matches!(kind, "full" | "partial" | "cert") {
+        return invalid("zone type must be 'full', 'partial' or 'cert'");
     }
     let name = normalize_name(name).map_err(StoreError::Invalid)?;
     if !name.contains('.') || name.contains(['*', '_']) {
@@ -2000,8 +2006,8 @@ fn apply_set_dnssec(d: &mut Data, clock: &HlcClock, sync_node: &str, zone_id: &s
 }
 
 fn apply_set_zone_kind(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str, kind: &str) -> Result<Zone, StoreError> {
-    if !matches!(kind, "full" | "partial") {
-        return invalid("zone type must be 'full' or 'partial'");
+    if !matches!(kind, "full" | "partial" | "cert") {
+        return invalid("zone type must be 'full', 'partial' or 'cert'");
     }
     if !d.zones.iter().any(|z| z.id == id) {
         return Err(StoreError::ZoneNotFound);

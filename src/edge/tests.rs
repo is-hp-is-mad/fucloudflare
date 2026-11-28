@@ -1892,3 +1892,17 @@ async fn proxy_rules_answer_by_themselves_and_serve_files() {
     assert!(get(&env, "example.com", "/hello").await.body.contains("origin=main"));
     let _ = std::fs::remove_dir_all(base);
 }
+
+#[test]
+fn request_hosts_are_normalized() {
+    for (raw, want) in [
+        ("Example.COM.", "example.com"),
+        ("example.com:8443", "example.com"),
+        ("192.0.2.7:443", "192.0.2.7"),
+        ("[2001:DB8:0::1]", "2001:db8::1"),
+        ("[2001:db8::1]:443", "2001:db8::1"),
+        ("2001:db8::1", "2001:db8::1"),
+    ] {
+        assert_eq!(request_host(raw), want, "{raw}");
+    }
+}

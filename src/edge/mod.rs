@@ -328,6 +328,23 @@ struct WafHit;
 #[derive(Clone)]
 struct OffersHttp3(String);
 
+/// The host a request is for, from its URI or `Host` header: without the
+/// port, the brackets of an IPv6 literal and a trailing dot, lowercase, IP
+/// addresses in their canonical form (so rules match `2001:db8::1` however
+/// the client wrote it).
+pub(crate) fn request_host(raw: &str) -> String {
+    let raw = raw.trim();
+    let host = match raw.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => match raw.rsplit_once(':') {
+            Some((h, port)) if !h.is_empty() && !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => raw,
+        },
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.parse::<IpAddr>().map(|ip| ip.to_string()).unwrap_or(host)
+}
+
 /// May an `accelerate` node serve `host`? It serves the hosts on its
 /// allowlist (`accel_hosts`) and its own sites: proxy rules scoped to this
 /// node by name. Rules for every node do not count -- the allowlist is what
@@ -774,12 +791,7 @@ pub(crate) async fn open_upstream_websocket(
         .map(str::to_string)
         .or_else(|| req_parts.headers.get(header::HOST).and_then(|h| h.to_str().ok()).map(str::to_string))
         .ok_or_else(|| EdgeError::new(400, "Bad request", "missing Host header"))?;
-    let host = match raw_host.rsplit_once(':') {
-        Some((h, port)) if !h.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => raw_host.as_str(),
-    }
-    .trim_end_matches('.')
-    .to_ascii_lowercase();
+    let host = request_host(&raw_host);
 
     let hops: u8 = req_parts
         .headers
@@ -1392,12 +1404,7 @@ impl Edge {
             .map(str::to_string)
             .or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).map(str::to_string))
             .ok_or_else(|| EdgeError::new(400, "Bad request", "missing Host header"))?;
-        let host = match host.rsplit_once(':') {
-            Some((h, port)) if !h.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
-            _ => host.as_str(),
-        }
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+        let host = request_host(&host);
 
         let looped = req.headers().get_all("cdn-loop").iter().any(|v| v.to_str().is_ok_and(|v| v.contains(LOOP_TOKEN)));
         if looped {

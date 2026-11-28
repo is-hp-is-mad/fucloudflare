@@ -950,7 +950,8 @@ async fn apply_purges(store: Arc<store::Store>, cache: Arc<edge::cache::Cache>) 
 /// Atomically write all hosted zone names (plus extra hosts like panel/cname_base)
 /// to `path`, one per line, only when the rendered content actually changed.
 fn export_domains_file(path: &std::path::Path, store: &store::Store, extra: &[String], node: &str, last: Option<&str>) -> Option<String> {
-    let mut set: std::collections::BTreeSet<String> = store.list_zones().into_iter().map(|z| z.name).collect();
+    // certificate-only zones are not served here, their names may be anybody's
+    let mut set: std::collections::BTreeSet<String> = store.list_zones().into_iter().filter(|z| z.kind != "cert").map(|z| z.name).collect();
     let here = |rule: &&items::LocalProxyRule| rule.nodes.is_empty() || rule.nodes.iter().any(|n| n.eq_ignore_ascii_case(node));
     for rule in store.snapshot().local_proxy_rules.iter().filter(here) {
         for h in &rule.hosts {
@@ -993,6 +994,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = crate::store::Store::open(&dir.join("state.json"), vec![]).unwrap();
         store.create_zone("zone.example").unwrap();
+        // a certificate-only zone is neither exported nor served
+        store.create_zone_as("certonly.example", "cert").unwrap();
+        assert!(store.snapshot().find_zone("www.certonly.example").is_none());
         store
             .save_proxy_rule(
                 None,

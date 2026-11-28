@@ -97,9 +97,10 @@ fn challenge_kind(method: &str, wildcard: bool, zone_kind: &str) -> &'static str
         "dns" => "dns-01",
         "tls-alpn" => "tls-alpn-01",
         "http" => "http-01",
-        // We answer DNS for zones delegated to us; for the others the CA can
-        // only reach the edge itself. Wildcards always need DNS.
-        _ if wildcard || zone_kind == "full" => "dns-01",
+        // We answer DNS for zones delegated to us (and for the `_acme-challenge`
+        // CNAMEs of certificate-only zones); for the others the CA can only
+        // reach the edge itself. Wildcards always need DNS.
+        _ if wildcard || zone_kind == "full" || zone_kind == "cert" => "dns-01",
         _ => "tls-alpn-01",
     }
 }

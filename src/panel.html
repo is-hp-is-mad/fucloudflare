@@ -727,7 +727,7 @@ async function ruleSection(zid, key) {
 // ---------------------------------------------------------------- views ----
 const zh = tab => `#/zone/${esc(S.zone)}/${tab}`;
 const protoChips = s => chips(["HTTP/1.1", s.http2 && "HTTP/2", s.http3 && "HTTP/3"].filter(Boolean));
-const modeTag = z => (z.type === "full" ? '<span class="tag pri">完全托管 (NS)</span>' : '<span class="tag">CNAME 接入</span>');
+const modeTag = z => (z.type === "full" ? '<span class="tag pri">完全托管 (NS)</span>' : z.type === "cert" ? '<span class="tag blue">仅证书</span>' : '<span class="tag">CNAME 接入</span>');
 const stateTag = z => (z.paused ? '<span class="st bad">已暂停</span>' : '<span class="st ok">运行中</span>');
 
 async function viewOverview() {
@@ -959,7 +959,7 @@ const ZONE = {
   },
   async manage(z) {
     return { sub: "接入方式、暂停与删除。", body:
-      card("接入", "", setRow(`接入方式 ${modeTag(z)}`, z.type === "full" ? "完全托管：域名的 NS 指向本平台，全部 DNS 记录在这里管理。" : "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来。", btn("zoneKind", z.type === "full" ? "改为 CNAME 接入" : "改为完全托管 (NS)")) +
+      card("接入", "", setRow(`接入方式 ${modeTag(z)}`, z.type === "full" ? "完全托管：域名的 NS 指向本平台，全部 DNS 记录在这里管理。" : z.type === "cert" ? "仅证书：本平台只为这个域名签发和续期证书（在“SSL/TLS”里管理），不解析、不代理。DNS 留在原服务商，只需加一条 _acme-challenge CNAME。" : "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来。", z.type === "cert" ? "" : btn("zoneKind", z.type === "full" ? "改为 CNAME 接入" : "改为完全托管 (NS)")) +
         setRow(z.paused ? "恢复域名" : "暂停域名", z.paused ? "域名已暂停：已代理的记录直接解析到源站。" : "停止代理，已代理的记录直接解析到源站，不经过 CDN 与 WAF。", btn("zonePause", z.paused ? "恢复" : "暂停"))) +
       card("删除", "", setRow("删除域名", "删除这个域名及其全部记录、规则和证书，无法恢复。", btn("zoneDel", "删除域名", {}, "outbad")), "danger") };
   },
@@ -1419,7 +1419,7 @@ function shell(v) {
   const collapsed = localStorage.getItem("cf_sidebar_collapsed") === "1";
   const activeView = (S.view === "kv" || S.view === "d1") ? "workers" : S.view;
   const side = z
-    ? `<a class="sb-back" href="#/zones" title="账户主页">${IC.back}<span class="nv-lbl">账户主页</span></a><div class="sb-zn"><b>${esc(z.name)}</b><span>${z.type === "full" ? "完全托管" : "CNAME 接入"}${z.paused ? " · 已暂停" : ""}</span></div>` +
+    ? `<a class="sb-back" href="#/zones" title="账户主页">${IC.back}<span class="nv-lbl">账户主页</span></a><div class="sb-zn"><b>${esc(z.name)}</b><span>${z.type === "full" ? "完全托管" : z.type === "cert" ? "仅证书" : "CNAME 接入"}${z.paused ? " · 已暂停" : ""}</span></div>` +
       ZNAV.map(([k, t, i]) => `${k === "manage" ? "<hr>" : ""}<a class="nv ${S.tab === k ? "on" : ""}" href="${zh(k)}" title="${esc(t)}"${S.tab === k ? ' aria-current="page"' : ""}>${IC[i]}<span class="nv-lbl">${t}</span></a>`).join("")
     : `<div class="sb-lbl">账户导航</div>` + NAV.filter(n => !n[3] || me.role === n[3]).map(([k, t, i]) => `<a class="nv ${activeView === k ? "on" : ""}" href="#/${k}" title="${esc(t)}"${activeView === k ? ' aria-current="page"' : ""}>${IC[i]}<span class="nv-lbl">${t}</span></a>`).join("");
   const theme = getThemePref();
@@ -1640,7 +1640,7 @@ const A = {
   oauthProvDel: d => del("/oauth/providers/" + d.id, "身份源"),
   zoneAdd: () => openForm("添加域名", [
     { k: "name", label: "域名", hint: "如 example.com" },
-    { k: "type", label: "接入方式", type: "select", options: [["full", "完全托管：把域名的 NS 指向本平台，全部 DNS 记录在这里管理"], ["partial", "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来"]] },
+    { k: "type", label: "接入方式", type: "select", options: [["full", "完全托管：把域名的 NS 指向本平台，全部 DNS 记录在这里管理"], ["partial", "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来"], ["cert", "仅证书：只为这个域名签发和续期证书（如泛域名），给反向代理等使用；不解析、不代理"]] },
   ], {}, v => api("POST", "/zones", v)),
   zoneKind: async () => {
     const full = C.zone.type === "full";
