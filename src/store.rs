@@ -197,6 +197,9 @@ pub struct Tombstones {
     /// (Left out while empty: nodes that know no alert channels compute the same version.)
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub alert_channels: BTreeMap<String, SyncMeta>,
+    /// (Left out while empty, like alert channels.)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub challenge_widgets: BTreeMap<String, SyncMeta>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -245,6 +248,10 @@ pub struct Data {
     /// configuration version stays the one nodes without alerts compute.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alert_channels: Vec<crate::alerts::AlertChannel>,
+    /// The human checks sites embed (see crate::edge::widget); left out
+    /// while empty, so that the configuration version stays the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub challenge_widgets: Vec<crate::edge::widget::ChallengeWidget>,
     /// Replication epoch UUID (changes if state is re-initialized).
     #[serde(default)]
     pub epoch: String,
@@ -705,6 +712,9 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
     for c in &mut d.alert_channels {
         bump(&mut c.sync);
     }
+    for w in &mut d.challenge_widgets {
+        bump(&mut w.sync);
+    }
     if let Some(l) = &mut d.acme_lease {
         bump(&mut l.sync);
     }
@@ -761,6 +771,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         node_telemetry,
         ip_lists,
         alert_channels,
+        challenge_widgets,
     );
     sync_telemetry_projections(d);
     clock.advance_floor(max_ver.0, max_ver.1);
@@ -798,6 +809,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.node_telemetry, durable_ttl_ms);
     prune(&mut d.tombstones.ip_lists, durable_ttl_ms);
     prune(&mut d.tombstones.alert_channels, durable_ttl_ms);
+    prune(&mut d.tombstones.challenge_widgets, durable_ttl_ms);
     prune(&mut d.tombstones.purges, ephemeral_ttl_ms);
     prune(&mut d.tombstones.acme_challenges, ephemeral_ttl_ms);
 }
@@ -855,6 +867,8 @@ struct ConfigDeltaPayload {
     acme_lease: Option<AcmeLease>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     alert_channels: Vec<crate::alerts::AlertChannel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    challenge_widgets: Vec<crate::edge::widget::ChallengeWidget>,
     tombstones: Tombstones,
 }
 
@@ -1354,6 +1368,33 @@ impl Store {
     pub async fn delete_alert_channel_async(&self, id: &str) -> Result<(), StoreError> {
         let id_owned = id.to_string();
         self.mutate_async(move |d, clock, sync_node| apply_delete_alert_channel(d, clock, sync_node, &id_owned)).await
+    }
+
+    // ---- challenge widgets (see crate::edge::widget) ----
+
+    pub fn list_challenge_widgets(&self) -> Vec<crate::edge::widget::ChallengeWidget> {
+        self.data.lock().unwrap().challenge_widgets.clone()
+    }
+
+    pub fn get_challenge_widget(&self, id: &str) -> Option<crate::edge::widget::ChallengeWidget> {
+        self.data.lock().unwrap().challenge_widgets.iter().find(|w| w.id == id).cloned()
+    }
+
+    /// Create (`id` none) or change a widget. `secret_sha256`: the digest of
+    /// a new secret, for a creation or a rotation; otherwise the stored one stays.
+    pub async fn save_challenge_widget_async(
+        &self,
+        id: Option<&str>,
+        body: serde_json::Value,
+        secret_sha256: Option<String>,
+    ) -> Result<crate::edge::widget::ChallengeWidget, StoreError> {
+        let id_owned = id.map(str::to_string);
+        self.mutate_async(move |d, clock, sync_node| apply_save_challenge_widget(d, clock, sync_node, id_owned.as_deref(), body, secret_sha256)).await
+    }
+
+    pub async fn delete_challenge_widget_async(&self, id: &str) -> Result<(), StoreError> {
+        let id_owned = id.to_string();
+        self.mutate_async(move |d, clock, sync_node| apply_delete_challenge_widget(d, clock, sync_node, &id_owned)).await
     }
 
     // ---- local proxy rules ----
@@ -1929,6 +1970,37 @@ fn apply_delete_alert_channel(d: &mut Data, clock: &HlcClock, sync_node: &str, i
     Ok(())
 }
 
+fn apply_save_challenge_widget(
+    d: &mut Data,
+    clock: &HlcClock,
+    sync_node: &str,
+    id: Option<&str>,
+    body: serde_json::Value,
+    secret_sha256: Option<String>,
+) -> Result<crate::edge::widget::ChallengeWidget, StoreError> {
+    let old = match id {
+        Some(id) => Some(d.challenge_widgets.iter().find(|w| w.id == id).cloned().ok_or(StoreError::NotFound)?),
+        None => None,
+    };
+    let mut widget = crate::edge::widget::ChallengeWidget::build(old.as_ref(), body, secret_sha256, d.challenge_widgets.len())?;
+    (widget.id, widget.created_on, widget.modified_on) = stamp(&d.challenge_widgets, id, |w| &w.id, |w| &w.created_on);
+    widget.sync = stamp_next(d, clock, sync_node, false);
+    d.tombstones.challenge_widgets.remove(&widget.id);
+    upsert(&mut d.challenge_widgets, widget.clone(), |w| &w.id);
+    Ok(widget)
+}
+
+fn apply_delete_challenge_widget(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str) -> Result<(), StoreError> {
+    let before = d.challenge_widgets.len();
+    d.challenge_widgets.retain(|w| w.id != id);
+    if d.challenge_widgets.len() == before {
+        return Err(StoreError::NotFound);
+    }
+    let tomb = stamp_next(d, clock, sync_node, true);
+    d.tombstones.challenge_widgets.insert(id.to_string(), tomb);
+    Ok(())
+}
+
 fn apply_save_proxy_rule(
     d: &mut Data,
     clock: &HlcClock,
@@ -2477,6 +2549,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             .collect(),
         acme_lease: d.acme_lease.as_ref().filter(|l| full_resync || l.sync.local_rev > since).cloned(),
         alert_channels: d.alert_channels.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
+        challenge_widgets: d.challenge_widgets.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         tombstones: Tombstones {
             zones: filter_tombs(&d.tombstones.zones, since),
             records: filter_tombs(&d.tombstones.records, since),
@@ -2502,6 +2575,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             node_telemetry: filter_tombs(&d.tombstones.node_telemetry, since),
             ip_lists: filter_tombs(&d.tombstones.ip_lists, since),
             alert_channels: filter_tombs(&d.tombstones.alert_channels, since),
+            challenge_widgets: filter_tombs(&d.tombstones.challenge_widgets, since),
         },
     };
     Ok(DomainDelta {
@@ -2707,6 +2781,7 @@ fn merge_delta_data(
     changed |= merge_collection(&mut rev, clock, &mut d.purges, &mut d.tombstones.purges, payload.purges, payload.tombstones.purges, |p| p.id.clone(), |p| &p.sync, |p| &mut p.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.acme_challenges, &mut d.tombstones.acme_challenges, payload.acme_challenges, payload.tombstones.acme_challenges, AcmeChallenge::sync_key, |c| &c.sync, |c| &mut c.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.alert_channels, &mut d.tombstones.alert_channels, payload.alert_channels, payload.tombstones.alert_channels, |c| c.id.clone(), |c| &c.sync, |c| &mut c.sync);
+    changed |= merge_collection(&mut rev, clock, &mut d.challenge_widgets, &mut d.tombstones.challenge_widgets, payload.challenge_widgets, payload.tombstones.challenge_widgets, |w| w.id.clone(), |w| &w.sync, |w| &mut w.sync);
 
     // Keep purge ring bounded by newest `updated_ms`.
     if d.purges.len() > 50 {

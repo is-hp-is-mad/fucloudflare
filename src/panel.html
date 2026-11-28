@@ -1506,6 +1506,7 @@ const NAV = [
   ["workers", "Workers & 存储", "code"],
   ["proxy", "反向代理 (Caddy)", "proxy"],
   ["alerts", "告警", "bolt"],
+  ["challenges", "人机验证", "shield"],
   ["account", "账户与安全", "lock"],
   ["users", "用户与审计", "shield", "admin"],
 ];
@@ -2129,6 +2130,46 @@ Object.assign(A, {
   v => api(d.id ? "PUT" : "POST", "/alerts/channels" + (d.id ? "/" + d.id : ""), v)),
   alertDel: d => del("/alerts/channels/" + d.id, "这个告警通道"),
   alertTest: async d => { await api("POST", `/alerts/channels/${d.id}/test`); toast("测试消息已送达"); },
+});
+
+// ----------------------------------------------------------- challenges ----
+// Human-check widgets that sites put into their own pages (Turnstile-like). The
+// secret is in the answer to a creation or a rotation only, so it is shown once.
+const widgetSnippet = w => `<script src="/cdn-cgi/challenge-platform/widget.js" async defer></` + `script>\n<div data-sitekey="${w.sitekey}"></div>`;
+const widgetVerifyUrl = w => `https://${w.domains[0]}/cdn-cgi/challenge-platform/siteverify`;
+const secretBox = (title, w) => showBox(title, `<p>密钥<b>只显示这一次</b>，请马上存到网站后端：</p><div class="secret">${esc(w.secret)}</div><button type="button" data-copy="${esc(w.secret)}">复制</button>
+  <p class="hint">后端校验：<span class="mono">curl -d secret=… -d response=… ${esc(widgetVerifyUrl(w))}</span></p>`, "我已保存");
+async function viewChallenges() {
+  const widgets = await api("GET", "/challenges/widgets");
+  C.widgets = widgets;
+  const admin = me.role === "admin";
+  const list = card(`组件 <span class="cnt">${widgets.length}</span>`, "", table([
+    { label: "名称", fmt: w => `<b>${esc(w.name)}</b>` },
+    { label: "Sitekey", fmt: w => `<span class="mono">${esc(w.sitekey)}</span> <button type="button" class="lk" data-copy="${esc(w.sitekey)}">复制</button>` },
+    { label: "域名", fmt: w => chips(w.domains) },
+    { label: "嵌入代码", fmt: w => `<button type="button" class="lk" data-copy="${esc(widgetSnippet(w))}">复制嵌入代码</button>` },
+    { label: "修改于", fmt: w => when(w.modified_on) },
+  ], widgets, admin ? w => lk("widgetRotate", "轮换密钥", { id: w.id }) + rowActs("widgetEdit", "widgetDel", { id: w.id }) : null,
+    `<b>还没有人机验证组件</b>建一个，把嵌入代码放进网站的表单，后端用密钥调 siteverify 校验。${admin ? "<br><br>" + btn("widgetEdit", "添加组件", {}, "pri") : ""}`));
+  return { title: "人机验证", sub: "网站自己的页面里嵌入的人机验证，用法同 Turnstile：页面拿到的令牌 5 分钟内有效、只能用一次，并且只认组件里列出的、经过边缘代理的域名。密钥只在创建和轮换时显示一次。",
+    acts: admin ? btn("widgetEdit", "添加组件", {}, "pri") : "", body: list };
+}
+Object.assign(VIEWS, { challenges: viewChallenges });
+Object.assign(A, {
+  widgetEdit: d => openForm(d.id ? "编辑人机验证组件" : "添加人机验证组件", [
+    { k: "name", label: "名称" },
+    { k: "domains", label: "域名", type: "list", hint: "完整的主机名，如 shop.example.com（不支持通配符），最多 10 个；必须是开了代理的域名" },
+  ], d.id ? byId("widgets", d.id) : {},
+  async v => {
+    const w = await api(d.id ? "PUT" : "POST", "/challenges/widgets" + (d.id ? "/" + d.id : ""), { name: v.name, domains: v.domains });
+    if (!d.id) setTimeout(() => secretBox("组件已创建", w), 50);
+  }),
+  widgetDel: d => del("/challenges/widgets/" + d.id, "这个人机验证组件"),
+  widgetRotate: async d => {
+    if (!(await confirmBox("轮换这个组件的密钥？", "会生成新的密钥，旧的立即失效，网站后端要马上换上新的。", "轮换", false))) return;
+    const w = await api("POST", `/challenges/widgets/${d.id}/rotate_secret`, { invalidate_immediately: true });
+    await secretBox("密钥已轮换", w); render();
+  },
 });
 
 document.addEventListener("click", e => {

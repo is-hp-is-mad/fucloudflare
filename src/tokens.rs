@@ -77,12 +77,15 @@ pub enum Area {
     /// IP lists (crate::lists): kept for the whole account, used by the
     /// rules of any zone.
     Lists,
+    /// The human-check widgets that sites embed (crate::edge::widget), kept
+    /// for the whole account like Cloudflare's Turnstile sites.
+    Turnstile,
 }
 
 impl Area {
     fn scope(self) -> Scope {
         match self {
-            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup | Area::Lists | Area::Notifications => {
+            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup | Area::Lists | Area::Notifications | Area::Turnstile => {
                 Scope::Account
             }
             Area::Tokens => Scope::User,
@@ -151,6 +154,8 @@ groups! {
     "9766e73b0e034208a4262fa492b80b2a" "Account Filter Lists Write" Lists true "Change IP lists and their items (the rules that use a list follow it)";
     "88f2d624e0de496d81a02bd4776852a1" "Notifications Read" Notifications false "Read alert channels (secrets masked) and the alerts that fire";
     "8b36fa19ef584f57aa26509f91963eb5" "Notifications Write" Notifications true "Change alert channels and send test messages";
+    "7fcfc7f29e92439b935403501f842172" "Turnstile Sites Read" Turnstile false "Read the human-check widgets (never their secrets)";
+    "3c07d4b298994a9397d3f2df9c6efe4e" "Turnstile Sites Write" Turnstile true "Create, change and delete human-check widgets and rotate their secrets";
     "0cc3a61731504c89b99ec1be78b77aa0" "API Tokens Read" Tokens false "List your API tokens";
     "686d18d5ac6c441c867cbf6771e58a0a" "API Tokens Write" Tokens true "Create, change, roll and delete your API tokens";
 }
@@ -217,6 +222,7 @@ pub fn need(path: &str) -> Need {
         ["alerts", ..] => Need::Account(Area::Notifications),
         ["analytics", ..] => Need::Account(Area::AccountAnalytics),
         ["rules", "lists", ..] => Need::Account(Area::Lists),
+        ["challenges", "widgets", ..] => Need::Account(Area::Turnstile),
         ["fleet", ..] | ["nodes", ..] | ["steering", ..] | ["proxy", ..] | ["system", ..] | ["releases", ..] | ["warp", ..] | ["email", "status"] => {
             Need::Account(Area::Fleet)
         }
@@ -459,6 +465,9 @@ mod tests {
         assert_eq!(need("/zones/z1/rulesets"), Need::Zone(Area::Firewall, Some("z1".into())));
         assert_eq!(need("/alerts/channels/c1/test"), Need::Account(Area::Notifications));
         assert_eq!(need("/alerts/active"), Need::Account(Area::Notifications));
+        assert_eq!(need("/challenges/widgets"), Need::Account(Area::Turnstile));
+        assert_eq!(need("/challenges/widgets/k1/rotate_secret"), Need::Account(Area::Turnstile));
+        assert_eq!(need("/challenges"), Need::Closed);
         assert_eq!(
             need("/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint"),
             Need::Zone(Area::CacheRules, Some("z1".into()))

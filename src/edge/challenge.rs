@@ -60,7 +60,8 @@ impl Level {
         }
     }
 
-    fn code(self) -> char {
+    /// One letter for the level, as tickets carry it.
+    pub(super) fn code(self) -> char {
         match self {
             Level::Off => 'o',
             Level::Low => 'l',
@@ -70,7 +71,7 @@ impl Level {
         }
     }
 
-    fn from_code(c: &str) -> Option<Level> {
+    pub(super) fn from_code(c: &str) -> Option<Level> {
         Some(match c {
             "o" => Level::Off,
             "l" => Level::Low,
@@ -146,7 +147,8 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn ua_digest(ua: &str) -> String {
+/// What a ticket keeps of the User-Agent it was issued to.
+pub(super) fn ua_digest(ua: &str) -> String {
     crate::release::sha256_hex(ua.as_bytes())[..16].to_string()
 }
 

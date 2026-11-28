@@ -882,6 +882,91 @@ curl -s -X POST $BASE/alerts/channels -H "Authorization: Bearer $TOKEN" -d '{
 }'
 ```
 
+### Human-check widgets (Turnstile-like)
+
+A widget puts the edge's challenge (the same detection and proof of work as a zone's challenge)
+into a site's own forms, and lets the site's backend check what came back, in the manner of
+Cloudflare Turnstile. Widgets belong to the account, like Turnstile sites; the id is the public
+sitekey.
+
+```
+GET    /challenges/widgets                         (also /accounts/{account_id}/challenges/widgets[...])
+POST   /challenges/widgets                         {"name", "domains": ["shop.example.com", ...], "mode": "managed"}
+                                                   the answer holds "secret": the only time it is shown
+GET    /challenges/widgets/{sitekey}
+PUT    /challenges/widgets/{sitekey}  PATCH        the fields given change (PUT and PATCH alike); the secret stays
+DELETE /challenges/widgets/{sitekey}
+POST   /challenges/widgets/{sitekey}/rotate_secret {} or {"invalidate_immediately": true}; the answer holds the
+                                                   new "secret", and the old one stops working at once
+```
+
+A widget reads back as `{"id", "sitekey", "name", "domains", "mode", "created_on", "modified_on"}`:
+never the secret or anything derived from it. Only the secret's SHA-256 is stored (and synced
+between nodes, and kept in backups); a lost secret can only be replaced by rotating it.
+
+- `domains`: 1 to 10 exact host names, lowercase (they are lowercased), at least two labels, no
+  wildcards, ports, paths or addresses. Each one a page may use the widget on; the puzzle is only
+  handed out on a host that is one of them and that a zone here proxies.
+- `name`: 1 to 254 characters, no control characters.
+- `mode`: only `managed` (a click is asked for when the browser looks doubtful; the puzzle is
+  never easier than a zone at `medium`, and as hard as the zone's when that is `high` or
+  `under_attack`).
+- Cloudflare's other fields are accepted at their defaults only (`bot_fight_mode`, `offlabel`,
+  `ephemeral_id`: false; `clearance_level`: `no_clearance`; `region`: `world`); `secret`,
+  `secret_sha256` and any other field are refused. `rotate_secret` with
+  `"invalidate_immediately": false` is refused, since there is no grace period for the old secret.
+- At most 50 widgets. Writes need an administrator (editors and viewers read); API tokens need
+  Turnstile Sites Read / Write, which Fleet permissions do not include.
+
+The page:
+
+```html
+<form method="post" action="/sign-up">
+  <script src="/cdn-cgi/challenge-platform/widget.js" async defer></script>
+  <div data-sitekey="0123456789abcdef0123456789abcdef"></div>
+  <button>Sign up</button>
+</form>
+```
+
+The script is loaded from the page's own host (every proxied host has it). It fetches its puzzle
+from `/cdn-cgi/challenge-platform/widget/ticket` and answers it at
+`/cdn-cgi/challenge-platform/widget/verify`, both on the page's own host: no CORS is offered,
+and requests a browser marks as cross-site are refused. A browser that passes gets a token, which
+the script writes into a hidden `fcf-challenge-response` field inside the element, and the element
+fires `fcf-challenge-success` (`event.detail.token`). A token is refreshed a little before its five
+minutes are up (`fcf-challenge-expired`); a failure fires `fcf-challenge-error` and shows a retry
+link. `window.fcfChallenge` has `render(el)` for elements added later, `reset(el)` for a new token
+(after a form was sent, since each token is accepted once) and `getResponse(el)`.
+
+The backend:
+
+```sh
+curl -s https://shop.example.com/cdn-cgi/challenge-platform/siteverify \
+  -d secret=fcfws_test-secret -d response="$TOKEN_FROM_THE_FORM" -d remoteip=198.51.100.7
+# {"success":true,"error-codes":[],"challenge_ts":"2026-11-28T12:00:30.000Z","hostname":"shop.example.com"}
+```
+
+- `POST` only, as `application/x-www-form-urlencoded` or `application/json` (string fields; a
+  field given twice in a form is refused), at most 16 KiB. It answers on any host a zone here
+  proxies and on the panel's host, over HTTPS only (plain HTTP from the node itself aside).
+- A token is good for five minutes, for the widget it was made for, on one of that widget's
+  domains, and once: a second check of the same token on the same node fails with
+  `timeout-or-duplicate`. The edge cannot tell the nodes apart in time, so a backend that checks a
+  token against two different nodes could have it accepted twice: check each token once.
+- `remoteip` is optional. When it is given it must be the address the browser had when it got the
+  token (IPv4 and IPv6 forms of one address are the same); otherwise the token is refused, which is
+  stricter than Turnstile.
+- Error codes: `missing-input-secret`, `invalid-input-secret` (no widget has that secret),
+  `missing-input-response`, `invalid-input-response` (not a token of this widget, or of another
+  host or address), `timeout-or-duplicate`, `bad-request` (not a POST, too large, not a form or JSON,
+  an unreadable `remoteip`, or a host that does not answer siteverify), `internal-error` (this node
+  remembers too many tokens to take a new one; try again). Nothing about a token, or about whether
+  a sitekey exists, is said before the secret is right.
+- `challenge_ts` and `hostname` are only in a successful answer. `idempotency_key` is not
+  supported (it is ignored).
+- A token is no clearance for the zone's own challenge, and the zone's clearance cookie is no
+  token: each is signed under a prefix of its own.
+
 ### Between nodes
 
 These are for the fleet itself (the API token or a peer's credentials), not for tools:

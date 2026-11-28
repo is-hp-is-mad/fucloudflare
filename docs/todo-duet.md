@@ -175,7 +175,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 只对页面请求排队；`/cdn-cgi/`、已有 Cookie 的后续请求、防火墙 `skip` 的请求不排队。
 - 测试：名额与速率；Cookie 的签名与过期；先到先放行；伪造 Cookie 无效。
 
-### [ ] T9 人机验证对外开放
+### [x] T9 人机验证对外开放
 
 - 目标：让任意页面嵌入我们的人机验证，并由后端校验结果（相当于 Turnstile）。
 - 全局对象 `ChallengeWidget { id（即 sitekey）, name, domains, secret, … }`，`secret` 只在创建时返回一次。
@@ -284,6 +284,12 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 放行 Cookie 和排队票都用 `Waf::mac` 签名、`mac_ok` 校验，只认规范写法；会话过半时打开页面会续期。排队按到达秒先到先放，120 秒没刷新或已经用过的票作废。排队页返回 200、`no-store`、`Retry-After: 20`。名额按节点各自计算，状态只在内存里且有上限。
 - 只有 GET/HEAD 的页面请求排队；`/cdn-cgi/`、`skip` 放行、暂停的域名不排队。路径先解码百分号转义、合并连续的 `/` 再匹配前缀，`/%73hop`、`//shop` 绕不过 `/shop`。令牌新开 `Waiting Rooms Read / Write`，面板在 网络与协议 → 等候室。
 - 没把握：字段名没有照 Cloudflare（`path` / `session_duration`）；Rulesets 的 skip 现在也会跳过等候室；前缀区分大小写；用编码路径访问的人带不上 Path 为前缀的 Cookie，会一直排队；多个节点时源站可能看到名额的节点数倍；给 `public` 的响应加 Set-Cookie 时没改 Cache-Control。
+
+### T9
+- 新文件 `src/edge/widget.rs` 和 `src/edge/challenge-widget.js`：组件对象、令牌和题目的签名（各有自己的前缀和标签，和域名自己的验证 Cookie 互不通用）、防重放、四个 `/cdn-cgi/challenge-platform` 端点和 siteverify，复用 challenge.rs 的检测和计算（challenge.rs 只把 3 个函数改成 `pub(super)`）。
+- 接线照 `alert_channels`：store.rs 的 `challenge_widgets`，api.rs 的 `/challenges/widgets`（也认 `/accounts/{id}/challenges/widgets`，写操作只给管理员），tokens.rs 新开 Turnstile Sites Read / Write，面板导航加"人机验证"页。
+- 密钥只存 SHA-256、只在创建和轮换时显示一次；令牌 5 分钟、绑定 sitekey、主机名和 IP，同一节点只认一次，记录满了就拒绝；只给开了代理、列在 domains 里的精确主机名发题，不开放跨域。
+- 没把握：防重放按节点算，跨节点会多认一次；轮换没有宽限期；只支持 managed 模式；`remoteip` 不一致直接拒绝，比 Turnstile 严；`/cdn-cgi/` 不经过域名的 WAF 和限流；前端脚本只做了语法检查，没在浏览器里跑过。
 
 ### T10
 - 新增 src/dkim.rs：私钥存在 `Zone.email_dkim`，不放在 settings 里，所以 API 永远不返回私钥。通过 `PATCH /zones/{id}/email` 设置 `dkim_selector` 和 `dkim_private_key`；私钥留空就保留原来的，选择器为 null 或空就移除。

@@ -219,6 +219,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/alerts/channels/{channel_id}", get(get_alert_channel).put(update_alert_channel).patch(update_alert_channel).delete(delete_alert_channel))
         .route("/alerts/channels/{channel_id}/test", post(test_alert_channel))
         .route("/alerts/active", get(active_alerts))
+        .route("/challenges/widgets", get(list_challenge_widgets).post(create_challenge_widget))
+        .route("/challenges/widgets/{sitekey}", get(get_challenge_widget).put(update_challenge_widget).patch(update_challenge_widget).delete(delete_challenge_widget))
+        .route("/challenges/widgets/{sitekey}/rotate_secret", post(rotate_challenge_widget_secret))
         .route("/zones/{zone_id}/logs/requests", get(request_log))
         .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
         .merge(crud::<crate::edge::waiting::WaitingRoom>("/zones/{zone_id}/waiting_rooms"))
@@ -232,7 +235,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn(security_headers))
         .with_state(state);
     // Cloudflare's account-level paths (`/accounts/{id}/workers/...`, `.../storage/kv/...`,
-    // `.../d1/...`, `.../tokens`, `.../rules/lists`) are the same as the ones here without the account
+    // `.../d1/...`, `.../tokens`, `.../rules/lists`, `.../challenges/widgets`) are the same as the ones here without the account
     let inner = app.clone();
     let by_account = axum::routing::any(move |req: Request| {
         let mut inner = inner.clone();
@@ -266,6 +269,8 @@ fn account_path(mut req: Request) -> Result<Request, ApiError> {
     } else if under("audit_logs") {
         "/audit".to_string()
     } else if under("rules/lists") {
+        format!("/{rest}")
+    } else if under("challenges/widgets") {
         format!("/{rest}")
     } else {
         return Err(ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()));
@@ -435,7 +440,7 @@ async fn client_of(mut req: Request, next: Next) -> Response {
 /// May somebody with this role make this request? Everybody may look after
 /// their own account; viewers only read; users, the audit trail, releases,
 /// nodes, spectrum listeners, what nodes are told to do and where alerts go
-/// are the administrators'.
+/// are the administrators', and so are changes to the human-check widgets.
 fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
     let under = |prefix: &str| path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'));
     let reads = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
@@ -448,7 +453,9 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
         || path.starts_with("/releases/")
         || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || under("/alerts") || path.contains("/spectrum/apps")))
         // a log job sends visitor addresses off this fleet
-        || (!reads && path.contains("/logpush/jobs"));
+        || (!reads && path.contains("/logpush/jobs"))
+        // a widget's secret is shown to whoever creates or rotates it
+        || (!reads && under("/challenges"));
     match role {
         Role::Admin => true,
         Role::Editor => own || !admins,
@@ -3136,6 +3143,60 @@ async fn active_alerts() -> ApiResult {
     ok(crate::alerts::active())
 }
 
+// ------------------------------------------------ challenge widgets ----
+// (the check itself and siteverify: crate::edge::widget). Only a digest of
+// a widget's secret is kept; the secret is in the answer to its creation
+// and to a rotation, and nowhere else.
+
+async fn list_challenge_widgets(State(st): St) -> ApiResult {
+    ok(Value::Array(st.store.list_challenge_widgets().iter().map(crate::edge::widget::ChallengeWidget::public).collect()))
+}
+
+async fn get_challenge_widget(State(st): St, Path(sitekey): Path<String>) -> ApiResult {
+    ok(st.store.get_challenge_widget(&sitekey).ok_or(StoreError::NotFound)?.public())
+}
+
+/// A fresh secret from the system's randomness, as the secret and its digest.
+fn new_widget_secret() -> Result<(String, String), ApiError> {
+    crate::edge::widget::new_secret().ok_or_else(|| ApiError(StatusCode::INTERNAL_SERVER_ERROR, 1000, "no randomness for a secret".into()))
+}
+
+async fn create_challenge_widget(State(st): St, bytes: Bytes) -> ApiResult {
+    let request: Value = body(&bytes)?;
+    let (secret, digest) = new_widget_secret()?;
+    ok(st.store.save_challenge_widget_async(None, request, Some(digest)).await?.with_secret(&secret))
+}
+
+/// PUT and PATCH alike: the fields given change, the secret stays.
+async fn update_challenge_widget(State(st): St, Path(sitekey): Path<String>, bytes: Bytes) -> ApiResult {
+    let request: Value = body(&bytes)?;
+    ok(st.store.save_challenge_widget_async(Some(&sitekey), request, None).await?.public())
+}
+
+async fn delete_challenge_widget(State(st): St, Path(sitekey): Path<String>) -> ApiResult {
+    st.store.delete_challenge_widget_async(&sitekey).await?;
+    ok(json!({ "id": sitekey, "sitekey": sitekey }))
+}
+
+/// A new secret; the old one stops working at once. Cloudflare keeps the
+/// old one for two hours unless `invalidate_immediately` is true: here
+/// only the immediate kind exists, so `false` is refused rather than
+/// quietly treated as true.
+async fn rotate_challenge_widget_secret(State(st): St, Path(sitekey): Path<String>, bytes: Bytes) -> ApiResult {
+    st.store.get_challenge_widget(&sitekey).ok_or(StoreError::NotFound)?;
+    let request: Value = if bytes.iter().all(u8::is_ascii_whitespace) { json!({}) } else { body(&bytes)? };
+    let Value::Object(request) = request else { return Err(bad("request body must be a JSON object")) };
+    for (key, value) in &request {
+        match key.as_str() {
+            "invalidate_immediately" if value == &json!(true) => {}
+            "invalidate_immediately" => return Err(bad("invalidate_immediately: only true is supported (the old secret stops working at once)")),
+            other => return Err(bad(format!("unknown field '{other}'"))),
+        }
+    }
+    let (secret, digest) = new_widget_secret()?;
+    ok(st.store.save_challenge_widget_async(Some(&sitekey), json!({}), Some(digest)).await?.with_secret(&secret))
+}
+
 // ------------------------------------------------ local proxy rules ----
 
 async fn list_proxy_rules(State(st): St) -> ApiResult {
@@ -4209,6 +4270,146 @@ mod tests {
             assert!(!String::from_utf8_lossy(&b).contains("test-secret"));
         }
         assert!(st.store.get_alert_channel(&tg_id).is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn challenge_widgets_show_their_secret_once_and_only_administrators_change_them() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-widgets-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("edit@example.com", Role::Editor, Some("editor-pass-123"), "edit@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("view@example.com", Role::Viewer, Some("viewer-pass-123"), "view@example.com", &Client::default()).unwrap();
+        let session = |email: &str, password: &str| match st.accounts.login(email, password, &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let admin = session("admin@example.com", "strong-pass-123");
+        let editor = session("edit@example.com", "editor-pass-123");
+        let viewer = session("view@example.com", "viewer-pass-123");
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let as_who = |auth: &str| -> Vec<(&'static str, String)> { vec![("authorization", auth.to_string()), ("content-type", "application/json".to_string())] };
+        let base = format!("/client/v4/accounts/{}/challenges/widgets", crate::tokens::account_id());
+
+        // made: the answer holds the secret, the store only its digest
+        let widget = json!({ "name": "sign-up form", "domains": ["Shop.Example.com", "www.example.net"], "mode": "managed" });
+        let (sc, b) = call(&mut app, "POST", &base, widget.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let made = json_of(&b)["result"].clone();
+        let sitekey = made["sitekey"].as_str().unwrap().to_string();
+        let secret = made["secret"].as_str().unwrap().to_string();
+        assert_eq!(made["id"], json!(sitekey));
+        assert_eq!(made["domains"], json!(["shop.example.com", "www.example.net"]));
+        assert!(secret.starts_with("fcfws_") && secret.len() == 6 + 64);
+        let kept = st.store.get_challenge_widget(&sitekey).unwrap();
+        assert_eq!(kept.secret_sha256, crate::release::sha256_hex(secret.as_bytes()));
+        assert!(!serde_json::to_string(&kept).unwrap().contains(&secret));
+
+        // read back in every way: no secret, no digest, no sync data
+        let shown_nowhere = |text: &str| !text.contains(&secret) && !text.contains(&kept.secret_sha256) && !text.contains("secret") && !text.contains("\"sync\"");
+        for path in [base.clone(), format!("{base}/{sitekey}"), "/client/v4/challenges/widgets".to_string()] {
+            let (sc, b) = call(&mut app, "GET", &path, vec![]).await;
+            let text = String::from_utf8_lossy(&b).to_string();
+            assert_eq!(sc, StatusCode::OK, "{path}");
+            assert!(shown_nowhere(&text), "{path}: {text}");
+        }
+        // changed: the secret stays, and is not shown
+        let (sc, b) = call(&mut app, "PUT", &format!("{base}/{sitekey}"), json!({ "name": "renamed", "sitekey": sitekey }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(shown_nowhere(&String::from_utf8_lossy(&b)));
+        assert_eq!(st.store.get_challenge_widget(&sitekey).unwrap().secret_sha256, kept.secret_sha256);
+
+        // rotated: a new secret, once; the old digest is gone
+        let (sc, b) = call(&mut app, "POST", &format!("{base}/{sitekey}/rotate_secret"), br#"{"invalidate_immediately":true}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let rotated = json_of(&b)["result"]["secret"].as_str().unwrap().to_string();
+        assert_ne!(rotated, secret);
+        assert_eq!(st.store.get_challenge_widget(&sitekey).unwrap().secret_sha256, crate::release::sha256_hex(rotated.as_bytes()));
+        let (sc, _) = call(&mut app, "POST", &format!("{base}/{sitekey}/rotate_secret"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (_, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert!(!String::from_utf8_lossy(&b).contains(&rotated));
+
+        // refused, and nothing changes
+        let before = st.store.get_challenge_widget(&sitekey).unwrap();
+        for (method, path, body) in [
+            ("POST", base.clone(), json!({ "name": "x", "domains": [] })),
+            ("POST", base.clone(), json!({ "name": "x", "domains": ["*.example.com"] })),
+            ("POST", base.clone(), json!({ "name": "x", "domains": ["192.0.2.1"] })),
+            ("POST", base.clone(), json!({ "name": "x", "domains": ["example.com"], "mode": "invisible" })),
+            ("POST", base.clone(), json!({ "name": "x", "domains": ["example.com"], "secret": "test-secret" })),
+            ("POST", base.clone(), json!({ "name": "x", "domains": ["example.com"], "sitekey": "0123456789abcdef0123456789abcdef" })),
+            ("POST", base.clone(), json!({ "name": "", "domains": ["example.com"] })),
+            ("POST", base.clone(), json!(["not", "an", "object"])),
+            ("PATCH", format!("{base}/{sitekey}"), json!({ "secret_sha256": "00".repeat(32) })),
+            ("PATCH", format!("{base}/{sitekey}"), json!({ "sitekey": "0123456789abcdef0123456789abcdef" })),
+            ("PATCH", format!("{base}/{sitekey}"), json!({ "clearance_level": "managed" })),
+            ("POST", format!("{base}/{sitekey}/rotate_secret"), json!({ "invalidate_immediately": false })),
+            ("POST", format!("{base}/{sitekey}/rotate_secret"), json!({ "keep_old": true })),
+        ] {
+            let (sc, b) = call(&mut app, method, &path, body.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{method} {path} {body}: {}", String::from_utf8_lossy(&b));
+        }
+        let (sc, _) = call(&mut app, "POST", &base, b"not json".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let after = st.store.get_challenge_widget(&sitekey).unwrap();
+        assert_eq!((&after.secret_sha256, &after.domains, st.store.list_challenge_widgets().len()), (&before.secret_sha256, &before.domains, 1));
+        for (method, path) in [
+            ("GET", format!("{base}/0123456789abcdef0123456789abcdef")),
+            ("PUT", format!("{base}/0123456789abcdef0123456789abcdef")),
+            ("DELETE", format!("{base}/0123456789abcdef0123456789abcdef")),
+            ("POST", format!("{base}/0123456789abcdef0123456789abcdef/rotate_secret")),
+        ] {
+            let (sc, _) = call(&mut app, method, &path, br#"{"name":"x"}"#.to_vec()).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+
+        // roles: viewers and editors read, only administrators change, rotate or delete
+        for who in [&viewer, &editor] {
+            let h = as_who(who);
+            let (sc, _, b) = call_raw(&mut app, "GET", &base, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), vec![]).await;
+            assert_eq!(sc, StatusCode::OK);
+            assert!(String::from_utf8_lossy(&b).contains(&sitekey));
+            for (method, path) in [("POST", base.clone()), ("PATCH", format!("{base}/{sitekey}")), ("POST", format!("{base}/{sitekey}/rotate_secret")), ("DELETE", format!("{base}/{sitekey}"))] {
+                let (sc, _, b) = call_raw(&mut app, method, &path, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), widget.to_string().into_bytes()).await;
+                assert_eq!(sc, StatusCode::FORBIDDEN, "{method} {path}");
+                assert!(!String::from_utf8_lossy(&b).contains("fcfws_"));
+            }
+        }
+        assert_eq!(st.store.get_challenge_widget(&sitekey).unwrap().secret_sha256, after.secret_sha256);
+        assert_eq!(st.store.list_challenge_widgets().len(), 1);
+
+        // tokens: a fleet token is not enough; Turnstile Sites Read reads, Write changes
+        let token_with = |group: &str| {
+            json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.{}", crate::tokens::account_id()): "*" }, "permission_groups": [{ "name": group }] }],
+            })
+        };
+        let mut bearer = HashMap::new();
+        for group in ["Fleet Write", "Turnstile Sites Read", "Turnstile Sites Write"] {
+            let h = as_who(&admin);
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h.iter().map(|(k, v)| (*k, v.as_str())).collect(), token_with(group).to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            bearer.insert(group, format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap()));
+        }
+        let expect = [
+            ("Fleet Write", "GET", base.clone(), StatusCode::FORBIDDEN),
+            ("Fleet Write", "POST", format!("{base}/{sitekey}/rotate_secret"), StatusCode::FORBIDDEN),
+            ("Turnstile Sites Read", "GET", format!("{base}/{sitekey}"), StatusCode::OK),
+            ("Turnstile Sites Read", "POST", format!("{base}/{sitekey}/rotate_secret"), StatusCode::FORBIDDEN),
+            ("Turnstile Sites Read", "DELETE", format!("{base}/{sitekey}"), StatusCode::FORBIDDEN),
+            ("Turnstile Sites Write", "DELETE", format!("{base}/{sitekey}"), StatusCode::OK),
+        ];
+        for (group, method, path, status) in expect {
+            let h = as_who(&bearer[group]);
+            let (sc, _, b) = call_raw(&mut app, method, &path, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), vec![]).await;
+            assert_eq!(sc, status, "{group}: {method} {path}");
+            assert!(!String::from_utf8_lossy(&b).contains("fcfws_"));
+        }
+        assert!(st.store.get_challenge_widget(&sitekey).is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -201,6 +201,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `/cdn-cgi/fucf-trace` | 调试信息，格式同 Cloudflare 的 `/cdn-cgi/trace`（每行 `key=value`） |
 | `/cdn-cgi/fucf-warp`（及其下所有路径） | **预留**：由节点接管，目前一律返回 501。实现位置在 `src/edge/warp.rs`，处理函数拿到完整的请求（方法、子路径、头、流式请求体，HTTP/1.1 下可升级连接）和访客信息。它在边缘缓存里有自己的一块（`warp::cached` / `warp::store`，与各区域的缓存互不影响，共用节点的缓存上限），用 `POST /warp/purge_cache` 在所有节点上清除 |
 | `/cdn-cgi/limit/page.css`、`mark.svg` | 节点限流提示页的资源（见下一节） |
+| `/cdn-cgi/challenge-platform/widget.js`、`widget/ticket`、`widget/verify`、`siteverify` | 人机验证组件的脚本、出题、答题和后端校验（见“人机验证组件”） |
 
 `fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`fucf-<节点名>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
 `colo`（节点名大写）、`http`（`http/1.1` / `http/2` / `http/3`）、`loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、
@@ -510,6 +511,30 @@ DNS 记录的 Cloudflare 兼容补充：
 - `events` 至少选一个；未知的事件名会被拒绝。最多 20 个通道。改通道要管理员；API 令牌要 Notifications Read / Write（Fleet 权限不包括它）。
 - 接口返回里令牌显示为 `***`、Webhook 地址只显示到域名（`https://host/***`）；原样送回打码后的值（或留空）会保留原来的，
   所以面板里改别的字段不会弄丢密钥。通道随配置同步、也在备份里，密钥一起。
+
+## 人机验证组件（兼容 Turnstile 的用法）
+
+把边缘的人机验证（检测和计算与区域的验证是同一套）放进网站自己的表单，网站后端再来问令牌是不是真的（面板：人机验证）。
+组件属于整个账户，id 就是公开的 sitekey；密钥只在创建和轮换时显示一次，存下来的只是它的 SHA-256。
+
+```
+/challenges/widgets[/{sitekey}]          GET POST PUT PATCH DELETE   {"name", "domains": [...], "mode": "managed"}
+/challenges/widgets/{sitekey}/rotate_secret   POST                    换新密钥，旧的立即失效（不支持宽限期）
+/cdn-cgi/challenge-platform/siteverify   POST                         后端校验：secret、response、remoteip（可选）
+```
+
+```html
+<script src="/cdn-cgi/challenge-platform/widget.js" async defer></script>
+<div data-sitekey="0123456789abcdef0123456789abcdef"></div>
+```
+
+- `domains` 写完整的主机名（如 `shop.example.com`），1 到 10 个，不支持通配符；只有其中开了代理的主机名才发题，答题也必须回到同一个主机名，
+  不开放跨域。通过后令牌写进容器里隐藏的 `fcf-challenge-response` 字段，随表单一起提交。
+- 令牌 5 分钟内有效，绑定 sitekey、主机名和访客 IP，同一节点只认一次（换节点校验同一个令牌可能再认一次，所以每个令牌只校验一次）；
+  给了 `remoteip` 就必须和拿令牌时的地址一致，比 Turnstile 严。错误码同 Turnstile：`missing-input-secret`、`invalid-input-secret`、
+  `missing-input-response`、`invalid-input-response`、`timeout-or-duplicate`、`bad-request`、`internal-error`。
+- siteverify 只走 HTTPS（本机回环除外），开了代理的主机名和面板域名上都能用；密钥不对时什么也不说，连 sitekey 存不存在都不说。
+- 令牌不能当区域验证的通行 Cookie 用，反过来也不行。改组件要管理员；API 令牌要 Turnstile Sites Read / Write。
 
 ## 安全级别、IP 纯净度与页面内人机验证
 

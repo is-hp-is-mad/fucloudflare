@@ -21,6 +21,7 @@ pub mod upstream;
 pub mod waf;
 pub mod waiting;
 pub mod warp;
+pub mod widget;
 
 use crate::expr::ReqInfo;
 use crate::store::{Snapshot, Store, ZoneSnap};

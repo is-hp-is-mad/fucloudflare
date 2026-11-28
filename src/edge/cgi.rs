@@ -8,6 +8,8 @@
 //!   `key=value` lines in the manner of Cloudflare's `/cdn-cgi/trace`;
 //! - `/cdn-cgi/fucf-warp` and everything below it: reserved, see [`super::warp`];
 //! - `/cdn-cgi/limit/*`: the resources of the over-limit notice, see [`crate::limits`];
+//! - `/cdn-cgi/challenge-platform/*`: the human check, see [`super::challenge`]
+//!   (a zone's) and [`super::widget`] (the one sites embed, and its siteverify);
 //! - anything else: 404.
 
 use super::{full, warp, Body, Edge, EdgeError, TlsInfo};
@@ -50,6 +52,11 @@ impl Edge {
             // nothing borrowed may live across the await (a `Send` that is not general enough)
             let (waf, ray) = (self.waf.clone(), ray.to_string());
             return super::challenge::verify(waf, ip, ssl, req, ray).await;
+        }
+        if super::widget::handles(endpoint) {
+            // the human check that sites put into their own pages, and its siteverify (see `super::widget`)
+            let (edge, endpoint, host, ray) = (self.clone(), endpoint.to_string(), host.to_string(), ray.to_string());
+            return Ok(super::widget::serve(edge, endpoint, ip, ssl, req, host, ray).await);
         }
         if endpoint == "challenge-platform/fcf.js" {
             // the script put into the site's pages (see `super::inject_script`)
