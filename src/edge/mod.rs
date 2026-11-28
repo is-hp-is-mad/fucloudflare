@@ -981,6 +981,9 @@ pub struct Edge {
     pub panel: std::sync::OnceLock<(String, SocketAddr)>,
     /// The node that runs the panel, when it is not this one (see [`panel_origin`]).
     pub panel_origin: std::sync::OnceLock<Target>,
+    /// What a node that passes a panel request on sets [`PANEL_HOP`] to
+    /// (derived from the fleet's API token, which all nodes share).
+    pub panel_seal: std::sync::OnceLock<String>,
     /// Internal loopback listeners of this node (API, HTTP/3 front) that
     /// worker subrequests must not reach directly.
     pub internal_listeners: std::sync::OnceLock<Vec<SocketAddr>>,
@@ -1257,6 +1260,7 @@ impl Edge {
             front: Default::default(),
             panel: Default::default(),
             panel_origin: Default::default(),
+            panel_seal: Default::default(),
             internal_listeners: Default::default(),
             geo: Default::default(),
             stats: Default::default(),
@@ -1945,8 +1949,11 @@ impl Edge {
                 }
                 return Ok(resp);
             }
-            let from_node = cgi::is_fucf_node(ip, &self.store.snapshot().nodes);
-            let hopped = req.headers().contains_key(PANEL_HOP);
+            // passed on by another node of the fleet: it proves that with a value derived from the fleet's token
+            // (a node's address alone is not enough: other programs on that host can connect from it too)
+            let seal = self.panel_seal.get();
+            let hopped = req.headers().get(PANEL_HOP).is_some_and(|v| seal.is_some_and(|seal| v.as_bytes() == seal.as_bytes()));
+            let from_node = hopped && cgi::is_fucf_node(ip, &self.store.snapshot().nodes);
             let target = match self.panel_origin.get() {
                 // another node runs the panel; never send on what a node already sent on
                 Some(origin) if !hopped => origin.clone(),
@@ -1971,8 +1978,8 @@ impl Edge {
             if let Ok(v) = HeaderValue::from_str(&visitor.to_string()) {
                 req.headers_mut().insert("x-forwarded-for", v);
             }
-            if self.panel_origin.get().is_some() {
-                req.headers_mut().insert(PANEL_HOP, HeaderValue::from_static("1"));
+            if let (Some(_), Some(seal)) = (self.panel_origin.get(), seal.and_then(|s| HeaderValue::from_str(s).ok())) {
+                req.headers_mut().insert(PANEL_HOP, seal);
             } else {
                 req.headers_mut().remove(PANEL_HOP);
             }

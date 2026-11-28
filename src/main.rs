@@ -764,6 +764,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = edge.internal_listeners.set(internal_listeners);
     if let Some(host) = &panel_host {
         let _ = edge.panel.set((host.clone(), args.api_listen));
+        let _ = edge.panel_seal.set(release::sha256_hex(format!("fucf panel hop\n{token}").as_bytes()));
         if let Some(origin) = panel_origin.clone() {
             tracing::info!("the panel {host} is served by {}:{}: its requests go there", origin.host, origin.port);
             let _ = edge.panel_origin.set(origin);
