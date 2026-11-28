@@ -705,6 +705,14 @@ const RULES = {
       { k: "destinations", label: "转发到（外部邮箱，逗号或空格分隔，最多 10 个）", type: "list", hint: "动作为“转发”时必填；不能填这个域名自己的地址" },
       { k: "worker", label: "Worker 脚本名（动作为 Worker 时必填）", opt: 1, hint: "脚本需导出 async email(message, env, ctx)" },
       DESC, { k: "enabled", label: "启用", type: "check", def: true }] },
+  waiting: { path: "waiting_rooms", title: "等候室", empty: "<b>还没有等候室</b>源站扛不住时，让超出名额的访客排队，按先来后到放行。只有页面请求会排队，图片、脚本和接口请求照常通过。",
+    cols: ["name", "host", "path_prefix", "total_active_users", "new_users_per_minute", "session_minutes", "enabled"],
+    fields: [{ k: "name", label: "名称" }, { k: "host", label: "主机名", hint: "这个域名下的一个主机名，如 www.example.com，不能用通配符" },
+      { k: "path_prefix", label: "路径前缀", def: "/", hint: "以 / 开头。/shop 覆盖 /shop 和 /shop/ 下的路径，不含 /shopping；同一主机上前缀最长的等候室生效" },
+      { k: "total_active_users", label: "同时在线人数（每个节点）", type: "number", min: 1, max: 100000, def: 200 },
+      { k: "new_users_per_minute", label: "每分钟放行人数（每个节点）", type: "number", min: 1, max: 100000, def: 50, hint: "不能超过同时在线人数" },
+      { k: "session_minutes", label: "会话时长（分钟，1–30）", type: "number", min: 1, max: 30, def: 5, hint: "访客最后一次打开页面后，名额保留这么久" },
+      DESC, { k: "enabled", label: "启用", type: "check", def: true }] },
 };
 const TONE = { block: "bad", js_challenge: "warn", managed_challenge: "warn", skip: "ok" };
 const ACT = { block: "拦截", js_challenge: "JS 质询", managed_challenge: "人机验证", log: "仅记录", skip: "放行", challenge: "质询", allow: "放行" };
@@ -1002,12 +1010,12 @@ const ZONE = {
   },
   async network(z) {
     const s = z.settings, nodes = await api("GET", "/nodes");
-    return { sub: "向访客提供的 HTTP 协议、服务这个域名的节点，以及 TCP / UDP 端口转发。", body:
+    return { sub: "向访客提供的 HTTP 协议、服务这个域名的节点、TCP / UDP 端口转发，以及源站扛不住时让访客排队的等候室（名额由每个节点各自计算）。", body:
       card("HTTP 协议", "", setRow("HTTP/2", "关闭后 TLS 连接只协商 HTTP/1.1。", sw("http2", s.http2, "HTTP/2")) +
         setRow("HTTP/3 (QUIC)", "通过 Alt-Svc 响应头和 HTTPS DNS 记录通告；在高丢包线路上通常更快。", sw("http3", s.http3, "HTTP/3"))) +
       card("服务节点", "", setRow("指定节点", "不选表示全部节点，按访客位置和调度规则分配；选中后只由这些节点应答。",
         nodes.length ? `<div class="chks">${nodes.map(n => `<label><input type="checkbox" data-set="edge_nodes" data-multi value="${esc(n.name)}" ${s.edge_nodes.includes(n.name) ? "checked" : ""}>${esc(n.name)}</label>`).join("")}</div>` : '<span class="hint">还没有登记节点。</span>', "stack")) +
-      await ruleSection(z.id, "spectrum") };
+      await ruleSection(z.id, "spectrum") + await ruleSection(z.id, "waiting") };
   },
   async caching(z) {
     return { sub: "边缘缓存的开关与清除。缓存哪些内容由“规则”里的缓存规则决定。", body:

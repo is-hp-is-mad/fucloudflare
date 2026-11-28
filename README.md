@@ -90,6 +90,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/analytics                    GET              ?since=-1440（分钟）| 90m | 24h | 7d（默认 24h，最长 30d），?step= 分钟
 /zones/{id}/logs/requests                GET              应答节点上这个区域最近的请求：?since=游标 &limit= &status=404|5xx &host= &path=前缀 &ip=，见“请求日志”
 /zones/{id}/logpush/jobs[/{id}]          CRUD             {"name", "destination": "https://...", "enabled", "status_min", "batch_seconds"}
+/zones/{id}/waiting_rooms[/{id}]         CRUD             {"name", "host", "path_prefix":"/shop", "total_active_users", "new_users_per_minute", "session_minutes", "enabled"}，见“等候室”
 /zones/{id}/spectrum/apps[/{id}]         CRUD             {"protocol":"tcp/2222", "dns":{"name":"ssh"}, "origin_direct":["tcp://192.0.2.1:22"], "proxy_protocol":"off|v1"}
 /zones/{id}/workers/routes[/{id}]        CRUD             {"pattern":"example.com/api/*", "script":"name"}
 /workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码
@@ -262,7 +263,7 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 
 ## 请求处理顺序
 
-`/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
+`/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
 
 - HTTP/3：与 HTTPS 同端口号的 UDP 上提供，HTTPS 响应带 `Alt-Svc` 头引导客户端升级；三种协议共用同一条处理链路。
 - 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli 或 gzip（源站已压缩的不动）。
@@ -455,6 +456,21 @@ DNS 记录的 Cloudflare 兼容补充：
   不能是内网、本机地址（解析到这些地址的域名在连接时拒绝）；任务从它到达节点之后的请求开始推。
   10 秒内没有 2xx 应答就丢掉这一批，记一条警告，不重试。只有管理员能添加和修改推送任务。
 - 令牌权限是 `Logs Read` / `Logs Write`；`Analytics Read` 看不到日志（日志里有访客 IP）。
+
+## 等候室
+
+源站扛不住时让访客排队（面板：域名 → 网络与协议 → 等候室，接口 `/zones/{id}/waiting_rooms`）。一个等候室管一个主机名下的一个路径前缀：
+`/shop` 管 `/shop` 和 `/shop/` 下的路径，不管 `/shopping`；同一主机上前缀最长的生效，同一主机同一前缀只能有一个启用的，每个域名最多 20 个。
+
+- 名额：同时在线 `total_active_users`（1–100000）个会话，任意 60 秒内最多放进 `new_users_per_minute` 个新访客（不能超过同时在线人数）。
+  **名额按节点各自计算**：每个节点只数自己放进来和见过的访客，多个节点服务同一个域名时，源站看到的可能是名额的节点数倍。
+- 放进来的访客拿到签名 Cookie `fucf_waiting_room`（全机群同一密钥，绑定等候室、随机访客号和到期时间；HttpOnly、SameSite=Lax，HTTPS 下带 Secure，Path 为路径前缀），
+  在 `session_minutes`（1–30，默认 5）内直接通过；会话过半后再打开页面会续期，所以会话在最后一次打开页面后 `session_minutes` 分钟结束。伪造、过期、别的等候室的 Cookie 一律当作没有。
+- 名额满或进入速率超限时返回排队页：状态码 200（与 Cloudflare 一致）、`Cache-Control: no-store`、`Retry-After: 20`，每 20 秒自动刷新，显示前面大约还有多少人。
+  排队的访客拿到带到达时间的排队票 Cookie `fucf_waiting_ticket`，刷新时位置不变，先到的先放行；120 秒没刷新就算离开队伍，用过的票不能再用。
+- 只有页面请求会排队；图片、脚本、接口请求和表单提交照常通过，`/cdn-cgi/` 和被防火墙 `skip` 规则放行的请求也不排队。
+- 状态只在内存里，有上限，过期的会话和不再刷新的排队票会被清掉；重启后会话计数和队伍清空（Cookie 和排队票的到达时间仍然有效）。
+- 令牌权限是 `Waiting Rooms Read` / `Waiting Rooms Write`。
 
 ## 自动防火墙
 

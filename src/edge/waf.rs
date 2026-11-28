@@ -53,6 +53,9 @@ pub struct Event {
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
     Pass,
+    /// A firewall `skip` rule matched: everything after it is skipped, the
+    /// security level, rate limits, managed rules and the waiting room.
+    Skipped,
     Block { rule_id: String },
     RateLimited { retry_after: u64 },
     /// The human check (see `super::challenge`); `click`: it always asks for a click.
@@ -470,7 +473,7 @@ impl Waf {
             match rule.action.as_str() {
                 "skip" => {
                     self.log(zone, info, ray, "firewall", ident, "skip");
-                    return Verdict::Pass;
+                    return Verdict::Skipped;
                 }
                 "log" => self.log(zone, info, ray, "firewall", ident, "log"),
                 "js_challenge" | "managed_challenge" => {

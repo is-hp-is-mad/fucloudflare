@@ -221,6 +221,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/alerts/active", get(active_alerts))
         .route("/zones/{zone_id}/logs/requests", get(request_log))
         .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
+        .merge(crud::<crate::edge::waiting::WaitingRoom>("/zones/{zone_id}/waiting_rooms"))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -3667,6 +3668,102 @@ mod tests {
         let (sc, _, _) = call_raw(&mut app, "GET", &format!("{base}/{fw_id}"), auth2(), vec![]).await;
         assert_eq!(sc, StatusCode::FORBIDDEN);
         assert_eq!(st.store.items::<TransformRule>(&z).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn waiting_rooms_are_managed_per_zone_and_need_their_own_permission() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-waiting-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("viewer@example.com", Role::Viewer, Some("strong-pass-123"), "viewer@example.com", &Client::default()).unwrap();
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (admin, viewer) = (session("admin@example.com"), session("viewer@example.com"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let z = zone.id.clone();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let rooms = format!("/client/v4/zones/{z}/waiting_rooms");
+        let room = json!({ "name": "shop", "host": "www.example.com", "path_prefix": "/shop", "total_active_users": 100, "new_users_per_minute": 20, "session_minutes": 10 });
+
+        let (sc, b) = call(&mut app, "POST", &rooms, room.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let r = json_of(&b)["result"].clone();
+        let id = r["id"].as_str().unwrap().to_string();
+        assert_eq!((r["zone_id"].clone(), r["enabled"].clone(), r["session_minutes"].clone()), (json!(z), json!(true), json!(10)));
+        assert!(r.get("sync").is_none());
+        let (sc, b) = call(&mut app, "POST", &rooms, room.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "one enabled room per host and path: {}", String::from_utf8_lossy(&b));
+        for bad in [
+            b"not json".to_vec(),
+            json!({ "name": "x", "host": "www.example.net", "total_active_users": 1, "new_users_per_minute": 1 }).to_string().into_bytes(),
+            json!({ "name": "x", "host": "example.com", "path_prefix": "x", "total_active_users": 1, "new_users_per_minute": 1 }).to_string().into_bytes(),
+            json!({ "name": "x", "host": "example.com", "total_active_users": 1, "new_users_per_minute": 2 }).to_string().into_bytes(),
+        ] {
+            let (sc, b) = call(&mut app, "POST", &rooms, bad).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        }
+        let (_, b) = call(&mut app, "GET", &rooms, vec![]).await;
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().len(), 1);
+        let (sc, b) = call(&mut app, "PATCH", &format!("{rooms}/{id}"), br#"{"enabled":false}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!((json_of(&b)["result"]["enabled"].clone(), json_of(&b)["result"]["path_prefix"].clone()), (json!(false), json!("/shop")));
+        assert!(st.store.snapshot().zones["example.com"].waiting_rooms.is_empty(), "a disabled room is not served");
+        let (sc, _) = call(&mut app, "PUT", &format!("{rooms}/{id}"), json!({ "name": "only a name" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "a replace needs the limits again");
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/zones/{}/waiting_rooms/{id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "a room belongs to one zone");
+        let (sc, _) = call(&mut app, "DELETE", &format!("/client/v4/zones/{}/waiting_rooms/{id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _) = call(&mut app, "GET", &format!("{rooms}/no-such-room"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _) = call(&mut app, "GET", "/client/v4/zones/no-such-zone/waiting_rooms", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // panel roles: a viewer reads, does not write
+        let h = vec![("authorization", viewer.as_str()), ("content-type", "application/json")];
+        let (sc, _, _) = call_raw(&mut app, "GET", &rooms, h.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "DELETE", &format!("{rooms}/{id}"), h, vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        // tokens: neither firewall nor zone settings will do; reading is not writing; one zone is not another
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let h = vec![("authorization", admin.as_str()), ("content-type", "application/json")];
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h, spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let firewall = token("Firewall Services Write").await;
+        let settings = token("Zone Settings Write").await;
+        let read = token("Waiting Rooms Read").await;
+        let write = token("Waiting Rooms Write").await;
+        let mut as_token = async |bearer: &str, method: &str, path: &str, body: Vec<u8>| {
+            call_raw(&mut app, method, path, vec![("authorization", bearer), ("content-type", "application/json")], body).await.0
+        };
+        let new_room = json!({ "name": "blog", "host": "example.com", "path_prefix": "/blog", "total_active_users": 5, "new_users_per_minute": 5 }).to_string();
+        for bearer in [&firewall, &settings] {
+            assert_eq!(as_token(bearer, "GET", &rooms, vec![]).await, StatusCode::FORBIDDEN);
+            assert_eq!(as_token(bearer, "POST", &rooms, new_room.clone().into_bytes()).await, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(as_token(&read, "GET", &rooms, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "GET", &format!("{rooms}/{id}"), vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "POST", &rooms, new_room.clone().into_bytes()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&read, "PATCH", &format!("{rooms}/{id}"), br#"{"enabled":true}"#.to_vec()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&read, "DELETE", &format!("{rooms}/{id}"), vec![]).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&write, "GET", &format!("/client/v4/zones/{}/waiting_rooms", other.id), vec![]).await, StatusCode::FORBIDDEN, "another zone");
+        assert_eq!(as_token(&write, "POST", &rooms, new_room.clone().into_bytes()).await, StatusCode::OK);
+        assert_eq!(as_token(&write, "DELETE", &format!("{rooms}/{id}"), vec![]).await, StatusCode::OK);
+        assert_eq!(st.store.items::<crate::edge::waiting::WaitingRoom>(&z).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

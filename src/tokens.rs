@@ -63,6 +63,8 @@ pub enum Area {
     Analytics,
     /// The request log (visitor addresses included) and its push jobs.
     Logs,
+    /// Waiting rooms (crate::edge::waiting): they decide who reaches the origin.
+    WaitingRooms,
     WorkersScripts,
     WorkersKv,
     D1,
@@ -132,6 +134,8 @@ groups! {
     "9c88f9c5bce24ce7af9a958ba9c504db" "Analytics Read" Analytics false "Read zone analytics";
     "26b532d014a248b19255e21c73660d14" "Logs Read" Logs false "Read the request log (visitor addresses included) and the log push jobs";
     "ddf5587f37134125868a20ce6a3f1420" "Logs Write" Logs true "Change the jobs that push the request log to another server";
+    "a4ea74d0fb8545a0a16b1c15e6429a26" "Waiting Rooms Read" WaitingRooms false "Read waiting rooms";
+    "f67470076141448daf90b83b8aeb1a3d" "Waiting Rooms Write" WaitingRooms true "Change waiting rooms, which decide who reaches the origin";
     "1a71c399035b4950a1bd1466bbe4f420" "Workers Scripts Read" WorkersScripts false "Read Workers scripts and their settings";
     "e086da7e2179491d91ee5f35b3ca210a" "Workers Scripts Write" WorkersScripts true "Upload, configure, run and delete Workers scripts";
     "8b47d2786a534c08a1f94ee8f9f599ef" "Workers KV Storage Read" WorkersKv false "Read Workers KV namespaces and values";
@@ -200,6 +204,7 @@ pub fn need(path: &str) -> Need {
                 "spectrum" => Area::Spectrum,
                 "analytics" => Area::Analytics,
                 "logs" | "logpush" => Area::Logs,
+                "waiting_rooms" => Area::WaitingRooms,
                 _ => return Need::Closed,
             };
             Need::Zone(area, Some(z.to_string()))
@@ -461,6 +466,9 @@ mod tests {
         assert_eq!(need("/zones/z1/logs/requests"), Need::Zone(Area::Logs, Some("z1".into())));
         assert_eq!(need("/zones/z1/logpush/jobs/j1"), Need::Zone(Area::Logs, Some("z1".into())));
         assert_eq!(need("/logpush/jobs"), Need::Closed);
+        assert_eq!(need("/zones/z1/waiting_rooms"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
+        assert_eq!(need("/zones/z1/waiting_rooms/w1"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
+        assert_eq!(need("/waiting_rooms"), Need::Closed);
     }
 
     #[test]

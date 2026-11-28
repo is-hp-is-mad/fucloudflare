@@ -19,6 +19,7 @@ pub mod stats;
 pub mod tls;
 pub mod upstream;
 pub mod waf;
+pub mod waiting;
 pub mod warp;
 
 use crate::expr::ReqInfo;
@@ -1005,6 +1006,8 @@ pub struct Edge {
     pub stats: Arc<stats::Stats>,
     /// The newest requests this node answered, for the API and the log jobs.
     pub reqlog: reqlog::RequestLog,
+    /// This node's sessions and lines of the zones' waiting rooms.
+    pub waiting: waiting::WaitingRooms,
     /// This node's traffic allowance and speed limit.
     pub limits: Arc<crate::limits::Limits>,
     /// This node's mainland-China (GFW) reachability status.
@@ -1284,6 +1287,7 @@ impl Edge {
             reputation: Default::default(),
             stats: Default::default(),
             reqlog: Default::default(),
+            waiting: Default::default(),
             limits: Default::default(),
             gfw: Default::default(),
             assets_host: Default::default(),
@@ -2138,14 +2142,17 @@ impl Edge {
         let mut headers = parts.headers;
         let mut response_rules = Vec::new();
         let mut worker = None;
+        let mut admitted = Vec::new();
         if !zone.zone.paused {
             let inspect = match (&body, &inspect_prefix) {
                 (ReqBody::Buffered(b), _) if !b.is_empty() => Some(&b[..]),
                 (_, Some(p)) if !p.is_empty() => Some(&p[..]),
                 _ => None,
             };
-            let stopped = match self.waf.check(zone, &info, inspect, ray) {
-                Verdict::Pass => None,
+            let verdict = self.waf.check(zone, &info, inspect, ray);
+            let skipped = verdict == Verdict::Skipped;
+            let stopped = match verdict {
+                Verdict::Pass | Verdict::Skipped => None,
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
                     let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: page_lang };
@@ -2187,6 +2194,13 @@ impl Edge {
                     resp.headers_mut().insert(header::LOCATION, v);
                 }
                 return Ok(resp);
+            }
+
+            // a page load over the limits of a waiting room waits here (crate::edge::waiting)
+            let visit = waiting::Visit { info: &info, headers: &headers, ssl, skipped, ray, lang: page_lang };
+            match waiting::gate(&self, zone, &visit) {
+                waiting::Gate::Queue(resp) => return Ok(resp),
+                waiting::Gate::Pass(cookies) => admitted = cookies,
             }
 
             // Every matching transform rule applies; all are matched against
@@ -2243,6 +2257,7 @@ impl Edge {
             }
             None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc }).await?,
         };
+        waiting::stamp(&mut resp, admitted);
         // What the zone's settings add to an answer (rules may still change it).
         if ssl && settings.hsts_max_age > 0 {
             let subdomains = if settings.hsts_include_subdomains { "; includeSubDomains" } else { "" };

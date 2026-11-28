@@ -184,6 +184,9 @@ pub struct Tombstones {
     pub cache_rules: BTreeMap<String, SyncMeta>,
     pub email_rules: BTreeMap<String, SyncMeta>,
     pub log_jobs: BTreeMap<String, SyncMeta>,
+    /// (Left out while empty, like `alert_channels`.)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub waiting_rooms: BTreeMap<String, SyncMeta>,
     pub nodes: BTreeMap<String, SyncMeta>,
     pub steering: BTreeMap<String, SyncMeta>,
     pub local_proxy_rules: BTreeMap<String, SyncMeta>,
@@ -213,6 +216,11 @@ pub struct Data {
     pub cache_rules: Vec<CacheRule>,
     pub email_rules: Vec<EmailRule>,
     pub log_jobs: Vec<crate::edge::reqlog::LogJob>,
+    /// Queues in front of the origin (crate::edge::waiting); left out while
+    /// empty, so that the configuration version stays the one nodes without
+    /// waiting rooms compute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
     pub nodes: Vec<EdgeNode>,
     pub steering: Vec<SteerRule>,
     pub local_proxy_rules: Vec<LocalProxyRule>,
@@ -271,6 +279,8 @@ pub struct ZoneSnap {
     pub routes: Vec<WorkerRoute>,
     /// Enabled e-mail routing rules.
     pub email_rules: Vec<EmailRule>,
+    /// Enabled waiting rooms (crate::edge::waiting::pick chooses among them).
+    pub waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
     /// Compiled DNSSEC signer when DNSSEC is enabled on this zone.
     pub dnssec: Option<Arc<crate::dns::dnssec::DnssecSigner>>,
 }
@@ -399,6 +409,7 @@ impl Snapshot {
                     cache_rules: compile(&data.cache_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
                     routes,
                     email_rules: data.email_rules.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
+                    waiting_rooms: data.waiting_rooms.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
                     dnssec: z.dnssec.as_ref().and_then(|cfg| crate::dns::dnssec::DnssecSigner::from_config(&z.name, cfg)),
                 };
                 (id, snap)
@@ -715,6 +726,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         cache_rules,
         email_rules,
         log_jobs,
+        waiting_rooms,
     );
     macro_rules! bump_tombs {
         ($($field:ident),* $(,)?) => {
@@ -740,6 +752,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         cache_rules,
         email_rules,
         log_jobs,
+        waiting_rooms,
         nodes,
         steering,
         local_proxy_rules,
@@ -778,6 +791,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.cache_rules, durable_ttl_ms);
     prune(&mut d.tombstones.email_rules, durable_ttl_ms);
     prune(&mut d.tombstones.log_jobs, durable_ttl_ms);
+    prune(&mut d.tombstones.waiting_rooms, durable_ttl_ms);
     prune(&mut d.tombstones.nodes, durable_ttl_ms);
     prune(&mut d.tombstones.steering, durable_ttl_ms);
     prune(&mut d.tombstones.local_proxy_rules, durable_ttl_ms);
@@ -821,6 +835,8 @@ struct ConfigDeltaPayload {
     email_rules: Vec<EmailRule>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     log_jobs: Vec<crate::edge::reqlog::LogJob>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     nodes: Vec<EdgeNode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2312,6 +2328,7 @@ fn apply_delete_zone(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str) 
     cascade_items!(cache_rules);
     cascade_items!(email_rules);
     cascade_items!(log_jobs);
+    cascade_items!(waiting_rooms);
     cascade_items!(certificate_packs);
 
     let packs: HashSet<String> = d.certificate_packs.iter().map(|p| p.meta.id.clone()).collect();
@@ -2445,6 +2462,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
         cache_rules: d.cache_rules.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         email_rules: d.email_rules.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         log_jobs: d.log_jobs.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
+        waiting_rooms: d.waiting_rooms.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         nodes: d.nodes.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         steering: d.steering.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         local_proxy_rules: d.local_proxy_rules.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
@@ -2475,6 +2493,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             cache_rules: filter_tombs(&d.tombstones.cache_rules, since),
             email_rules: filter_tombs(&d.tombstones.email_rules, since),
             log_jobs: filter_tombs(&d.tombstones.log_jobs, since),
+            waiting_rooms: filter_tombs(&d.tombstones.waiting_rooms, since),
             nodes: filter_tombs(&d.tombstones.nodes, since),
             steering: filter_tombs(&d.tombstones.steering, since),
             local_proxy_rules: filter_tombs(&d.tombstones.local_proxy_rules, since),
@@ -2678,6 +2697,7 @@ fn merge_delta_data(
     merge_items!(cache_rules);
     merge_items!(email_rules);
     merge_items!(log_jobs);
+    merge_items!(waiting_rooms);
 
     changed |= merge_collection(&mut rev, clock, &mut d.workers, &mut d.tombstones.workers, payload.workers, payload.tombstones.workers, |w| w.name.clone(), |w| &w.sync, |w| &mut w.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.nodes, &mut d.tombstones.nodes, payload.nodes, payload.tombstones.nodes, |n| n.id.clone(), |n| &n.sync, |n| &mut n.sync);
@@ -2805,6 +2825,7 @@ fn merge_delta_data(
         cascade_tomb!(cache_rules);
         cascade_tomb!(email_rules);
         cascade_tomb!(log_jobs);
+        cascade_tomb!(waiting_rooms);
         cascade_tomb!(certificate_packs);
     }
 

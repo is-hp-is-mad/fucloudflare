@@ -91,6 +91,7 @@ by `id` or by `name`:
 | Zone Spectrum Read / Write | zone | `/zones/{id}/spectrum/apps` |
 | Analytics Read | zone | `/zones/{id}/analytics` |
 | Logs Read / Logs Write | zone | `/zones/{id}/logs/requests` (visitor addresses included), `/zones/{id}/logpush/jobs` (Write: change jobs) |
+| Waiting Rooms Read / Write | zone | `/zones/{id}/waiting_rooms` |
 | Workers Scripts, Workers KV Storage, D1 Read / Write | account | `/workers/scripts…`, `/kv/…`, `/d1/…` |
 | Fleet Read / Write | account | nodes, fleet actions, steering, local proxy rules, releases |
 | Notifications Read / Write | account | `/alerts…` (alert channels, test messages, active alerts) |
@@ -727,6 +728,53 @@ once as a warning; it is not sent again.
 
 ```json
 { "name": "errors to the collector", "destination": "https://logs.example.com/ingest?token=test-token", "status_min": 500, "batch_seconds": 30 }
+```
+
+### Waiting rooms
+
+```
+CRUD   /zones/{id}/waiting_rooms          {"name", "host", "path_prefix", "total_active_users", "new_users_per_minute", "session_minutes", "enabled", "description"}
+```
+
+A waiting room puts a queue in front of one host and path prefix of the zone. It is checked after the
+security rules and redirects, and before transform rules, Workers, the cache and the origin.
+
+| Field | Meaning |
+|---|---|
+| `name` | required, at most 64 characters |
+| `host` | one host name of the zone, no wildcard; not one that a more specific zone serves |
+| `path_prefix` | default `/`. Covers the path and everything below it on segment boundaries: `/shop` covers `/shop` and `/shop/cart`, not `/shopping`. Starts with `/`, at most 256 of `a-z A-Z 0-9 / - . _ ~ ! $ & ' ( ) * + = : @ %`; a trailing `/` is dropped. Compared with the path as sent, case-sensitive |
+| `total_active_users` | admitted sessions active at once, 1 to 100000 (per node) |
+| `new_users_per_minute` | new visitors let in over any 60 seconds, 1 to `total_active_users` (per node) |
+| `session_minutes` | 1 to 30, default 5: how long a session lasts after the visitor's last page load |
+| `enabled` | default `true` |
+| `description` | optional, one line of at most 256 characters |
+
+- At most one enabled room per host and path prefix (another one is a 409), at most 20 rooms per zone.
+  Where rooms of one host overlap, the longest prefix wins.
+- Only page loads wait: `GET` or `HEAD` requests that a browser makes to show a page (`Sec-Fetch-Mode:
+  navigate`, or without that header an `Accept` that names `text/html` or is missing; never with
+  `X-Requested-With`). Assets, API calls and form posts pass, and so does everything under `/cdn-cgi/`
+  and every request a firewall `skip` rule let through.
+- A visitor who is let in gets the cookie `fucf_waiting_room` (`HttpOnly`, `SameSite=Lax`, `Secure` over
+  HTTPS, `Path` the room's prefix, `Max-Age` the session), signed with the fleet's key and bound to the
+  room, a random visitor id and an expiry, and passes directly until it expires; a page load in the second
+  half of a session renews it. A cookie that does not verify, belongs to another room, has expired or runs
+  longer than the room's sessions do now counts as no cookie.
+- A visitor who has to wait gets the queue page: status 200 (as Cloudflare answers), `Cache-Control:
+  no-store`, `Retry-After: 20`, `fcf-waiting-room: queued`, reloading itself every 20 seconds and showing
+  roughly how many are ahead. It carries the cookie `fucf_waiting_ticket` with the visitor's arrival time;
+  each reload shows the ticket again and gets it back with the same arrival. Earlier tickets are let in
+  first; a ticket not shown again for 120 seconds is void (the visitor left the line), and so is one
+  already used to get in.
+- Counting is per node: each node keeps its own sessions, admissions and line in memory and applies the
+  limits to what it sees (visitors admitted by another node count once they load a page here). With
+  several nodes serving a zone, the origin may see up to that many times the limits. A restart forgets
+  the sessions (cookies stay valid) and the line (tickets keep their arrival time).
+- Tokens need `Waiting Rooms Read` or `Waiting Rooms Write` for the zone.
+
+```json
+{ "name": "launch", "host": "www.example.com", "path_prefix": "/shop", "total_active_users": 500, "new_users_per_minute": 100, "session_minutes": 10 }
 ```
 
 ### The fleet

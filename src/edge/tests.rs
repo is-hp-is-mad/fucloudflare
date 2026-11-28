@@ -2183,3 +2183,93 @@ async fn every_answered_request_lands_in_the_request_log() {
     assert_eq!(get(&env, "other.org", "/").await.status, 404);
     assert_eq!(env.edge.reqlog.newest(), 4);
 }
+
+#[tokio::test]
+async fn a_full_waiting_room_queues_page_loads_and_lets_admitted_visitors_through() {
+    let env = setup().await;
+    let room: waiting::WaitingRoom = env
+        .store
+        .save_item(&env.zone, None, json!({ "name": "all", "host": "www.example.com", "total_active_users": 1, "new_users_per_minute": 1 }), true)
+        .unwrap();
+    let set_cookies = |r: &Reply| -> Vec<String> {
+        r.head
+            .lines()
+            .filter_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")).map(|(_, v)| v.trim().to_string()))
+            .collect()
+    };
+    let value_of = |set_cookie: &str| set_cookie.split(';').next().unwrap().to_string();
+
+    // the first visitor gets in and is given its admission
+    let first = get(&env, "www.example.com", "/").await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert!(first.body.contains("origin=main GET /"), "{}", first.body);
+    let given = set_cookies(&first);
+    assert_eq!(given.len(), 1, "{given:?}");
+    assert!(given[0].starts_with(&format!("{}={}.", waiting::COOKIE, room.meta.id)), "{}", given[0]);
+    assert!(given[0].ends_with("; Path=/; Max-Age=300; HttpOnly; SameSite=Lax"), "plain HTTP: no Secure: {}", given[0]);
+    let admission = value_of(&given[0]);
+
+    // the room is full: the next page load waits, the origin never sees it
+    let hits = env.hits.load(Ordering::SeqCst);
+    let queued = send(&env, "GET", "www.example.com", "/page", "Accept: text/html\r\n", "").await;
+    assert_eq!(queued.status, 200);
+    assert_eq!(queued.header("fcf-waiting-room"), Some("queued"));
+    assert_eq!(queued.header("cache-control"), Some("no-store"));
+    assert_eq!(queued.header("retry-after"), Some(waiting::REFRESH_SECS.to_string().as_str()));
+    assert!(queued.body.contains("http-equiv=\"refresh\""), "{}", queued.body);
+    let ticket = set_cookies(&queued);
+    assert!(ticket.len() == 1 && ticket[0].starts_with(&format!("{}=", waiting::TICKET_COOKIE)), "{ticket:?}");
+    // shown again, the ticket keeps its place (and the line does not grow)
+    let again = send(&env, "GET", "www.example.com", "/page", &format!("Cookie: {}\r\n", value_of(&ticket[0])), "").await;
+    assert_eq!(again.header("fcf-waiting-room"), Some("queued"));
+    assert_eq!(env.edge.waiting.counts(&room.meta.id), (1, 1));
+    assert_eq!(env.hits.load(Ordering::SeqCst), hits);
+
+    // the admitted visitor passes
+    let back = send(&env, "GET", "www.example.com", "/page", &format!("Cookie: a=b; {admission}\r\n"), "").await;
+    assert!(back.status == 200 && back.header("fcf-waiting-room").is_none(), "{}", back.body);
+    assert!(set_cookies(&back).is_empty(), "a fresh session is not renewed");
+    // a tampered admission counts as none
+    let forged = admission.replacen('.', ".0", 1);
+    let r = send(&env, "GET", "www.example.com", "/page", &format!("Cookie: {forged}\r\n"), "").await;
+    assert_eq!(r.header("fcf-waiting-room"), Some("queued"));
+
+    // what does not wait: assets and API calls, posts, /cdn-cgi/, another host, what a skip rule lets through
+    for extra in ["Accept: image/png\r\n", "Sec-Fetch-Mode: no-cors\r\n", "X-Requested-With: XMLHttpRequest\r\n"] {
+        let r = send(&env, "GET", "www.example.com", "/app.js", extra, "").await;
+        assert!(r.header("fcf-waiting-room").is_none(), "{extra}");
+    }
+    let r = send(&env, "POST", "www.example.com", "/form", "Accept: text/html\r\n", "a=1").await;
+    assert!(r.header("fcf-waiting-room").is_none(), "a post is not a page load");
+    assert!(get(&env, "www.example.com", "/cdn-cgi/anything").await.header("fcf-waiting-room").is_none());
+    assert!(get(&env, "example.com", "/").await.header("fcf-waiting-room").is_none());
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "http.request.headers[\"x-internal\"] eq \"yes\"", "action": "skip" }), true)
+        .unwrap();
+    let r = send(&env, "GET", "www.example.com", "/", "X-Internal: yes\r\n", "").await;
+    assert!(r.status == 200 && r.header("fcf-waiting-room").is_none(), "{}", r.body);
+
+    // a disabled room lets everybody through
+    env.store.save_item::<waiting::WaitingRoom>(&env.zone, Some(&room.meta.id), json!({ "enabled": false }), false).unwrap();
+    let r = get(&env, "www.example.com", "/page").await;
+    assert!(r.status == 200 && r.header("fcf-waiting-room").is_none() && set_cookies(&r).is_empty(), "{}", r.body);
+}
+
+#[tokio::test]
+async fn the_admission_cookie_is_scoped_to_the_rooms_path() {
+    let env = setup().await;
+    env.store
+        .save_item::<waiting::WaitingRoom>(
+            &env.zone,
+            None,
+            json!({ "name": "shop", "host": "example.com", "path_prefix": "/shop", "total_active_users": 5, "new_users_per_minute": 5, "session_minutes": 2 }),
+            true,
+        )
+        .unwrap();
+    let r = get(&env, "example.com", "/shopping").await;
+    assert!(r.header("set-cookie").is_none(), "/shopping is not under /shop");
+    let r = get(&env, "example.com", "/shop/cart").await;
+    assert_eq!(r.status, 200);
+    let c = r.header("set-cookie").unwrap_or_default().to_string();
+    assert!(c.ends_with("; Path=/shop; Max-Age=120; HttpOnly; SameSite=Lax"), "{c}");
+}

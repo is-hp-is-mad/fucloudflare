@@ -166,7 +166,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - README 里说明日志含访客地址，以及保留条数。
 - 测试：环形缓冲的容量与游标；过滤；路径和 UA 的截断。
 
-### [ ] T8 Waiting Room
+### [x] T8 Waiting Room
 
 - 目标：源站扛不住时让访客排队。新文件 `src/edge/waiting.rs`，在 `process(` 里回源之前检查。
 - 域名下的对象 `WaitingRoom { host, path_prefix, total_active_users, new_users_per_minute, session_minutes, enabled, … }`。
@@ -278,6 +278,12 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 新文件 `src/edge/reqlog.rs`：每个节点内存里一个 5000 条的环形缓冲（锁内只做入队出队和取 Arc），序号连续，游标就是序号。比最旧还旧的游标从最旧开始并返回 `gap: true`，比最新还新的游标返回空和当前最新游标。在 `respond(` 里 `edge.stats.record(` 旁边一行接入；method、ASN、UA 加进了 `Seen`。
 - 接口 `GET /zones/{id}/logs/requests`（参数写错一律 400）；推送任务 `LogJob` 按 `Item` 存储，走 `/zones/{id}/logpush/jobs`（照 Cloudflare 的路径）。新的域名级令牌区域 `Logs`（Logs Read / Write），`Analytics Read` 看不到日志；面板里只有管理员能写推送任务。推送循环在所有节点上跑，NDJSON，10 秒超时，失败丢弃并记一条只含主机名的警告。
 - 没把握：`bytes` 是响应声明的长度（流式无长度时为 null），`duration_ms` 只算到响应头；质询不区分 js_challenge 和 managed_challenge；推送目标禁止内网（局域网收集器用不了）；多个推送任务串行发送；没有对真实 HTTPS 收集器跑过；Logs Read 能看到推送目标地址（地址里若带令牌也看得到）。
+
+### T8
+- 新文件 `src/edge/waiting.rs`：域名对象 `WaitingRoom`（`/zones/{id}/waiting_rooms`，`Item`，接线照 `log_jobs`，Data 和 Tombstones 为空时不序列化）。`process(` 里在重定向之后、改写规则之前调用 `waiting::gate`，回源之后用 `waiting::stamp` 加 Cookie，缓存看不到这个 Set-Cookie。为了识别防火墙放行，`waf.rs` 新增 `Verdict::Skipped`。
+- 放行 Cookie 和排队票都用 `Waf::mac` 签名、`mac_ok` 校验，只认规范写法；会话过半时打开页面会续期。排队按到达秒先到先放，120 秒没刷新或已经用过的票作废。排队页返回 200、`no-store`、`Retry-After: 20`。名额按节点各自计算，状态只在内存里且有上限。
+- 只有 GET/HEAD 的页面请求排队；`/cdn-cgi/`、`skip` 放行、暂停的域名不排队。路径先解码百分号转义、合并连续的 `/` 再匹配前缀，`/%73hop`、`//shop` 绕不过 `/shop`。令牌新开 `Waiting Rooms Read / Write`，面板在 网络与协议 → 等候室。
+- 没把握：字段名没有照 Cloudflare（`path` / `session_duration`）；Rulesets 的 skip 现在也会跳过等候室；前缀区分大小写；用编码路径访问的人带不上 Path 为前缀的 Cookie，会一直排队；多个节点时源站可能看到名额的节点数倍；给 `public` 的响应加 Set-Cookie 时没改 Cache-Control。
 
 ### T10
 - 新增 src/dkim.rs：私钥存在 `Zone.email_dkim`，不放在 settings 里，所以 API 永远不返回私钥。通过 `PATCH /zones/{id}/email` 设置 `dkim_selector` 和 `dkim_private_key`；私钥留空就保留原来的，选择器为 null 或空就移除。

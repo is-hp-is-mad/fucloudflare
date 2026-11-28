@@ -280,9 +280,10 @@ fn extras(kind: Kind, c: &Common, base: &str) -> Result<(), StoreError> {
 }
 
 /// What a skip rule here skips: the remaining custom rules (`return
-/// Verdict::Pass` in crate::edge::waf), the security level, rate limits and
-/// the managed rules. A Cloudflare skip that names less would skip more here
-/// than its author meant, so it is refused rather than widened.
+/// Verdict::Skipped` in crate::edge::waf), the security level, rate limits,
+/// the managed rules and the waiting room. A Cloudflare skip that names
+/// less would skip more here than its author meant, so it is refused
+/// rather than widened.
 fn skip_params() -> Value {
     json!({
         "ruleset": "current",
