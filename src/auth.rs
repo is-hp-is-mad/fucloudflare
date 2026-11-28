@@ -269,7 +269,14 @@ fn client_data(raw: &[u8], kind: &str, panel_host: Option<&str>) -> Result<(Stri
     }
     let origin = data["origin"].as_str().unwrap_or_default();
     let rp = relying_party(origin, panel_host).ok_or_else(|| AuthError::passkey(format!("passkeys do not work from {origin}: open the panel under its own host name")))?;
-    Ok((data["challenge"].as_str().unwrap_or_default().to_string(), rp))
+    Ok((answered_challenge(data["challenge"].as_str().unwrap_or_default()), rp))
+}
+
+/// The browser writes the challenge into the client data as base64url of the
+/// bytes it was given; the panel hands it our (text) challenge as UTF-8 bytes.
+/// Anything that does not decode that way is taken as it is (and will not match).
+fn answered_challenge(field: &str) -> String {
+    unb64(field).and_then(|raw| String::from_utf8(raw).ok()).filter(|s| s.starts_with(PENDING_PREFIX)).unwrap_or_else(|| field.to_string())
 }
 
 /// Check the authenticator data: made for this relying party, with the
@@ -2515,7 +2522,8 @@ mod tests {
         }
 
         fn client_data(kind: &str, challenge: &str, origin: &str) -> Vec<u8> {
-            json!({ "type": kind, "challenge": challenge, "origin": origin, "crossOrigin": false }).to_string().into_bytes()
+            // as a browser does it: base64url of the challenge bytes (the panel passes our text as UTF-8)
+            json!({ "type": kind, "challenge": b64(challenge.as_bytes()), "origin": origin, "crossOrigin": false }).to_string().into_bytes()
         }
 
         fn rp(origin: &str) -> String {

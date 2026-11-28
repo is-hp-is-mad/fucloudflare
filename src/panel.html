@@ -499,11 +499,13 @@ function showBox(title, html, okText = "好") {
 // ------------------------------------------------------------- passkeys ----
 const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+// Our challenges are signed text tokens ("fucf_p1.…"), not base64url: the browser gets their UTF-8 bytes.
+const challengeBytes = s => s.startsWith("fucf_p1.") ? new TextEncoder().encode(s) : unb64u(s);
 const canPasskey = () => !!(window.PublicKeyCredential && navigator.credentials);
 async function passkeyAssert(challenge, verify) {
   if (!canPasskey()) throw new Error("这个浏览器（或当前访问方式）不支持通行密钥");
   let cred;
-  try { cred = await navigator.credentials.get({ publicKey: { challenge: unb64u(challenge), rpId: location.hostname, userVerification: verify ? "required" : "preferred", timeout: 120000 } }); }
+  try { cred = await navigator.credentials.get({ publicKey: { challenge: challengeBytes(challenge), rpId: location.hostname, userVerification: verify ? "required" : "preferred", timeout: 120000 } }); }
   catch (e) { throw new Error(e.name === "NotAllowedError" ? "已取消，或没有可用的通行密钥" : "通行密钥不可用：" + e.message); }
   const r = cred.response;
   return { id: cred.id, client_data: b64u(r.clientDataJSON), authenticator_data: b64u(r.authenticatorData), signature: b64u(r.signature) };
@@ -1696,7 +1698,7 @@ const A = {
     let cred;
     try {
       cred = await navigator.credentials.create({ publicKey: {
-        challenge: unb64u(o.challenge), rp: { name: "fucloudflare", id: location.hostname }, user: { id: unb64u(o.user.id), name: o.user.name, displayName: o.user.name },
+        challenge: challengeBytes(o.challenge), rp: { name: "fucloudflare", id: location.hostname }, user: { id: unb64u(o.user.id), name: o.user.name, displayName: o.user.name },
         pubKeyCredParams: o.algorithms.map(alg => ({ type: "public-key", alg })), excludeCredentials: o.exclude.map(id => ({ type: "public-key", id: unb64u(id) })),
         authenticatorSelection: { residentKey: "required", userVerification: "preferred" }, attestation: "none", timeout: 120000 } });
     } catch (e) { throw new Error(e.name === "NotAllowedError" ? "已取消" : "创建失败：" + e.message); }
