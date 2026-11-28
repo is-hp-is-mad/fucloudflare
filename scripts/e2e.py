@@ -725,10 +725,10 @@ def run():
     origin_rule = r["result"]["id"]
     check(st == 200, "origin rule created")
     st, h, body = edge("/page")
-    check(st == 200 and "host=example.test ip=127.0.0.1" in body and h["cf-cache-status"] == "DYNAMIC", "request proxied to origin")
-    check(edge("/a/style.css")[1]["cf-cache-status"] == "MISS" and edge("/a/style.css")[1]["cf-cache-status"] == "HIT", "static file cached")
+    check(st == 200 and "host=example.test ip=127.0.0.1" in body and h["fcf-cache-status"] == "DYNAMIC", "request proxied to origin")
+    check(edge("/a/style.css")[1]["fcf-cache-status"] == "MISS" and edge("/a/style.css")[1]["fcf-cache-status"] == "HIT", "static file cached")
     st, r = api("POST", f"/zones/{zid}/purge_cache", {"purge_everything": True})
-    check(r["success"] and r["result"]["purged"] in (0, 1) and edge("/a/style.css")[1]["cf-cache-status"] == "MISS", "cache purged")
+    check(r["success"] and r["result"]["purged"] in (0, 1) and edge("/a/style.css")[1]["fcf-cache-status"] == "MISS", "cache purged")
     # origin options on a proxied record: the origin is asked for another name than the visitor used
     st, r = api("POST", f"/zones/{zid}/dns_records", {"type": "A", "name": "saas", "content": "127.0.0.1", "proxied": True,
                                                       "origin": {"host_header": "App.Origin.test"}})
@@ -763,7 +763,7 @@ def run():
     check(codes == [200, 200, 429, 429], f"rate limit enforced {codes}")
     st, r = api("GET", f"/zones/{zid}/security/events")
     sources = {e["source"] for e in r["result"]}
-    check(sources == {"managed", "firewall", "ratelimit"}, "security events recorded")
+    check(sources == {"managed", "firewall", "ratelimit", "origin"}, "security events recorded")
     st, r = api("PATCH", f"/zones/{zid}/settings/waf", {"value": "off"})
     check(st == 200 and edge("/?q=%3Cscript%3E")[0] == 200, "managed rules switched off via settings")
 
@@ -807,7 +807,7 @@ def run():
     st, r = api("POST", f"/zones/{zid}/transform_rules", {"expression": "", "set_response_headers": {"X-Edge": "fucf"}})
     check(st == 200 and edge("/page")[1].get("x-edge") == "fucf", "transform rule sets a response header")
     st, r = api("POST", f"/zones/{zid}/cache_rules", {"expression": 'starts_with(http.request.uri.path, "/html/")', "cache": True, "edge_ttl": 60})
-    check(st == 200 and [edge("/html/a")[1]["cf-cache-status"] for _ in range(2)] == ["MISS", "HIT"], "cache rule caches a dynamic path")
+    check(st == 200 and [edge("/html/a")[1]["fcf-cache-status"] for _ in range(2)] == ["MISS", "HIT"], "cache rule caches a dynamic path")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -836,7 +836,7 @@ def run():
     print("ranges, zone settings, CNAME flattening")
     edge("/a/range.css")
     st, h, body = edge("/a/range.css", headers={"Range": "bytes=0-5"})
-    check(st == 206 and h["cf-cache-status"] == "HIT" and h["content-range"].startswith("bytes 0-5/") and body == "origin", "byte range cut from the cached object")
+    check(st == 206 and h["fcf-cache-status"] == "HIT" and h["content-range"].startswith("bytes 0-5/") and body == "origin", "byte range cut from the cached object")
     api("PATCH", f"/zones/{zid}/settings/security_level", {"value": "under_attack"})
     st, h, body = edge("/page")
     check(st == 403 and "Checking your browser" in body, "under attack mode challenges visitors")

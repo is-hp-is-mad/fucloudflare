@@ -900,10 +900,10 @@ def t1_036(ctx: TestContext) -> None:
     c = ctx.ensure_cluster()
     z = ctx.create_zone(f"{tag}.test", node="peer_a", origin_port=ctx.origin1.port)
     c.wait_converged(lambda: c.edge("peer_b", "/a/style.css", host=f"{tag}.test")[0] == 200)
-    assert c.edge("peer_b", "/a/style.css", host=f"{tag}.test")[1]["cf-cache-status"] == "HIT"
+    assert c.edge("peer_b", "/a/style.css", host=f"{tag}.test")[1]["fcf-cache-status"] == "HIT"
     st_p, _ = c.api("peer_a", "POST", f"/zones/{z['id']}/purge_cache", {"purge_everything": True})
     assert st_p == 200
-    c.wait_converged(lambda: c.edge("peer_b", "/a/style.css", host=f"{tag}.test")[1]["cf-cache-status"] == "MISS")
+    c.wait_converged(lambda: c.edge("peer_b", "/a/style.css", host=f"{tag}.test")[1]["fcf-cache-status"] == "MISS")
 
 
 @register_test("T1-103", "1", "r2", ("REQ-07",), "Tombstone delete then re-create item with same name propagates to peer")
@@ -1146,7 +1146,7 @@ def t1_048(ctx: TestContext) -> None:
     ctx.create_zone(f"{tag}.test", node="peer_a", origin_port=ctx.origin1.port)
     c.wait_converged(lambda: c.edge("accel_jp", "/a/style.css", host=f"{tag}.test")[0] == 200)
     st, hdrs, _ = c.edge("accel_jp", "/a/style.css", host=f"{tag}.test")
-    assert st == 200 and hdrs.get("cf-cache-status") == "HIT"
+    assert st == 200 and hdrs.get("fcf-cache-status") == "HIT"
 
 
 @register_test("T1-049", "1", "r2", ("REQ-10",), "accel_jp creates zero local state.json, accounts.json, or persistent DB files")
