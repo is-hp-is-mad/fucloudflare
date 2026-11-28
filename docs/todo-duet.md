@@ -221,6 +221,96 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
   一个 DNS-01 插件、一个 DDNS 客户端。每个工具一个作业，互不影响。
 - 这份工作流需要实际运行后再调整，写清楚每一步预期什么即可。
 
+### 第三批（T14 之后，2026-11-28 定）
+
+- 这一批按 `docs/todo-duet-new.md` 第 0 节的规则做：核心文件可以小步改；依赖只在任务写明时才加，钉版本、选发布一周以上的版本。
+- 已经排除、不做：DoH / Gateway、发信、Zero Trust、AI Gateway、Workers AI、Vectorize、Containers、Browser Rendering、Realtime、Pipelines。
+- 顺序照编号做，每个任务一个提交；做不了的子项写明原因跳过。
+
+### [ ] T14 补上已知的接口缺口
+
+- `GET /accounts/{id}/workers/services/{name}`：脚本不存在时回 Cloudflare 的错误码 10007（wrangler 也认 10090），存在时回 `default_environment.script` 里 wrangler 会读的字段（`tag`、`tags`、`last_deployed_from`）。照 N12 交接里从 wrangler 4 包里读到的调用顺序，查清 `wrangler deploy` 接下来还要哪些接口（secrets 检查、`/subdomain`、`/schedules`、路由），能用现有数据回答的就回答，回答不了的在文档写清。
+- `GET /zones/`（带尾斜杠）和 `/zones` 一样回答，其他列表接口顺手检查一遍。
+- `--ban-export` 不写 IPv6：autofw 存的是 /64 封禁，banset 只收单个地址，导出时 IPv6 一项都没有。导出里写出 /64 前缀（或说明只导出 IPv4），并加测试。
+- 纯加速节点的 full_resync（`src/store.rs` 的 `merge_delta_data`）只保留区域、记录、Workers、节点、调度、IP 列表和 ACME 挑战，各条目集合（custom_hostnames、waiting_rooms、log_jobs、alert_channels、challenge_widgets、rules 等）会丢；老节点对新节点做 full_resync 时还会清空 ip_lists。改成全部保留，并加测试。
+
+### [ ] T15 API Shield
+
+- 域名下的 API 端点清单（方法 + 路径模板，如 `GET /api/users/{id}`）；可选地上传 OpenAPI 3 文件生成清单（只取路径、方法、参数和请求体 schema，不支持的部分忽略并报告）。
+- 模式校验：请求体是 JSON 时按 schema 的子集（type、required、enum、长度与数值范围）校验；不在清单里的端点可设为记录或拦截。
+- 规则字段：`cf.api_gateway.request_violates_schema` 等，照 `src/expr.rs` 现有字段写法。
+- 测试：模板匹配、schema 子集校验、未知端点的处理、清单大小上限。
+
+### [ ] T16 Page Shield
+
+- 给 HTML 响应加 `Content-Security-Policy-Report-Only`（可配置），收 `/cdn-cgi/` 下的 CSP 报告，按脚本来源聚合成"页面加载的脚本清单"。
+- 新出现的脚本来源可接 T6 的告警。报告体有大小和频率上限，来源只记主机名和路径，不记查询串。
+- 测试：报告解析（两种 CSP 报告格式）、聚合、上限。
+
+### [ ] T17 泄露凭据检测
+
+- 在登录类请求（可配置路径与表单字段名，默认识别常见的 `username`/`email` + `password`）里，把密码做 SHA-1 后取前缀，和本地的泄露哈希前缀表比对（表由运营者用文件提供，格式写清；不在请求路径上联网查询）。
+- 结果只作为规则字段 `cf.waf.credential_check.password_leaked` 暴露，由用户自己的规则决定拦截或加头；密码和哈希不进日志、不进 trace。
+- 测试：字段提取（表单和 JSON）、前缀比对、明文绝不出现在日志里。
+
+### [ ] T18 Snippets
+
+- 比 Worker 轻的请求 / 响应改写：在现有 Workers 运行时上跑一段受限脚本（只能改请求头、URL、响应头，不能发子请求、不能用绑定），按规则表达式匹配。
+- 资源上限比 Worker 小；属于区域对象，T12 的归属规则照用（普通用户能写自己区域的 Snippet，因为它拿不到账户级绑定；这一点在交接里写清）。
+- 测试：只能做允许的改动、越界调用报错、超时。
+
+### [ ] T19 托管改写（Managed Transforms）
+
+- 一组开关：去掉 `X-Powered-By`、加访客位置头（`cf-ipcountry` 已有的话核对）、加 `True-Client-IP`、加安全头组（`X-Content-Type-Options` 等）。
+- 照 Cloudflare 的 `managed_headers` 接口形状。测试每个开关开和关。
+
+### [ ] T20 防盗链与 Scrape Shield
+
+- 防盗链：图片等静态类型的请求，`Referer` 不是本域名（可配白名单）时回 403；空 Referer 放行。
+- 邮箱混淆：HTML 里的邮箱地址改写成需要脚本还原的形式；`<!--email_off-->` 区块不改。
+- 测试：Referer 判断、HTML 改写不破坏标签和属性。
+
+### [ ] T21 签名 URL
+
+- 区域设置一组密钥（存法照 T10 的 DKIM 私钥），规则可要求请求带有效签名：`?verify=<过期时间>-<HMAC>`，签名覆盖路径和过期时间。
+- 支持密钥轮换（新旧两把同时有效）。比较用常量时间。测试：有效、过期、篡改路径、错密钥、轮换。
+
+### [ ] T22 Cache Reserve
+
+- 缓存的第三层：磁盘层淘汰的对象写到一个持久目录（可以是另一块盘），命中时回填到上层。
+- 有总大小上限和最长保存期；清除要同样覆盖这一层（含 N6 的分片）。测试：淘汰后从这一层命中、清除、上限。
+
+### [ ] T23 AI 爬虫控制
+
+- 区域开关：拦截已知 AI 爬虫（按 UA 和已验证爬虫的网络，名单放在代码里一处，写清来源和更新方法）；可选地只给它们回 `robots.txt` 规定。
+- 托管 `robots.txt`：开启时在源站的 `robots.txt` 后面追加 AI 爬虫的禁止条目（源站没有就生成一份）。
+- 测试：名单匹配、robots.txt 合并。
+
+### [ ] T24 Web Analytics
+
+- 可选地往 HTML 里注入一个很小的统计脚本（自带，放在 `/cdn-cgi/` 下，不引第三方），收页面浏览、来源、路径、加载时间，不用 Cookie、不记 IP。
+- 面板里按天展示。数据按天汇总后丢掉明细。测试：注入位置、上报解析、汇总。
+
+### [ ] T25 L3/4 DDoS 防护
+
+- 在现有自动防火墙（`autofw`）和 nftables 导出的基础上：按源地址 / 网段的新连接速率、半开连接数、UDP 包速率做阈值，超过就进封禁集；QUIC 的无效初始包计数。
+- 只写本进程能看到的指标，不改内核参数；阈值可配、默认保守。测试：阈值判断、封禁到期。
+
+### [ ] T26 Hyperdrive
+
+- Worker 绑定一个数据库连接（先只做 PostgreSQL），边缘节点维护连接池，Worker 通过绑定发查询。
+- 拿不准协议细节就先做连接池和绑定接口的骨架，查询走现有依赖能做到的范围；依赖需要新增时先停下写进交接。
+
+### [ ] T27 Workflows
+
+- 多步骤、可重试、可睡眠的持久任务：每一步的结果存进 store，失败按退避重试，`step.sleep` 由定时器唤醒。建在现有 Workers 与 cron 上。
+- 测试：步骤结果持久、重试次数、睡眠后继续、取消。
+
+### [ ] T28 Analytics Engine
+
+- Worker 绑定 `writeDataPoint({blobs, doubles, indexes})`，按数据集存（SQLite，已有 rusqlite），带保留期；接口提供 SQL 子集查询（只读、限时、限行数）。
+- 测试：写入、查询子集、保留期清理、恶意 SQL 被拒。
+
 ## 4. 交接记录
 
 每个任务完成后追加一段：加了什么文件、在哪里接的线、哪些地方没把握或需要第 1.4 节那些文件配合。
