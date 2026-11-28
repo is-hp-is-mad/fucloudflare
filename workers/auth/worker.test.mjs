@@ -389,6 +389,9 @@ test("Passkey WebAuthn registration and assertion", async () => {
   assert.equal(finLogin.status, 200);
   const pkCookie = extractCookie(finLogin, "fucf_auth_sid");
   assert.ok(pkCookie.startsWith("fucf_auth_sid="));
+  // the signature counter of this authenticator stays 0 (as synced passkeys do): sign-ins are counted anyway
+  const account = await (await worker.fetch(new Request("https://auth.fucloudflare.com/account", { headers: { cookie: pkCookie } }), env, {})).text();
+  assert.ok(account.includes("登录 1 次") && account.includes("1 sign-in,"), "the passkey's sign-ins are counted");
 });
 
 test("Linux.do Connect OAuth2 login and account page Kumo UI + CSP", async () => {
@@ -1025,4 +1028,42 @@ test("A database from an older version gets the newer tables", async () => {
   assert.equal(res.status, 200);
   const t = await env.AUTH_DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'").first();
   assert.ok(t, "the settings table was added");
+});
+
+test("A database from an older version gets the newer tables", async () => {
+  const env = makeEnv();
+  // what an earlier version left behind: no settings table
+  await env.AUTH_DB.exec(`
+    CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_secret_hash TEXT, name TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+      scopes TEXT NOT NULL DEFAULT 'openid profile email', require_pkce INTEGER NOT NULL DEFAULT 1, trusted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE spent_tokens (jti TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+  `);
+  const res = await worker.fetch(new Request("https://auth.fucloudflare.com/login"), env, {});
+  assert.equal(res.status, 200);
+  const t = await env.AUTH_DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'").first();
+  assert.ok(t, "the settings table was added");
+});
+
+test("Signing out with the account page's form works under the page's referrer policy", async () => {
+  const env = makeEnv();
+  const base = "https://auth.fucloudflare.com";
+  const reg = await worker.fetch(new Request(base + "/register", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "out@example.com", username: "out", password: "a long password here" }),
+  }), env, {});
+  const cookie = extractCookie(reg, "fucf_auth_sid");
+  const page = await worker.fetch(new Request(base + "/account", { headers: { cookie } }), env, {});
+  assert.equal(page.headers.get("referrer-policy"), "same-origin");
+  const csrf = /name="csrf_token" value="([^"]+)"/.exec(await page.text())[1];
+  const post = (headers) => worker.fetch(new Request(base + "/logout", {
+    method: "POST", redirect: "manual",
+    headers: Object.assign({ "content-type": "application/x-www-form-urlencoded", cookie }, headers),
+    body: "csrf_token=" + encodeURIComponent(csrf),
+  }), env, {});
+  // another site posting the form: refused
+  assert.equal((await post({ origin: "null", "sec-fetch-site": "cross-site" })).status, 403);
+  assert.equal((await post({ origin: "null" })).status, 403, "no browser vouching for it");
+  // what a browser sends for our own form (older pages had a no-referrer policy)
+  const out = await post({ origin: "null", "sec-fetch-site": "same-origin" });
+  assert.equal(out.status, 302);
 });

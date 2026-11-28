@@ -571,7 +571,8 @@ function securityHeaders(extra) {
   const h = new Headers({
     "x-content-type-options": "nosniff",
     "x-frame-options": "DENY",
-    "referrer-policy": "no-referrer",
+    // "no-referrer" makes browsers send `Origin: null` with same-site form posts
+    "referrer-policy": "same-origin",
     "content-security-policy":
       "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https: http:;",
   });
@@ -622,8 +623,10 @@ function safeReturnTo(val, fallback = "/account") {
 
 function verifySameOrigin(request, url) {
   const origin = request.headers.get("origin");
+  const secFetchSite = (request.headers.get("sec-fetch-site") || "").toLowerCase();
   if (origin) {
-    if (origin === "null") return false;
+    // a form post under a strict referrer policy; Sec-Fetch-Site is set by the browser itself
+    if (origin === "null") return secFetchSite === "same-origin";
     try {
       return new URL(origin).origin === url.origin;
     } catch (_) {
@@ -638,7 +641,6 @@ function verifySameOrigin(request, url) {
       return false;
     }
   }
-  const secFetchSite = (request.headers.get("sec-fetch-site") || "").toLowerCase();
   if (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") {
     return false;
   }
@@ -1190,7 +1192,9 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
   const passkeyRows = passkeys.length
     ? passkeys.map((pk) => `
       <div class="row">
-        <div><b>${escapeHtml(pk.name)}</b><small><span class="mono">${escapeHtml(pk.id.slice(0, 16))}…</span> · ${t(`已使用 ${pk.sign_count} 次`, `used ${pk.sign_count} times`)}</small></div>
+        <div><b>${escapeHtml(pk.name)}</b><small>${t(`创建于 ${fmtDate(pk.created_at)}`, `added ${fmtDate(pk.created_at)}`)} · ${pk.uses
+          ? t(`登录 ${pk.uses} 次，上次 ${fmtDate(pk.last_used_at)}`, `${pk.uses} sign-in${pk.uses === 1 ? "" : "s"}, last ${fmtDate(pk.last_used_at)}`)
+          : t("还没用它登录过", "not used to sign in yet")}</small></div>
         <button type="button" class="outbad sm" data-action="del-passkey" data-id="${escapeHtml(pk.id)}">${t("删除", "Remove")}</button>
       </div>`).join("")
     : `<p class="empty">${t("还没有通行密钥。添加一个，下次用指纹、面容或安全密钥直接登录。", "No passkeys yet. Add one to sign in with your fingerprint, face or security key.")}</p>`;
@@ -2049,6 +2053,10 @@ async function handlePasskeyLoginFinish(request, env, url) {
   const now = Math.floor(Date.now() / 1000);
   await env.AUTH_DB.prepare("UPDATE passkeys SET sign_count = ?, last_used_at = ? WHERE id = ?")
     .bind(signCount, now, credId).run();
+  // Synced passkeys (iCloud Keychain, Google Password Manager…) always report a
+  // signature counter of 0, so the number of sign-ins is counted here.
+  const uses = Number((await env.AUTH_KV.get("pk_uses:" + credId)) || 0) + 1;
+  await env.AUTH_KV.put("pk_uses:" + credId, String(uses));
 
   const sid = await createSession(env, request, pk.user_id, ["hwk", "pop"]);
   return jsonResponse(
@@ -2359,9 +2367,10 @@ async function handleAccountPage(request, env) {
   const session = await getSession(request, env);
   if (!session) return Response.redirect(new URL(request.url).origin + "/login?return_to=%2Faccount", 302);
 
-  const pkRes = await env.AUTH_DB.prepare("SELECT id, name, sign_count, created_at FROM passkeys WHERE user_id = ?")
+  const pkRes = await env.AUTH_DB.prepare("SELECT id, name, sign_count, created_at, last_used_at FROM passkeys WHERE user_id = ? ORDER BY created_at")
     .bind(session.user.id).all();
   const passkeys = (pkRes && pkRes.results) || [];
+  for (const pk of passkeys) pk.uses = Number((await env.AUTH_KV.get("pk_uses:" + pk.id)) || 0);
   const identities = await getUserProviders(env, session.user.id);
   const allProviders = await listConfiguredOAuthProviders(env);
 
