@@ -135,6 +135,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `hsts_max_age` / `hsts_include_subdomains` | 秒（默认 0）/ bool | HTTPS 响应带 `Strict-Transport-Security`；0 表示不发 |
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
 | `origin_check_path` / `origin_check_interval` | 路径（默认空）/ 秒（默认 30） | 源站主动健康检查：每个节点定期请求每个源站地址的这个路径，连续两次失败（无应答或状态码不是 2xx/3xx）的地址排到最后；`GET /zones/{id}/origins/health` 查看本节点的检查结果 |
+| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点 |
 | `session_affinity` | bool（默认关） | 会话保持：同一访客 IP 始终回到同一个源站地址（记录的 `origin.weight`，1–100，决定各地址分到的请求比例） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
 

@@ -181,6 +181,9 @@ pub struct Settings {
     /// Secondary name servers (addresses, or networks as `address/prefix`) that may
     /// transfer the zone (AXFR); the single addresses are sent a NOTIFY when it changes.
     pub dns_transfer_to: Vec<String>,
+    /// Tiered cache: the node the others fetch cacheable requests through (empty: every
+    /// node asks the origin itself).
+    pub cache_tier_node: String,
 }
 
 impl Default for Settings {
@@ -215,6 +218,7 @@ impl Default for Settings {
             origin_check_interval: 30,
             session_affinity: false,
             dns_transfer_to: Vec::new(),
+            cache_tier_node: String::new(),
         }
     }
 }
@@ -243,6 +247,9 @@ impl Settings {
         }
         if self.dns_transfer_to.len() > 16 || self.dns_transfer_to.iter().any(|e| !crate::dns::transfer::valid(e)) {
             return invalid("dns_transfer_to holds at most 16 addresses or networks (address/prefix)");
+        }
+        if self.cache_tier_node.len() > 64 {
+            return invalid("cache_tier_node is the name of a node, or empty");
         }
         if !(10..=3600).contains(&self.origin_check_interval) {
             return invalid("origin_check_interval is 10 to 3600 seconds");

@@ -1402,6 +1402,23 @@ impl Edge {
             options = records.iter().find_map(|r| r.origin.as_ref());
             origin_node = options.and_then(|o| o.node.clone());
         }
+        // Tiered cache: what may be cached is fetched through the zone's upper-tier node, whose
+        // copy then serves every node and spares the origin. That node is asked as a visitor
+        // would ask it (it applies the origin's own options and rules); when it just failed,
+        // the origin is asked directly.
+        let upper = zone.zone.settings.cache_tier_node.trim();
+        if !upper.is_empty() && origin_node.is_none() && origin_host.is_none() && matches!(info.method.as_str(), "GET" | "HEAD") {
+            let me = crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.get().map(String::as_str));
+            let node = snap.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(upper)).filter(|n| !n.name.eq_ignore_ascii_case(&me));
+            let failed = |n: &crate::items::EdgeNode| {
+                let (down, now) = (self.down.lock().unwrap(), Instant::now());
+                [n.ipv4.map(|a| a.to_string()), n.ipv6.map(|a| a.to_string())].into_iter().flatten().any(|a| down.get(&a).is_some_and(|until| *until > now))
+            };
+            if let Some(node) = node.filter(|n| !failed(n)) {
+                origin_node = Some(node.name.clone());
+                (options, host_header, sni, port, scheme) = (None, None, None, None, Some("https".to_string()));
+            }
+        }
 
         let (host, candidates) = if let Some(target_node) = origin_node {
             let me = crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.get().map(String::as_str));
