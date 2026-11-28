@@ -407,7 +407,7 @@ DNS 记录的 Cloudflare 兼容补充：
 - `challenge_script`（默认开，只在域名可能要求验证时生效）：在 HTML 页面里插入 `/cdn-cgi/challenge-platform/fcf.js`。空闲时后台悄悄通过验证；
   页面里的 `fetch` 被要求验证时就地弹出验证框，通过后自动重发（XHR 无法重发，通过后下一次请求即可）。
 - 被要求验证的非页面请求（`Sec-Fetch-Mode` 不是 `navigate`，或 `Accept` 不含 `text/html`）得到 JSON，响应头 `fcf-mitigated: challenge`。
-- 响应头一律用 `fcf-` 前缀（`fcf-cache-status`、`fcf-mitigated`、`fcf-ray`），不发任何 `cf-` 开头的头；源站在 Cloudflare 后面时它发的 `cf-*` 会被去掉。
+- 响应头一律用 `fcf-` 前缀（`fcf-cache-status`、`fcf-mitigated`，以及 `fucf-ray`），不发任何 `cf-` 开头的头；源站在 Cloudflare 后面时它发的 `cf-*` 会被去掉。
   回源请求带 `fcf-connecting-ip` / `fcf-ipcountry`（以及给为 Cloudflare 写的程序用的 `cf-connecting-ip` / `cf-ipcountry`）。
 
 ## 备份与恢复

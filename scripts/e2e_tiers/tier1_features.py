@@ -660,7 +660,7 @@ def t1_023(ctx: TestContext) -> None:
     assert st2 == 200 and json.loads(body)["ts"] > 1_700_000_000_000
 
 
-@register_test("T1-024", "1", "r1", ("REQ-05",), "Cron triggered via /workers/scripts/{name}/schedules/trigger API")
+@register_test("T1-024", "1", "r1", ("REQ-05",), "Cron triggered via /workers/scripts/{name}/scheduled API")
 def t1_024(ctx: TestContext) -> None:
     tag = ctx.next_tag("t1024")
     c = ctx.ensure_cluster()
@@ -684,7 +684,7 @@ def t1_024(ctx: TestContext) -> None:
     assert st2 == 200 and json.loads(body) == {"v": "yes"}
 
 
-@register_test("T1-025", "1", "r1", ("REQ-05",), "Cron 5-field UTC expression validation & /schedules API")
+@register_test("T1-025", "1", "r1", ("REQ-05",), "Cron 5-field UTC expression validation & the crons in /settings")
 def t1_025(ctx: TestContext) -> None:
     tag = ctx.next_tag("t1025")
     c = ctx.ensure_cluster()
@@ -697,9 +697,9 @@ def t1_025(ctx: TestContext) -> None:
         f"{tag}.test/*",
         crons=["0 */2 * * 1-5"],
     )
-    st, r = c.api("peer_a", "GET", ContractConfig.WORKER_SCRIPTS_PATH + f"/{sname}/schedules")
+    st, r = c.api("peer_a", "GET", ContractConfig.WORKER_SCRIPTS_PATH + f"/{sname}/settings")
     assert st == 200 and r.get("success")
-    crons = r["result"] if isinstance(r["result"], list) else r["result"].get("schedules", [])
+    crons = r["result"] if isinstance(r["result"], list) else r["result"].get("crons", [])
     assert any((x.get("cron") if isinstance(x, dict) else x) == "0 */2 * * 1-5" for x in crons)
 
 
@@ -1092,7 +1092,7 @@ def t1_045(ctx: TestContext) -> None:
     st_b, r_b = c.api("peer_a", "POST", "/account/passkeys/begin", {}, token=tok, headers={"Origin": origin})
     assert st_b == 200
     reg = sim.register(r_b["result"]["challenge"], origin, name="cross-node-key")
-    st_f, r_f = c.api("peer_a", "POST", "/account/passkeys/finish", reg, token=tok)
+    st_f, r_f = c.api("peer_a", "POST", ContractConfig.PASSKEY_REGISTER_PATH, reg, token=tok)
     assert st_f == 200, f"passkey register failed: {st_f} {r_f}"
 
     # Wait for user passkey to sync to peer_b
@@ -2195,7 +2195,7 @@ def t1_098(ctx: TestContext) -> None:
             localStorage.setItem('fucf_token', {json.dumps(tok)});
             location.hash = '#/workers';
             await new Promise(r => setTimeout(r, 150));
-            const r = await fetch('/client/v4/workers/d1/databases/{db_id}/query', {{
+            const r = await fetch('/client/v4/d1/database/{db_id}/query', {{
                 method: 'POST',
                 headers: {{ 'Authorization': 'Bearer ' + {json.dumps(tok)}, 'Content-Type': 'application/json' }},
                 body: JSON.stringify({{ sql: 'SELECT 1 AS ok' }})

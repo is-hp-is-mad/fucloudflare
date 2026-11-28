@@ -88,7 +88,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
   响应头写的是 `CF-Cache-Status`（实际是 `fcf-cache-status`）；防火墙动作缺 `managed_challenge`；`security_level` 的取值不全。
 - `docs/api.md` 只覆盖了一部分接口。对照 `src/api.rs` 里全部 `.route(` 和 `crud::<`，补成完整的接口参考（方法、路径、请求体字段、示例）。
 
-### [ ] T2 e2e 分层测试的静态对齐
+### [x] T2 e2e 分层测试的静态对齐
 
 - `scripts/e2e_tiers/`（T1 到 T4）里的接口路径和代码不一致，例如 `harness.py` 的
   `KV_NAMESPACES_PATH = "/workers/kv/namespaces"`（实际是 `/kv/namespaces`）、D1 的路径（实际是 `/d1/database`）。
@@ -233,6 +233,13 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 
 - 按第 5 节加了 `.github/workflows/release.yml` 和 `scripts/deploy/node-upgrade.sh`（照原文，LF，可执行）。
 - `ci` 的产物 `fucf-linux-x86_64` 只保留 30 天（`retention-days: 30`），超过 30 天的提交 `release` 取不到二进制，要先重跑一次 `ci`。
+
+### T2
+
+- `scripts/e2e_tiers/harness.py`：`KV_NAMESPACES_PATH` 改成 `/kv/namespaces`，`D1_DATABASES_PATH` 改成 `/d1/database`；补上被引用却没定义的 `WORKER_CRON_TRIGGER_PATH`（`/workers/scripts/{name}/scheduled`），新增 `PASSKEY_REGISTER_PATH`（`/account/passkeys`）。
+- `tier1_features.py` / `tier2_boundaries.py`：浏览器里直接写的 D1 路径、`/account/passkeys/finish`（实际是 `POST /account/passkeys`）、T1-025 读的 `/schedules`（实际在 `GET …/settings` 的 `crons`）；`tier2` 里调 `/replication/sync` 时去掉了 `prefix=""`（路由在 `/client/v4` 下）。
+- 响应头：分层测试里已经全是 `fcf-*`；射线头实际是 `fucf-ray`（`src/edge/mod.rs`），测试写的也是它，没改；顺手把 README 里写成 `fcf-ray` 的一处改正。
+- 疑点（没改，留给能运行的人）：`OAUTH_CLIENTS_PATH = "/oauth/clients"` 在 `src/api.rs` 里没有这条路由，OAuth 客户端是 `workers/auth/` 那个 Worker 自己管的（D1 表 `oauth_clients`），T1-08x 和 T2 里注册客户端的几个测试应该改走 Worker 的管理接口；`PANEL_HOST` / `AUTH_HOST` 用的不是示例域名；`tier2` 里 `scheduledTime` / `dedup` 这两个请求体字段 `trigger_worker_scheduled` 不认识（它只读 `cron`）。
 
 ## 5. 部署（通过 Komari）
 

@@ -576,9 +576,9 @@ def t2_030(ctx: TestContext) -> None:
 def t2_031(ctx: TestContext) -> None:
     c = ctx.ensure_cluster()
     for method in ("GET", "POST"):
-        st, _ = c.api("peer_a", method, ContractConfig.SYNC_PATH, token="", prefix="")
+        st, _ = c.api("peer_a", method, ContractConfig.SYNC_PATH, token="")
         assert st == 401
-        st2, _ = c.api("peer_a", method, ContractConfig.SYNC_PATH, token="wrong-token", prefix="")
+        st2, _ = c.api("peer_a", method, ContractConfig.SYNC_PATH, token="wrong-token")
         assert st2 == 401
 
 
@@ -586,7 +586,7 @@ def t2_031(ctx: TestContext) -> None:
 def t2_032(ctx: TestContext) -> None:
     c = ctx.ensure_cluster()
     before = c.api("peer_a", "GET", "/zones")[1]["result"]
-    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, raw="{not-valid-json", prefix="")
+    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, raw="{not-valid-json")
     assert st == 400
     after = c.api("peer_a", "GET", "/zones")[1]["result"]
     assert len(after) == len(before)
@@ -605,7 +605,7 @@ def t2_033(ctx: TestContext) -> None:
         "node": "stale-node",
         "zones": [{**z, "settings": {**z["settings"], "waf": "off"}, "sync": {"updated_ms": 1, "node": "stale-node", "seq": 0, "deleted": False}}],
     }
-    st, _ = c.api("peer_b", "POST", ContractConfig.SYNC_PATH, body=stale_payload, prefix="")
+    st, _ = c.api("peer_b", "POST", ContractConfig.SYNC_PATH, body=stale_payload)
     assert st in (200, 400)
     assert c.api("peer_b", "GET", f"/zones/{zid}")[1]["result"]["settings"]["waf"] == "block"
 
@@ -643,7 +643,7 @@ def t2_035(ctx: TestContext) -> None:
 @register_test("T2-102", "2", "r2", ("REQ-07",), "Sync payload containing unknown future field is ignored safely")
 def t2_102(ctx: TestContext) -> None:
     c = ctx.ensure_cluster()
-    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, body={"node": "future-peer", "future_field_v99": {"x": 1}}, prefix="")
+    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, body={"node": "future-peer", "future_field_v99": {"x": 1}})
     assert st == 200 and c.api("peer_a", "GET", "/system")[0] == 200
 
 
@@ -687,7 +687,7 @@ def t2_037(ctx: TestContext) -> None:
     c.edge("peer_a", "/init", host=host)
     c.wait_converged(lambda: json.loads(c.edge("peer_b", "/read", host=host)[2]).get("v") == "v2")
     # Attempt pushing stale seq=1 delta
-    c.api("peer_b", "POST", ContractConfig.SYNC_PATH, body={"node": "old", "d1_deltas": [{"db_id": db_id, "seq": 1, "sql": "INSERT OR REPLACE INTO t VALUES(1, 'stale')"}]}, prefix="")
+    c.api("peer_b", "POST", ContractConfig.SYNC_PATH, body={"node": "old", "d1_deltas": [{"db_id": db_id, "seq": 1, "sql": "INSERT OR REPLACE INTO t VALUES(1, 'stale')"}]})
     assert json.loads(c.edge("peer_b", "/read", host=host)[2])["v"] == "v2"
 
 
@@ -705,7 +705,7 @@ def t2_038(ctx: TestContext) -> None:
 def t2_039(ctx: TestContext) -> None:
     c = ctx.ensure_cluster()
     huge = json.dumps({"node": "peer_x", "kv_deltas": [{"ns": "x", "key": "k", "value": "A" * (16 * 1024 * 1024)}]})
-    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, raw=huge, prefix="")
+    st, _ = c.api("peer_a", "POST", ContractConfig.SYNC_PATH, raw=huge)
     assert st in (400, 413) and c.api("peer_a", "GET", "/system")[0] == 200
 
 
@@ -1306,7 +1306,7 @@ def t2_105(ctx: TestContext) -> None:
     sim = WebAuthnSimulator(alg=-7)
     origin = f"https://{ContractConfig.PANEL_HOST}"
     chal = c.api("peer_a", "POST", "/account/passkeys/begin", {}, token=utok)[1]["result"]["challenge"]
-    c.api("peer_a", "POST", "/account/passkeys/finish", sim.register(chal, origin), token=utok)
+    c.api("peer_a", "POST", ContractConfig.PASSKEY_REGISTER_PATH, sim.register(chal, origin), token=utok)
     c.api("peer_a", "PATCH", f"/users/{ru['user']['id']}", {"disabled": True}, token=tok)
     chal2 = c.api("peer_a", "POST", "/auth/passkey/begin", {}, token="")[1]["result"]["challenge"]
     st, _ = c.api("peer_a", "POST", "/auth/passkey/finish", sim.assert_login(chal2, origin), token="")

@@ -70,9 +70,11 @@ class ContractConfig:
 
     # Sync & Control Plane API paths (under /client/v4 unless noted)
     SYNC_PATH = "/replication/sync"
-    KV_NAMESPACES_PATH = "/workers/kv/namespaces"
-    D1_DATABASES_PATH = "/workers/d1/databases"
+    KV_NAMESPACES_PATH = "/kv/namespaces"
+    D1_DATABASES_PATH = "/d1/database"
     WORKER_SCRIPTS_PATH = "/workers/scripts"
+    WORKER_CRON_TRIGGER_PATH = "/workers/scripts/{name}/scheduled"
+    PASSKEY_REGISTER_PATH = "/account/passkeys"
     PROXY_RULES_PATH = "/proxy/rules"
     OAUTH_CLIENTS_PATH = "/oauth/clients"
     PANEL_OAUTH_LOGIN_PATH = "/auth/oauth/login"
