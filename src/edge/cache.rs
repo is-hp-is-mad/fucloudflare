@@ -54,6 +54,153 @@ impl Entry {
     }
 }
 
+/// What to do with an origin response.
+#[derive(Debug, PartialEq)]
+pub enum Decision {
+    Store(Duration),
+    /// Eligible content, but the origin's headers forbid caching.
+    Bypass,
+    /// Not eligible for caching at all.
+    Dynamic,
+}
+
+fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|d| match d.trim().split_once('=') {
+            Some((k, v)) => (k.trim().to_ascii_lowercase(), Some(v.trim().trim_matches('"').to_string())),
+            None => (d.trim().to_ascii_lowercase(), None),
+        })
+        .collect()
+}
+
+/// The `max-age` a response declares, if any.
+pub fn max_age(headers: &HeaderMap) -> Option<u64> {
+    directives(headers).into_iter().find(|(k, _)| k == "max-age").and_then(|(_, v)| v?.parse().ok())
+}
+
+/// May this request be answered from / stored into the cache?
+pub fn request_cacheable(method: &Method, headers: &HeaderMap) -> bool {
+    (method == Method::GET || method == Method::HEAD)
+        && !headers.contains_key(header::AUTHORIZATION)
+        && !headers.contains_key(header::UPGRADE)
+}
+
+/// What a `Range` header asks for, of an object of `len` bytes.
+#[derive(Debug, PartialEq)]
+pub enum Range {
+    /// Nothing we act on (no byte range, or several): the whole object.
+    Whole,
+    /// First and last byte, inclusive.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+pub fn parse_range(value: &str, len: u64) -> Range {
+    let Some((first, last)) = value.trim().strip_prefix("bytes=").and_then(|spec| spec.split_once('-')) else {
+        return Range::Whole;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    match (first.parse::<u64>(), last.parse::<u64>()) {
+        (Ok(a), _) if a >= len && (last.is_empty() || last.parse::<u64>().is_ok_and(|b| a <= b)) => Range::Unsatisfiable,
+        (Ok(a), Ok(b)) if a <= b => Range::Part(a, b.min(len - 1)),
+        (Ok(a), Err(_)) if last.is_empty() => Range::Part(a, len - 1),
+        // `-n`: the last n bytes
+        (Err(_), Ok(n)) if first.is_empty() && (n == 0 || len == 0) => Range::Unsatisfiable,
+        (Err(_), Ok(n)) if first.is_empty() => Range::Part(len - n.min(len), len - 1),
+        _ => Range::Whole,
+    }
+}
+
+/// An HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`) as Unix seconds.
+pub fn http_date(value: &header::HeaderValue) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc2822(value.to_str().ok()?.trim()).ok().map(|t| t.timestamp())
+}
+
+fn accept_encoding_bucket(headers: &HeaderMap) -> &'static str {
+    let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
+    match (ae.contains("br"), ae.contains("gzip")) {
+        (true, true) => "br,gzip",
+        (true, false) => "br",
+        (false, true) => "gzip",
+        _ => "",
+    }
+}
+
+/// Query parameters that only tell where a visitor came from: never part of the key.
+fn tracking(param: &str) -> bool {
+    let name = param.split('=').next().unwrap_or("").to_ascii_lowercase();
+    name.starts_with("utm_") || matches!(name.as_str(), "fbclid" | "gclid" | "dclid" | "msclkid" | "yclid" | "mc_eid" | "_ga" | "igshid" | "spm")
+}
+
+/// The key of a request: scheme, host, path and query (without tracking
+/// parameters), and which compressions the client takes.
+pub fn cache_key(ssl: bool, host: &str, uri: &str, req_headers: &HeaderMap) -> String {
+    let uri = match uri.split_once('?') {
+        Some((path, query)) if query.split('&').any(tracking) => {
+            let kept: Vec<&str> = query.split('&').filter(|p| !p.is_empty() && !tracking(p)).collect();
+            if kept.is_empty() { path.to_string() } else { format!("{path}?{}", kept.join("&")) }
+        }
+        _ => uri.to_string(),
+    };
+    format!("{}|{host}{uri}|{ENC}{}", if ssl { "https" } else { "http" }, accept_encoding_bucket(req_headers))
+}
+
+/// Marks the compression part of a key from [`cache_key`].
+const ENC: &str = "ae=";
+
+/// The key under which an uncompressed answer is kept: one copy serves
+/// every client, whatever it accepts (the edge compresses on the way out).
+fn identity_key(key: &str) -> Option<String> {
+    let (head, bucket) = key.rsplit_once(&format!("|{ENC}"))?;
+    (!bucket.is_empty()).then(|| format!("{head}|{ENC}"))
+}
+
+/// `force` makes any content type eligible ("cache everything"); `ttl`
+/// overrides the origin's freshness directives.
+pub fn decide(path: &str, status: StatusCode, headers: &HeaderMap, force: bool, ttl: Option<u64>) -> Decision {
+    let cc = directives(headers);
+    let has = |name: &str| cc.iter().any(|(k, _)| k == name);
+    let secs = |name: &str| cc.iter().find(|(k, _)| k == name).and_then(|(_, v)| v.as_ref()?.parse::<u64>().ok());
+
+    let ext = path.rsplit('/').next().and_then(|f| f.rsplit_once('.')).map(|(_, e)| e.to_ascii_lowercase());
+    let is_static = ext.is_some_and(|e| STATIC_EXT.contains(&e.as_str()));
+    let explicit = has("public") || secs("s-maxage").is_some();
+    if !is_static && !explicit && !force {
+        return Decision::Dynamic;
+    }
+    let default_ttl = match status.as_u16() {
+        200 | 206 => 7200,
+        301 | 308 => 1200,
+        404 | 410 => 180,
+        _ => return Decision::Dynamic,
+    };
+    if status == StatusCode::PARTIAL_CONTENT {
+        return Decision::Bypass;
+    }
+    let forbidden = ttl.is_none() && (has("no-store") || has("private") || has("no-cache"));
+    if forbidden || headers.contains_key(header::SET_COOKIE) {
+        return Decision::Bypass;
+    }
+    // Only `Vary: Accept-Encoding` is supported (it is part of the key).
+    let vary_ok = headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .all(|v| v.trim().eq_ignore_ascii_case("accept-encoding"));
+    if !vary_ok {
+        return Decision::Bypass;
+    }
+    match ttl.or(secs("s-maxage")).or(secs("max-age")).unwrap_or(default_ttl) {
+        0 => Decision::Bypass,
+        ttl => Decision::Store(Duration::from_secs(ttl.min(31_536_000))),
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     /// Entry and when it was last used (a tick of `clock`).
@@ -125,7 +272,8 @@ impl Cache {
             return Some(hit);
         }
         let disk = self.disk.as_ref()?;
-        for k in [Some(key.to_string()), identity_key(key)].into_iter().flatten() {
+        let candidates: Vec<String> = [Some(key.to_string()), identity_key(key)].into_iter().flatten().collect();
+        for k in candidates {
             let Some(file) = disk.file_of(&k) else { continue };
             let read = tokio::task::spawn_blocking(move || Disk::read(&file)).await.ok().flatten();
             match read {
