@@ -2115,3 +2115,29 @@ async fn the_panel_is_answered_here_when_its_node_is_gone() {
     let r = get(&env, "panel.example.net", "/client/v4/system").await;
     assert!(r.status == 200 && r.body.contains("GET /client/v4/system"), "{}", r.body);
 }
+
+#[tokio::test]
+async fn a_node_named_by_its_address_answers_sync_itself() {
+    let env = setup().await;
+    let _ = env.edge.panel.set(("panel.example.net".to_string(), ([127, 0, 0, 1], env.origin_port).into()));
+    // the panel's node: nobody listens there, and that it was tried is remembered
+    let _ = env.edge.panel_origin.set(panel_origin("127.0.0.1:1", "panel.example.net").unwrap());
+    let _ = env.edge.panel_seal.set("seal".into());
+    let tried = || env.edge.panel_down_until.swap(0, Ordering::Relaxed) > 0;
+    let sync = |extra: &'static str| send(&env, "GET", "panel.example.net", "/client/v4/replication/sync?since=0", extra, "");
+    // sealed, but not from a node of the fleet: passed on like the rest of the panel
+    sync("fucf-sync-direct: seal\r\n").await;
+    assert!(tried());
+    env.store.save_node(None, json!({ "name": "peer", "ipv4": "127.0.0.1" })).unwrap();
+    // sealed, from a node: this node's own API answers, the panel's node is left alone
+    let r = sync("fucf-sync-direct: seal\r\n").await;
+    assert!(r.status == 200 && r.body.contains("origin=main GET /client/v4/replication/sync?since=0 host=panel.example.net"), "{}", r.body);
+    assert!(!tried());
+    // a node that found this one by the panel's name (no seal), a wrong seal, another API: the panel's node
+    sync("").await;
+    assert!(tried());
+    sync("fucf-sync-direct: other\r\n").await;
+    assert!(tried());
+    send(&env, "GET", "panel.example.net", "/client/v4/zones", "fucf-sync-direct: seal\r\n", "").await;
+    assert!(tried());
+}

@@ -199,9 +199,12 @@ impl PeerSync {
                 .method(method)
                 .uri(format!("/client/v4{path}"))
                 .header("authorization", format!("Bearer {}", self.token))
-                .header("x-fucf-node-role", self.role.as_str())
-                // a node spoken to by its address answers sync itself (see crate::edge::SYNC_DIRECT)
-                .header(crate::edge::SYNC_DIRECT, crate::release::sha256_hex(format!("fucf panel hop\n{}", self.token).as_bytes()));
+                .header("x-fucf-node-role", self.role.as_str());
+            // a node spoken to by its address answers sync itself (see crate::edge::SYNC_DIRECT);
+            // one found by a name is whichever node that resolves to, and passes sync on to the panel's node
+            if target.host.parse::<IpAddr>().is_ok() {
+                req = req.header(crate::edge::SYNC_DIRECT, crate::release::sha256_hex(format!("fucf panel hop\n{}", self.token).as_bytes()));
+            }
             if body.is_some() {
                 req = req.header("content-type", "application/json");
             }
