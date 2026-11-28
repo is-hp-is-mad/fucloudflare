@@ -268,6 +268,13 @@ CA 有效期 20 年，名称约束在本区域，只签服务器证书（扩展�
 规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
 明文 HTTP、经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
 
+### 后量子密钥交换
+
+TLS 用 aws-lc-rs 做密码学实现（HTTPS / HTTP/3 监听、回源、ACME、出站探测全部同一个），除 `X25519`、`secp256r1`、`secp384r1` 外还支持后量子混合密钥交换 `X25519MLKEM768`，不用配置。
+TLS 1.3 下按访客客户端的偏好选：支持它的浏览器就用它，TLS 1.2 和不支持它的客户端照旧用 `X25519`；回源时优先报它，同时带一份普通 `X25519` 的密钥，源站不支持也不多一次往返。
+`/cdn-cgi/fucf-trace` 的 `kex=` 显示本连接用的是哪个（明文 HTTP 和 HTTP/3 为空）。
+编静态（musl）二进制时 aws-lc-rs 要编一份 C 代码，`musl-tools` 里的 `musl-gcc` 就够（`scripts/deploy/build-linux.sh` 和 CI 已经这样设置，不需要 cmake）；没有 C 编译器的机器编不出来。
+
 ### Bot 分
 
 每个请求都有一个 1–99 的 Bot 分，方向和 Cloudflare 一样：1 几乎肯定是程序，99 几乎肯定是真人。规则里写 `fcf.bot_score`（或 `cf.bot_management.score`），
@@ -325,7 +332,7 @@ CA 有效期 20 年，名称约束在本区域，只签服务器证书（扩展�
 `fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`<dc>f<进程号>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
 `colo`（节点的 `colo`，没设时取节点名去掉末尾数字后大写）、`dc`（节点的 `dc`，没设时取节点名末尾的数字，默认 1）、`http`（`http/1.0` / `http/1.1` / `http/2` / `http/3`）、
 `loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、`sni`（`plaintext` / `off`）、
-`warp`（访客地址是本机群的节点时为 `fucf`，是 Cloudflare 的地址时为 `cloudflare`，否则 `off`）、`kex`；
+`warp`（访客地址是本机群的节点时为 `fucf`，是 Cloudflare 的地址时为 `cloudflare`，否则 `off`）、`kex`（本连接的密钥交换组，如 `X25519MLKEM768`，见"后量子密钥交换"）；
 后面是自有的——`ja4`（本连接的 JA4 指纹，见"TLS 指纹（JA4）"）、`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
 `limit`（本节点的限流状态）、`threat`（访客地址的威胁分）、`bot`（Bot 分，见"Bot 分"）、`client_cert`（`verified` / `none`，见"访客客户端证书（mTLS）"）、`region`（省或州，未知为空）。
 

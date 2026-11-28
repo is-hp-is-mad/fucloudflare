@@ -687,13 +687,13 @@ mod tests {
             Ok(HandshakeSignatureValid::assertion())
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+            crate::edge::tls::crypto().signature_verification_algorithms.supported_schemes()
         }
     }
 
     /// The certificate the edge presents for `host` (and the protocol agreed on).
     async fn presented(port: u16, host: &str, alpn: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        let mut config = rustls::ClientConfig::builder_with_provider(crate::edge::tls::crypto())
             .with_safe_default_protocol_versions()
             .unwrap()
             .dangerous()

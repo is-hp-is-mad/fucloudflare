@@ -1547,7 +1547,8 @@ async fn cdn_cgi_is_the_edge_itself() {
     for (key, value) in expected {
         assert_eq!(t.get(key).map(String::as_str), Some(value), "{key} in {body}");
     }
-    assert!(!t["kex"].is_empty(), "{body}");
+    // the client config is the edge's own (origin pulls), which offers the post-quantum hybrid first
+    assert_eq!(t["kex"], "X25519MLKEM768", "{body}");
     let bot: i64 = t["bot"].parse().unwrap();
     assert!((1..=99).contains(&bot), "{body}");
 
@@ -1689,7 +1690,7 @@ async fn grpc_listener(tls: Option<Arc<rustls::ServerConfig>>) -> u16 {
 fn origin_tls(alpn: &[&[u8]]) -> Arc<rustls::ServerConfig> {
     let cert = rcgen::generate_simple_self_signed(vec!["backend.internal".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let mut config = rustls::ServerConfig::builder_with_provider(crate::edge::tls::crypto())
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()

@@ -4,7 +4,7 @@
 
 use crate::store::Store;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{ring as provider, CryptoProvider};
+use rustls::crypto::{aws_lc_rs as provider, CryptoProvider};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::ClientCertVerifier;
@@ -247,8 +247,28 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
-fn crypto() -> Arc<CryptoProvider> {
-    Arc::new(provider::default_provider())
+/// The one crypto provider of the process: every TLS configuration (the
+/// edge's listeners, origin pulls, ACME and outbound probes) is built from it,
+/// so no code relies on rustls' process-wide default and nothing ever races
+/// over `CryptoProvider::install_default`.
+///
+/// It is aws-lc-rs because ring has no post-quantum key exchange. Its groups
+/// put the hybrid `X25519MLKEM768` first: a TLS 1.3 server takes the group
+/// the client prefers (so visitors' browsers get it whatever the order here),
+/// but as a client (origin pulls) the order is ours, and the hybrid share is
+/// sent along with a plain X25519 one, so an origin without it costs no extra
+/// round trip. TLS 1.2 clients and clients without it still get X25519.
+pub(crate) fn crypto() -> Arc<CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            let mut kx = provider::default_provider();
+            let hybrid = provider::kx_group::X25519MLKEM768;
+            kx.kx_groups.retain(|group| group.name() != hybrid.name());
+            kx.kx_groups.insert(0, hybrid);
+            Arc::new(kx)
+        })
+        .clone()
 }
 
 /// For how long a session ticket is good, and how often its key changes.
@@ -533,5 +553,152 @@ mod ticket_tests {
         // as rustls uses it
         let sealed = here.encrypt(b"abc").unwrap();
         assert_eq!((there.decrypt(&sealed).as_deref(), here.enabled(), here.lifetime()), (Some(b"abc".as_slice()), true, 43200));
+    }
+}
+
+#[cfg(test)]
+mod kex_tests {
+    use super::*;
+    use rustls::crypto::SupportedKxGroup;
+    use rustls::{ClientConnection, NamedGroup, ProtocolVersion, ServerConnection};
+
+    /// A server config from the process provider with a certificate made for
+    /// the test (nothing kept on disk), and a client config that trusts it,
+    /// offering `client_kx` (or the provider's groups when `None`).
+    fn configs(client_kx: Option<Vec<&'static dyn SupportedKxGroup>>) -> (ClientConfig, ServerConfig) {
+        let cert = rcgen::generate_simple_self_signed(vec!["pq.example.com".to_string()]).unwrap();
+        let key = PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
+        let server = ServerConfig::builder_with_provider(crypto())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert.der().clone()], key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let provider = match client_kx {
+            Some(kx_groups) => Arc::new(CryptoProvider { kx_groups, ..(*crypto()).clone() }),
+            None => crypto(),
+        };
+        let client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (client, server)
+    }
+
+    /// Run a whole handshake in memory, passing each side's bytes to the other
+    /// until neither is handshaking; the first error either side raises ends it.
+    fn shake(client: ClientConfig, server: ServerConfig) -> Result<(ClientConnection, ServerConnection), rustls::Error> {
+        let mut c = ClientConnection::new(Arc::new(client), ServerName::try_from("pq.example.com").unwrap())?;
+        let mut s = ServerConnection::new(Arc::new(server))?;
+        for _ in 0..10 {
+            let mut wire = Vec::new();
+            while c.wants_write() {
+                c.write_tls(&mut wire).unwrap();
+            }
+            let mut rd = wire.as_slice();
+            while !rd.is_empty() {
+                s.read_tls(&mut rd).unwrap();
+                s.process_new_packets()?;
+            }
+            let mut wire = Vec::new();
+            while s.wants_write() {
+                s.write_tls(&mut wire).unwrap();
+            }
+            let mut rd = wire.as_slice();
+            while !rd.is_empty() {
+                c.read_tls(&mut rd).unwrap();
+                c.process_new_packets()?;
+            }
+            if !c.is_handshaking() && !s.is_handshaking() {
+                return Ok((c, s));
+            }
+        }
+        panic!("the handshake did not finish in ten rounds");
+    }
+
+    /// The group each side says was agreed on.
+    fn groups(c: &ClientConnection, s: &ServerConnection) -> (Option<NamedGroup>, Option<NamedGroup>) {
+        (c.negotiated_key_exchange_group().map(|g| g.name()), s.negotiated_key_exchange_group().map(|g| g.name()))
+    }
+
+    #[test]
+    fn the_provider_puts_the_post_quantum_hybrid_first_and_keeps_the_classical_groups() {
+        let names: Vec<NamedGroup> = crypto().kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(names.first(), Some(&NamedGroup::X25519MLKEM768), "{names:?}");
+        assert_eq!(names.iter().filter(|n| **n == NamedGroup::X25519MLKEM768).count(), 1, "listed once: {names:?}");
+        for classical in [NamedGroup::X25519, NamedGroup::secp256r1, NamedGroup::secp384r1] {
+            assert!(names.contains(&classical), "{classical:?} missing from {names:?}");
+        }
+        assert!(Arc::ptr_eq(&crypto(), &crypto()), "one provider for the whole process");
+    }
+
+    #[test]
+    fn two_of_our_configs_agree_on_x25519mlkem768_and_the_trace_names_it() {
+        let (client, server) = configs(None);
+        let (c, s) = shake(client, server).unwrap();
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519MLKEM768), Some(NamedGroup::X25519MLKEM768)));
+        assert_eq!(s.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+        // what the edge writes in the trace's `kex=` (see `TlsInfo` in edge/mod.rs)
+        let kex = s.negotiated_key_exchange_group().map(|group| format!("{:?}", group.name())).unwrap_or_default();
+        assert_eq!(kex, "X25519MLKEM768");
+    }
+
+    #[test]
+    fn a_client_that_offers_only_x25519_still_shakes_hands() {
+        let (client, server) = configs(Some(vec![provider::kx_group::X25519]));
+        let (c, s) = shake(client, server).unwrap();
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519), Some(NamedGroup::X25519)));
+    }
+
+    #[test]
+    fn the_server_follows_a_client_that_prefers_x25519_over_the_hybrid() {
+        let (client, server) = configs(Some(vec![provider::kx_group::X25519, provider::kx_group::X25519MLKEM768]));
+        let (c, s) = shake(client, server).unwrap();
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519), Some(NamedGroup::X25519)));
+    }
+
+    #[test]
+    fn a_client_that_offers_only_the_hybrid_gets_it() {
+        let (client, server) = configs(Some(vec![provider::kx_group::X25519MLKEM768]));
+        let (c, s) = shake(client, server).unwrap();
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519MLKEM768), Some(NamedGroup::X25519MLKEM768)));
+    }
+
+    #[test]
+    fn a_tls12_client_falls_back_to_x25519() {
+        let (_, server) = configs(None);
+        let client = ClientConfig::builder_with_provider(crypto())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify(crypto())))
+            .with_no_client_auth();
+        let (c, s) = shake(client, server).unwrap();
+        assert_eq!(s.protocol_version(), Some(ProtocolVersion::TLSv1_2));
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519), Some(NamedGroup::X25519)));
+    }
+
+    #[test]
+    fn a_client_with_no_group_in_common_is_refused() {
+        // pure ML-KEM is not among the server's groups, and nothing else is offered
+        let (client, server) = configs(Some(vec![provider::kx_group::MLKEM768]));
+        assert!(shake(client, server).is_err());
+    }
+
+    #[test]
+    fn the_edge_listeners_and_origin_pulls_are_built_from_the_post_quantum_provider() {
+        let store = Arc::new(Store::open_ephemeral(vec![]));
+        let tcp = server_config(store.clone()).unwrap();
+        let quic = quic_server_config(store).unwrap();
+        let (strict, blind) = (client_config(true).unwrap(), client_config(false).unwrap());
+        for provider in [tcp.crypto_provider(), quic.crypto_provider(), strict.crypto_provider(), blind.crypto_provider()] {
+            assert!(Arc::ptr_eq(provider, &crypto()));
+        }
+        // a real handshake against the edge's own server config (its fallback certificate)
+        let (c, s) = shake((*blind).clone(), (*tcp).clone()).unwrap();
+        assert_eq!(groups(&c, &s), (Some(NamedGroup::X25519MLKEM768), Some(NamedGroup::X25519MLKEM768)));
     }
 }

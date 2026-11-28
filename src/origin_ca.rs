@@ -251,7 +251,7 @@ mod tests {
     fn verifies(ca: &str, cert: &str, name: &str) -> Result<(), rustls::Error> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from_pem_slice(ca.as_bytes()).unwrap()).unwrap();
-        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let provider = crate::edge::tls::crypto();
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(std::sync::Arc::new(roots), provider).build().unwrap();
         let leaf = CertificateDer::from_pem_slice(cert.as_bytes()).unwrap();
         verifier.verify_server_cert(&leaf, &[], &ServerName::try_from(name.to_string()).unwrap(), &[], UnixTime::now()).map(|_| ())

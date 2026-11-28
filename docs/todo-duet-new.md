@@ -83,7 +83,7 @@
 - 私有 CA（给源站签证书，配合已完成的回源客户端证书）：`POST /zones/{id}/origin_ca` 生成 CA（存进 store 条目），`POST /zones/{id}/origin_ca/sign` 按给的名称/天数签发证书并返回 PEM（不存私钥之外的额外状态）。rcgen 用法**照抄仓库现有代码**：搜 `rcgen::`（`src/edge/tls.rs` 162 行附近的备用证书就是现成例子）。API 形状拿不准就以简单为优，文档写清楚即可。
 - 单元测试：CA 生成、签发、链式校验的纯逻辑。
 
-### [ ] N8 后量子密钥交换（aws-lc-rs）
+### [x] N8 后量子密钥交换（aws-lc-rs）
 
 - 目标：TLS 握手支持 `X25519MLKEM768`。rustls 只有 aws-lc-rs 提供者带它，ring 没有。
 - 改法：`Cargo.toml` 里 `rustls` 的 features 把 `ring` 换成 `aws-lc-rs`；`tokio-rustls` 同样换 feature；`quinn` 把 `rustls-ring` 换成对应的 aws-lc-rs feature（到 docs.rs 查 quinn 0.11 的 feature 名，查不到就按 `aws-lc-rs` 试）；`rcgen` 的 `ring` feature 换 `aws_lc_rs`。`src/edge/tls.rs` 搜 `fn crypto()` 和 `ring::default_provider`，换成 `rustls::crypto::aws_lc_rs::default_provider()`。`ring` 这个直接依赖若别处还用（搜 `ring::`）就保留。
@@ -169,3 +169,9 @@
 - 区域设置 `mtls: on` 由 `src/edge/mtls.rs::check` 在 `process()`（`/cdn-cgi/` 之前）和 `open_upstream_websocket` 拦截；明文 HTTP、HTTP/3 前置、拿不到 `TlsInfo` 的路径（含 Worker 子请求）都算未验证。规则字段为 `cf.tls_client_auth.cert_verified` / `fcf.client_cert_verified`，trace 字段为 `client_cert=`。已知的 ACME HTTP-01 令牌照常放行，面板主机不受限。
 - 源站 CA 在 `src/origin_ca.rs`：私钥存在 `Zone.origin_ca`（仿 DKIM），API 永不返回；名称约束到本区域，叶子证书只有 serverAuth；`days` 必填 1–5475；每个区域只能有一个，轮换要先 DELETE 再 POST（多加了 DELETE）；令牌属于 SSL 区域。
 - 留待能跑真实节点的人：出示无效证书会让该节点上所有主机名的握手失败；访客 CA 是整节点的，不分区域；没配 `--mtls-ca` 的节点上 `mtls: on` 的区域拒绝所有人；`strict` 不信任源站 CA（用 `full`）；滚动升级时旧节点可能经同步丢掉 `origin_ca`。
+
+### N8
+- `Cargo.toml` 把 rustls / tokio-rustls / rcgen 的 `ring` 换成 `aws_lc_rs`，quinn 的 `rustls-ring` 换成 `rustls-aws-lc-rs`；锁文件只新增 aws-lc-rs 1.19.0 / aws-lc-sys 0.47.0 等，没有升级已有包。`ring` 直接依赖保留（哈希、HMAC、会话票据、签名等十几处直接用）。
+- `src/edge/tls.rs` 的 `crypto()` 改为全进程唯一的提供者（`OnceLock`），把 `X25519MLKEM768` 排到第一；gfw、各测试里原来的 `crypto::ring` 和 `Config::builder()` 全换成它，进程里不再有第二个提供者，也不依赖 `install_default`。服务端按客户端偏好选组，回源时优先报混合组并带一份 X25519，源站不支持也不多一次往返。
+- 测试：`kex_tests` 用 rcgen 现生成的证书做内存握手（双方都支持则用混合组、只报 X25519 的照样握手、TLS 1.2 回落、没有共同组被拒）；trace 测试断言 `kex=X25519MLKEM768`。
+- 风险：aws-lc-sys 要编 C 代码。本机按 CI 的 musl-gcc 设置实测能编、能静态链接，musl 下测试通过，不需要 cmake；CI 镜像若变或没有 C 编译器就会挂，那时整体回退本任务。HTTP/3 连接的 `kex` 仍为空（quinn 不给出协商的组）。

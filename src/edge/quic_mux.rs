@@ -522,7 +522,11 @@ mod tests {
         });
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let mut c_tls = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let mut c_tls = rustls::ClientConfig::builder_with_provider(crate::edge::tls::crypto())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         c_tls.alpn_protocols = vec![b"h3".to_vec()];
         let c_cfg = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(c_tls).unwrap()));
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();

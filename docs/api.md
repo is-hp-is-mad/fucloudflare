@@ -648,6 +648,17 @@ curl -s -X POST $BASE/zones/$ZONE/origin_ca/sign -H "Authorization: Bearer $TOKE
   -d '{"hostnames": ["example.com", "*.example.com"], "days": 365}'
 ```
 
+#### Key exchange
+
+Every TLS configuration of the process (the HTTPS and HTTP/3 listeners, origin pulls, ACME and the
+outbound probes) is built from one crypto provider, aws-lc-rs. Next to `X25519`, `secp256r1` and
+`secp384r1` it offers the post-quantum hybrid `X25519MLKEM768`. In TLS 1.3 the edge takes the group
+the visitor's client prefers, so a browser that offers the hybrid gets it, and TLS 1.2 or a client
+without it gets `X25519`; nothing to configure. Origin pulls offer the hybrid first, with a plain
+`X25519` share alongside, so an origin without it costs no extra round trip.
+`/cdn-cgi/fucf-trace` names the group of the connection as `kex=` (for example
+`kex=X25519MLKEM768`); it is empty over plain HTTP and HTTP/3.
+
 ### Rules
 
 All rule lists take an `expression` (empty matches every request), `description`, `enabled` (true)

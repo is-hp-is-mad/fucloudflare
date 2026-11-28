@@ -107,7 +107,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 fn tls_client_config(alpn: &[&[u8]]) -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    let mut cfg = rustls::ClientConfig::builder_with_provider(crate::edge::tls::crypto())
         .with_safe_default_protocol_versions()
         .expect("rustls default versions")
         .with_root_certificates(roots)

@@ -850,7 +850,9 @@ mod tests {
         let cert_der = cert.cert.der().clone();
         let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
         let origin_tls = Arc::new(
-            rustls::ServerConfig::builder()
+            rustls::ServerConfig::builder_with_provider(crate::edge::tls::crypto())
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(vec![cert_der], key_der)
                 .unwrap(),
@@ -1045,7 +1047,7 @@ mod tests {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec())).unwrap();
-        let mut tls_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        let mut tls_cfg = rustls::ClientConfig::builder_with_provider(crate::edge::tls::crypto())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_root_certificates(roots)
