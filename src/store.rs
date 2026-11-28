@@ -282,7 +282,7 @@ impl ZoneSnap {
         if !self.zone.settings.decoy_subdomains || host.len() <= zone.len() + 1 || !host.ends_with(zone.as_str()) || !host[..host.len() - zone.len()].ends_with('.') {
             return false;
         }
-        if self.nodes.contains(host) || self.spectrum_names.contains(host) || !self.records_for(host).is_empty() {
+        if self.nodes.contains(host) || self.spectrum_names.contains(host) || !self.records_for(host).is_empty() || reserved(host) {
             return false;
         }
         let mut n = host;
@@ -294,6 +294,19 @@ impl ZoneSnap {
         }
         true
     }
+}
+
+/// Names this node answers for by itself (the CNAME base and everything
+/// below it, the panel host): they are never decoy names, even when they
+/// fall in a zone that has decoys and holds no records for them.
+static RESERVED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn reserve_names(names: Vec<String>) {
+    let _ = RESERVED.set(names.into_iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).filter(|n| !n.is_empty()).collect());
+}
+
+fn reserved(host: &str) -> bool {
+    RESERVED.get().is_some_and(|names| names.iter().any(|n| host == n || host.strip_suffix(n.as_str()).is_some_and(|rest| rest.ends_with('.'))))
 }
 
 #[derive(Default)]

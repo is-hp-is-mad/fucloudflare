@@ -406,6 +406,8 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let panel_host = args.panel_host.as_ref().map(|h| h.trim().to_ascii_lowercase());
+    // names the node itself answers for: never decoys, whatever zone they fall in
+    store::reserve_names([cname_base.clone(), panel_host.clone()].into_iter().flatten().collect());
     let store = if accel {
         Arc::new(store::Store::open_ephemeral(name_servers.clone()))
     } else {

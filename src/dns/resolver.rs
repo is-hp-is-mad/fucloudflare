@@ -1319,6 +1319,10 @@ mod tests {
         assert!(z.is_decoy("nothing.example.com") && !z.is_decoy("mail.example.com") && !z.is_decoy("example.com"));
         assert!(!z.is_decoy("x.sub.example.com") && !z.is_decoy("a.b.example.com") && !z.is_decoy("x.wild.example.com"));
         assert!(!z.is_decoy("badexample.com"));
+        // the CNAME base (health probes, the over-limit notice's assets) and the panel are the node's own
+        crate::store::reserve_names(vec!["cdn.example.com".into(), "panel.example.com".into()]);
+        assert!(!z.is_decoy("cdn.example.com") && !z.is_decoy("limit.cdn.example.com") && !z.is_decoy("panel.example.com"));
+        assert!(z.is_decoy("xcdn.example.com") && z.is_decoy("panel2.example.com"));
     }
 
     #[test]
