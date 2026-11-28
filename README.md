@@ -304,7 +304,8 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
   请求和响应都按消息流式透传（含双向流），响应 trailers（`grpc-status`）原样送达；一次调用没有时长上限，连接靠 HTTP/2 ping 保活。
   边缘自己拒绝或失败的请求（WAF、限流、源站不可达）以 gRPC 状态码返回而不是错误页。gRPC-Web 是普通 HTTP，不走这条路径。
 - 故障转移：一个主机名有多条代理 A/AAAA 记录时轮询；连接被拒的地址 10 秒内排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
-- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存。首条匹配生效。
+- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份）。首条匹配生效。
+- 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
   遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `CF-Cache-Status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`。

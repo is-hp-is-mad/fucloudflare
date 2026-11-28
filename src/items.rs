@@ -1043,6 +1043,9 @@ pub struct CacheRule {
     /// `Cache-Control`.
     #[serde(default)]
     pub edge_ttl: Option<u32>,
+    /// One copy whatever the query string: the key is the path alone.
+    #[serde(default)]
+    pub ignore_query: bool,
 }
 
 impl Item for CacheRule {

@@ -1506,7 +1506,8 @@ impl Edge {
         let (force, ttl_override) = (rule.is_some_and(|r| r.cache), rule.and_then(|r| r.edge_ttl).map(u64::from));
         let eligible = !zone.zone.paused && !settings.development_mode && cache::request_cacheable(&method, &headers);
         let use_cache = eligible && rule.is_none_or(|r| r.cache);
-        let key = cache::cache_key(info.ssl, &info.host, &uri, &headers);
+        // a rule may keep one copy whatever the query string
+        let key = cache::cache_key(info.ssl, &info.host, if rule.is_some_and(|r| r.ignore_query) { &info.path } else { &uri }, &headers);
         let conditional = Conditional::of(&headers);
 
         let mut status_label = if eligible && !use_cache { "BYPASS" } else { "DYNAMIC" };

@@ -2062,6 +2062,9 @@ struct PurgeBody {
     files: Vec<String>,
     #[serde(default)]
     prefixes: Vec<String>,
+    /// Everything of these host names (Cloudflare's `hosts`).
+    #[serde(default)]
+    hosts: Vec<String>,
 }
 
 async fn purge_cache(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
@@ -2077,9 +2080,12 @@ async fn purge_warp_cache(State(st): St, bytes: Bytes) -> ApiResult {
 
 /// Drop cached objects of one scope (a zone, or the edge's own) on this
 /// node and, through the configuration, on every other one.
-async fn purge(st: &ApiState, scope: &str, b: PurgeBody) -> ApiResult {
+async fn purge(st: &ApiState, scope: &str, mut b: PurgeBody) -> ApiResult {
+    // a host is the prefix that ends where its paths begin
+    let hosts = std::mem::take(&mut b.hosts);
+    b.prefixes.extend(hosts.iter().map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase()).filter(|h| !h.is_empty()).map(|h| format!("{h}/")));
     if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() {
-        return Err(bad("specify purge_everything, files or prefixes"));
+        return Err(bad("specify purge_everything, files, prefixes or hosts"));
     }
     st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone()).await?;
     let purged = if b.purge_everything {
