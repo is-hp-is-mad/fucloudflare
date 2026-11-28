@@ -35,6 +35,18 @@ pub fn disk_cert(host: &str) -> Option<Arc<CertifiedKey>> {
     DISK_CERTS.get()?.get(host)
 }
 
+/// `(not before, not after)` of the certificate on disk that would be used for `host`.
+pub fn disk_cert_validity(host: &str) -> Option<(i64, i64)> {
+    DISK_CERTS.get()?.validity(host)
+}
+
+/// Load the certificate directories again now (after writing one).
+pub fn rescan_disk_certs() {
+    if let Some(certs) = DISK_CERTS.get() {
+        certs.rescan();
+    }
+}
+
 /// Parse and sanity-check a PEM certificate chain and its private key.
 pub fn parse_cert(cert_pem: &str, key_pem: &str) -> Result<Arc<CertifiedKey>, String> {
     let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
@@ -203,7 +215,8 @@ impl ResolvesServerCert for CertResolver {
         let sni = hello.server_name().map(str::to_ascii_lowercase);
         if hello.alpn().is_some_and(|mut offered| offered.any(|p| p == ACME_TLS_ALPN)) {
             // A CA validating a challenge: only the challenge certificate will do.
-            return self.store.snapshot().acme_tls.get(sni.as_deref()?).cloned();
+            let sni = sni?;
+            return self.store.snapshot().acme_tls.get(&sni).cloned().or_else(|| crate::site_acme::tls_alpn(&sni));
         }
         let Some(sni) = sni.or_else(|| DEFAULT_SNI.get().cloned()) else { return Some(self.default.clone()) };
         let snap = self.store.snapshot();

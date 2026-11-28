@@ -65,7 +65,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -444,6 +444,90 @@ impl Acme {
         let chain = String::from_utf8(chain.body.to_vec()).map_err(|_| "the certificate is not PEM")?;
         crate::edge::tls::parse_cert(&chain, &key_pem).map_err(|e| format!("the CA sent an unusable certificate: {e}"))?;
         crate::edge::tls::pem_validity(&chain).ok_or("the CA sent a certificate whose validity cannot be read")?;
+        Ok((chain, key_pem))
+    }
+
+    /// Obtain a certificate for `hosts` that this node proves by itself (the
+    /// challenges are answered locally, see [`crate::site_acme`]), not through
+    /// the fleet's configuration. `kind`: `http-01` or `tls-alpn-01`;
+    /// `profile`: an ACME profile to ask for when the CA offers it (e.g.
+    /// `shortlived`, which Let's Encrypt requires for IP addresses).
+    pub async fn issue_site(&self, hosts: &[String], kind: &'static str, profile: Option<&str>) -> Result<(String, String), String> {
+        let mut session = self.session().await?;
+        let thumbprint = session.thumbprint();
+        let identifiers: Vec<Value> = hosts
+            .iter()
+            .map(|h| match h.parse::<std::net::IpAddr>() {
+                Ok(_) => json!({ "type": "ip", "value": h }),
+                Err(_) => json!({ "type": "dns", "value": h }),
+            })
+            .collect();
+        let mut new_order = json!({ "identifiers": identifiers });
+        if let Some(p) = profile.filter(|p| session.urls["meta"]["profiles"].get(*p).is_some()) {
+            new_order["profile"] = json!(p);
+        }
+        let reply = session.post(&session.url("newOrder")?, Some(new_order)).await?;
+        let order_url = reply.header("location").ok_or("the CA did not name the order")?;
+        let order = reply.json()?;
+        let text = |v: &Value, what: &str| v.as_str().map(String::from).ok_or_else(|| format!("the CA's reply lacks {what}"));
+
+        // answered here until this function returns, whatever happens
+        let mut published = crate::site_acme::Published::default();
+        let mut pending = Vec::new();
+        for authz_url in order["authorizations"].as_array().ok_or("the order lists no authorizations")? {
+            let authz_url = text(authz_url, "an authorization URL")?;
+            let authz = session.post(&authz_url, None).await?.json()?;
+            if authz["status"] == "valid" {
+                continue;
+            }
+            let host = text(&authz["identifier"]["value"], "the name to validate")?.to_ascii_lowercase();
+            let offered = authz["challenges"].as_array().and_then(|list| list.iter().find(|c| c["type"] == kind));
+            let challenge = offered.ok_or_else(|| format!("the CA offers no {kind} challenge for {host}"))?;
+            let token = text(&challenge["token"], "a challenge token")?;
+            if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                return Err("the CA sent a malformed challenge token".into());
+            }
+            let key_authorization = format!("{token}.{thumbprint}");
+            match kind {
+                "tls-alpn-01" => {
+                    let digest = sha256(key_authorization.as_bytes());
+                    let cert = crate::edge::tls::acme_challenge_cert(&host, &digest).ok_or("cannot make the challenge certificate")?;
+                    published.tls(&host, cert);
+                }
+                _ => published.http(&token, &key_authorization),
+            }
+            pending.push((authz_url, text(&challenge["url"], "a challenge URL")?, host));
+        }
+        for (_, challenge_url, _) in &pending {
+            session.post(challenge_url, Some(json!({}))).await?;
+        }
+        for (authz_url, _, host) in &pending {
+            let authz = session.settled(authz_url, "the validation").await?;
+            if authz["status"] != "valid" {
+                let reason = authz["challenges"].as_array().and_then(|list| list.iter().find_map(|c| c["error"]["detail"].as_str()));
+                return Err(format!("validation of {host} ({kind}) failed: {}", reason.unwrap_or("the CA gave no reason")));
+            }
+        }
+        drop(published);
+
+        let names = hosts.to_vec();
+        let (key_pem, csr_der) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
+            let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+            let mut params = rcgen::CertificateParams::new(names).map_err(|e| e.to_string())?;
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            let csr = params.serialize_request(&key).map_err(|e| e.to_string())?;
+            Ok((key.serialize_pem(), csr.der().to_vec()))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        session.post(&text(&order["finalize"], "the finalize URL")?, Some(json!({ "csr": b64(&csr_der) }))).await?;
+        let order = session.settled(&order_url, "the certificate").await?;
+        if order["status"] != "valid" {
+            return Err(format!("the CA did not issue: the order is {}", order["status"].as_str().unwrap_or("in an unknown state")));
+        }
+        let chain = session.post(&text(&order["certificate"], "the certificate URL")?, None).await?;
+        let chain = String::from_utf8(chain.body.to_vec()).map_err(|_| "the certificate is not PEM")?;
+        crate::edge::tls::parse_cert(&chain, &key_pem).map_err(|e| format!("the CA sent an unusable certificate: {e}"))?;
         Ok((chain, key_pem))
     }
 
@@ -1025,6 +1109,57 @@ mod tests {
 
     fn leaf(pack: &CertificatePack) -> Vec<u8> {
         CertificateDer::pem_slice_iter(pack.certificate.as_bytes()).next().unwrap().unwrap().to_vec()
+    }
+
+    #[tokio::test]
+    async fn proxy_rule_hosts_get_their_own_certificates() {
+        let Env { store, acme, ca, https_port, .. } = setup().await;
+        store
+            .save_proxy_rule(None, json!({
+                "name": "site", "nodes": ["n1"], "hosts": ["App.example.org", "*.example.org", "intranet.local"],
+                "respond": { "body": "hi" }
+            }))
+            .unwrap();
+        store.save_proxy_rule(None, json!({ "name": "manual", "nodes": ["n1"], "hosts": ["manual.example.org"], "auto_https": false, "respond": {} })).unwrap();
+        store.save_proxy_rule(None, json!({ "name": "elsewhere", "nodes": ["n2"], "hosts": ["other.example.org"], "respond": {} })).unwrap();
+        let dir = std::env::temp_dir().join(format!("fucf-site-{}", uuid::Uuid::new_v4().simple()));
+        let mut site = crate::site_acme::SiteAcme::new(Arc::new(acme), dir.clone());
+        site.node = Some("n1".into());
+        let now = unix_now();
+        assert_eq!(site.due(now), ["app.example.org"]);
+
+        site.tick().await;
+        assert_eq!(ca.state.lock().unwrap().validated, ["http-01 app.example.org"]);
+        let crt = std::fs::read_to_string(dir.join("app.example.org/app.example.org.crt")).unwrap();
+        let key = dir.join("app.example.org/app.example.org.key");
+        assert!(crt.contains("BEGIN CERTIFICATE") && std::fs::read_to_string(&key).unwrap().contains("PRIVATE KEY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o077, 0, "the key is private");
+        }
+        assert!(site.due(now).is_empty(), "nothing more to do while the certificate is fresh");
+        assert!(site.due(now + 61 * 86400).contains(&"app.example.org".to_string()), "renewed in the last third");
+        site.tick().await;
+        assert_eq!(ca.state.lock().unwrap().orders.len(), 1, "no second order");
+        assert_eq!(crate::site_acme::http01("anything"), None, "answers are withdrawn");
+
+        // TLS-ALPN-01 is answered by the edge's TLS listener, for a name it has no zone for
+        let (chain, _) = site.acme.issue_site(&["b.example.org".into()], "tls-alpn-01", None).await.unwrap();
+        assert!(chain.contains("BEGIN CERTIFICATE"));
+        assert_eq!(ca.state.lock().unwrap().validated.last().unwrap(), "tls-alpn-01 b.example.org");
+        assert!(!presented(https_port, "b.example.org", tls::ACME_TLS_ALPN).await.is_ok_and(|(_, alpn)| alpn.is_some()), "withdrawn");
+
+        // a CA that refuses: back off instead of hammering it
+        ca.reject.store(true, SeqCst);
+        let stale = unix_now() + 70 * 86400;
+        let before = ca.state.lock().unwrap().orders.len();
+        site.acme.edge.store.save_proxy_rule(None, json!({ "name": "new", "nodes": ["n1"], "hosts": ["new.example.org"], "respond": {} })).unwrap();
+        site.tick().await;
+        assert_eq!(ca.state.lock().unwrap().orders.len(), before + 1);
+        assert!(!site.due(unix_now()).contains(&"new.example.org".to_string()), "waits before trying again");
+        assert!(site.due(stale).contains(&"new.example.org".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

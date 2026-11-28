@@ -211,6 +211,12 @@ impl DiskCerts {
         found
     }
 
+    /// Validity of the certificate [`Self::get`] picks for `host`.
+    pub fn validity(&self, host: &str) -> Option<(i64, i64)> {
+        let key = self.get(host)?;
+        self.entries.read().unwrap().iter().find(|e| Arc::ptr_eq(&e.key, &key)).map(|e| (e.not_before, e.not_after))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.read().unwrap().len()
     }

@@ -14,9 +14,9 @@ Status legend: ✅ done · 🟡 partial · ⬜ to do
 | `tls cert key` (files) | `--tls-cert-dir` (acme.sh / certbot / Caddy storage / `name.crt`+`name.key`, reloaded every minute) | ✅ |
 | `default_sni` | `--tls-default-sni` | ✅ |
 | uploaded certificates | zone `custom_certificates` | ✅ (zone-bound) |
-| automatic HTTPS (ACME) for every site | managed certificates exist for zones; proxy-rule hosts need their own (TLS-ALPN-01 / HTTP-01, per node) | ⬜ |
+| automatic HTTPS (ACME) for every site | zones: managed certificates; proxy rules scoped to a node: `auto_https` (per host, HTTP-01 / TLS-ALPN-01 answered by that node, IPs with the `shortlived` profile, key stays on the node, renewed in the last third) | ✅ |
 | on-demand TLS | — | ⬜ |
-| automatic HTTP→HTTPS redirect | per-rule `redirect_url` only | 🟡 (needs an automatic switch) |
+| automatic HTTP→HTTPS redirect | per-rule `https_redirect` (308; ACME challenges still answered) | ✅ |
 | HTTP/3 | `--proxy-h3-listen`, or Hysteria front / QUIC SNI split | ✅ |
 
 ## Routing
@@ -73,7 +73,7 @@ Status legend: ✅ done · 🟡 partial · ⬜ to do
 ## Order of work
 
 1. ✅ Disk certificates, `default_sni`, `respond`, `file_server`, per-node `domains.lst`.
-2. ACME for proxy-rule hosts (TLS-ALPN-01 / HTTP-01 on the node that serves them) and automatic HTTP→HTTPS.
+2. ✅ ACME for proxy-rule hosts (TLS-ALPN-01 / HTTP-01 on the node that serves them) and automatic HTTP→HTTPS.
 3. Matchers (method, header, query, remote IP, glob paths) and placeholders in headers/redirects (`{host}`, `{uri}`, `{remote_host}`).
 4. `try_files`, `basicauth`, `forward_auth`.
 5. Load-balancing policies, active health checks, unix sockets, Docker-aware upstream names.

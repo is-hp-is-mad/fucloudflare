@@ -1303,6 +1303,13 @@ pub struct LocalProxyRule {
     /// What is tried for a directory under `file_root` (default `index.html`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub index_files: Vec<String>,
+    /// On the nodes the rule names explicitly, obtain a certificate for its
+    /// concrete hosts (no wildcards) when no other one covers them, like
+    /// Caddy's automatic HTTPS. The node proves the names itself.
+    #[serde(default = "yes")]
+    pub auto_https: bool,
+    /// Answer plain-HTTP requests with a permanent redirect to `https://`.
+    pub https_redirect: bool,
     /// Keep the visitor's `Host` header when forwarding to the upstream.
     #[serde(default = "yes")]
     pub preserve_host: bool,
@@ -1340,6 +1347,8 @@ impl Default for LocalProxyRule {
             respond: None,
             file_root: None,
             index_files: Vec::new(),
+            auto_https: true,
+            https_redirect: false,
             preserve_host: true,
             strip_response_headers: Vec::new(),
             set_response_headers: BTreeMap::new(),

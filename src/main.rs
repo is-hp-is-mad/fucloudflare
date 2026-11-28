@@ -15,6 +15,7 @@ mod node;
 mod release;
 mod spectrum;
 mod store;
+mod site_acme;
 mod sync;
 mod workers;
 
@@ -477,7 +478,13 @@ async fn main() -> anyhow::Result<()> {
         let up = edge::warp::WarpUpstream::parse(url).map_err(anyhow::Error::msg)?;
         let _ = edge.warp_upstream.set(up);
     }
-    let dirs: Vec<PathBuf> = args.tls_cert_dir.iter().filter(|d| !d.as_os_str().is_empty()).cloned().collect();
+    // what other tools issued, plus what this node obtains for its own sites
+    let site_certs = args.data_dir.join("certs");
+    let site_acme_on = args.acme_directory != "off" && std::fs::create_dir_all(&site_certs).is_ok();
+    let mut dirs: Vec<PathBuf> = args.tls_cert_dir.iter().filter(|d| !d.as_os_str().is_empty()).cloned().collect();
+    if site_acme_on {
+        dirs.push(site_certs.clone());
+    }
     if !dirs.is_empty() {
         let certs = tokio::task::spawn_blocking(move || edge::certdir::DiskCerts::new(dirs)).await?;
         tokio::spawn(certs.clone().watch());
@@ -756,6 +763,13 @@ async fn main() -> anyhow::Result<()> {
         acme.sync = sync.clone();
         acme.node_name = Some(fleet_self);
         tokio::spawn(Arc::new(acme).run());
+    }
+    if site_acme_on {
+        // automatic HTTPS for the proxy rules that name this node (accelerate nodes too)
+        let account = args.data_dir.join("acme_site_account.json");
+        let acme = acme::Acme::new(edge.clone(), fleet.clone(), args.acme_directory.clone(), args.acme_email.clone(), account);
+        let site = site_acme::SiteAcme::new(Arc::new(acme), site_certs);
+        tokio::spawn(Arc::new(site).run());
     }
     if !accel {
         tokio::spawn(telemetry.clone().keep_saving());

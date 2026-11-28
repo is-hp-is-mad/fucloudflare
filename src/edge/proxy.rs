@@ -193,6 +193,16 @@ pub async fn forward(
     host: &str,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, EdgeError> {
+    if rule.https_redirect && !ssl {
+        let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let authority = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
+        let mut out = Response::new(full(Bytes::new()));
+        *out.status_mut() = StatusCode::PERMANENT_REDIRECT;
+        if let Ok(hv) = HeaderValue::from_str(&format!("https://{authority}{pq}")) {
+            out.headers_mut().insert(header::LOCATION, hv);
+        }
+        return Ok(out);
+    }
     if let Some(loc) = &rule.redirect_url {
         let code = rule.redirect_status.unwrap_or(302);
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::FOUND);

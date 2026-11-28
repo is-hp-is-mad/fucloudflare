@@ -1584,6 +1584,8 @@ const A = {
       { k: "respond_type", label: "固定响应：Content-Type（默认 text/plain; charset=utf-8）", opt: 1 },
       { k: "file_root", label: "静态文件目录（绝对路径，相当于 Caddy 的 file_server；须在节点的 --file-root-allow 之内）", opt: 1 },
       { k: "index_files", label: "目录索引文件（默认 index.html）", type: "list", opt: 1 },
+      { k: "auto_https", label: "自动 HTTPS：限定了节点时，由该节点为具体主机名自动签发证书（HTTP-01 / TLS-ALPN-01）", type: "check", def: true },
+      { k: "https_redirect", label: "HTTP 请求永久重定向到 HTTPS（308）", type: "check" },
       { k: "preserve_host", label: "保留原始 Host 头", type: "check", def: true },
       { k: "mask_upstream_errors", label: "上游 >= 400 错误伪装为 404 not found", type: "check" },
       { k: "is_fallback", label: "设为 Hysteria 2 兜底回落规则", type: "check" },

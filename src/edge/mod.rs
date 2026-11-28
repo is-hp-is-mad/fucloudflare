@@ -1406,6 +1406,14 @@ impl Edge {
             .ok_or_else(|| EdgeError::new(400, "Bad request", "missing Host header"))?;
         let host = request_host(&host);
 
+        // This node proving a name of its own (automatic HTTPS): whatever the
+        // node's role or rules, the CA has to get its answer.
+        if let Some(answer) = req.uri().path().strip_prefix("/.well-known/acme-challenge/").and_then(crate::site_acme::http01) {
+            let mut resp = Response::new(full(answer));
+            resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            return Ok(resp);
+        }
+
         let looped = req.headers().get_all("cdn-loop").iter().any(|v| v.to_str().is_ok_and(|v| v.contains(LOOP_TOKEN)));
         if looped {
             return Err(EdgeError::new(508, "Loop detected", "this request already passed through this edge"));
