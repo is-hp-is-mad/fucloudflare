@@ -57,6 +57,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 ## 管理 API
 
 基址 `http://127.0.0.1:8787/client/v4`，认证头 `Authorization: Bearer <token>`，响应信封与 Cloudflare v4 一致。
+用户自己的 API 令牌和 Global API Key 见下面的“开放 API”。
 zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是简化的自有结构。
 
 ```
@@ -341,6 +342,48 @@ install -m 755 fucf /usr/local/bin/fucf && systemctl kill -s USR2 --kill-whom=ma
 ```
 
 `systemctl restart` 仍会有几百毫秒没有进程监听；停止时同样先给手上的请求最多 3 秒，期间来的访客看到更新页面。
+
+## 开放 API：API 令牌与 Global API Key（兼容 Cloudflare）
+
+除了面板登录和机群自己的 API token，还可以用 **Cloudflare 格式的 API 令牌**（面板：账户与安全 → API 令牌）。
+`Authorization: Bearer <令牌>`，基址 `https://<面板域名>/client/v4`。certbot-dns-cloudflare、acme.sh `dns_cf`、lego、
+Terraform、各种 DDNS 脚本只要把 API 地址换掉就能用。
+
+```
+/user                                     GET              凭据属于谁
+/user/tokens[/{id}]                       GET POST PUT DELETE   {"name", "policies": [...], "condition": {"request.ip": {"in": [...], "not_in": [...]}}, "not_before", "expires_on", "status": "active|disabled"}
+                                                           POST 的返回值里有 value（只给这一次）；PUT 整体替换（值不变）
+/user/tokens/{id}/value                   PUT              轮换：返回新值，旧值立即失效
+/user/tokens/verify                       GET              当前令牌是否有效
+/user/tokens/permission_groups            GET              权限组（与 Cloudflare 同名：Zone Read、DNS Write、Cache Purge、Workers KV Storage Write……）
+/accounts[/{id}]                          GET              唯一的账户（Cloudflare 工具需要它的 id）
+/accounts/{id}/workers/scripts/...        同 /workers/scripts/...；/accounts/{id}/storage/kv/namespaces/... 同 /kv/namespaces/...；
+/accounts/{id}/d1/database/...            同 /d1/database/...；/accounts/{id}/tokens/... 同 /user/tokens/...
+/account/api_key                          POST             {"password", "remove": false}：生成（或删除）自己的 Global API Key
+```
+
+policy 与 Cloudflare 相同：`{"effect": "allow|deny", "resources": {...}, "permission_groups": [{"id"} 或 {"name"}]}`，资源写法
+`com.cloudflare.api.account.zone.<zone id>` / `com.cloudflare.api.account.zone.*` / `com.cloudflare.api.account.<account id>`（可内含 zone 资源）
+/ `com.cloudflare.api.user.<user id>`；deny 优先；写权限包含读；对某个域名有任何权限就能看到这个域名（`GET /zones` 只列出令牌涉及的域名）。
+令牌能做的不超过所有者的角色；登录、改密码、两步验证、用户管理、复制同步永远不能用令牌。令牌在机群里像会话一样同步。
+
+Global API Key：请求头 `X-Auth-Email` + `X-Auth-Key`，拥有所有者的全部权限（`/account/*` 除外）。
+
+DNS 记录的 Cloudflare 兼容补充：
+- 过滤：`type`、`proxied`、`search`、`match=any|all`，name / content / comment 的 `x`、`x.exact`、`x.contains`、`x.startswith`、`x.endswith`（comment 另有 `.present`/`.absent`）；排序 `order=type|name|content|ttl|proxied` + `direction=asc|desc`
+- SRV、CAA 可以用 `data`（`{"priority","weight","port","target"}` / `{"flags","tag","value"}`）代替 `content`
+- `POST /zones/{id}/dns_records/batch`：`{"deletes":[{"id"}], "patches":[{"id",...}], "puts":[{"id",...}], "posts":[{...}]}`，按这个顺序执行；先整体检查，
+  之后若某一步失败，它之前的修改保留（错误信息说明停在哪）——这一点和 Cloudflare 的原子批量不同
+- `GET /zones/{id}/dns_records/export`：BIND 文件（已代理的带 `cf_tags=cf-proxied:true`）；`POST /zones/{id}/dns_records/import`：multipart 字段 `file`（或直接把文件当请求体），`proxied=true` 把能代理的都代理
+- 代理（`proxied`）和自定义回源（`origin`：端口、SNI、Host、协议、节点内回源）照常可用，见上面的“高级回源”
+
+## 自动防火墙
+
+区域设置 `auto_firewall`（面板：域名 → 安全 → 自动防火墙，默认关）：每 30 秒看一次最近的安全事件——托管规则命中（拦截或记录）、防火墙拦截、限速——
+在 `auto_firewall_window` 秒（默认 600）内攻击达到 `auto_firewall_threshold` 次（默认 10）的地址，被加进这个域名的一条自动规则
+（`managed_by: auto_firewall`，表达式 `ip.src in {...}`，优先级 1000，动作 `auto_firewall_action`：block 或 managed_challenge），
+封 `auto_firewall_ban` 秒（默认 86400）；期间继续攻击会续期，到期自动移出，空了规则就删掉。IPv6 按 /64 封；机群节点自己的地址和内网地址从不封；
+最多 1000 个地址（保留最晚到期的）。在主节点上运行（它有全机群的安全事件），规则随配置同步到所有节点。
 
 ## 伪装子域
 
