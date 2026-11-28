@@ -68,8 +68,7 @@ impl Edge {
     fn trace(&self, ip: IpAddr, ssl: bool, req: &Request<Body>, host: &str, ray: &str) -> Response<Body> {
         let tls = req.extensions().get::<TlsInfo>();
         let location = self.geo.get().map(|geo| geo.locate(ip)).unwrap_or_default();
-        let (node, limit) = self.limits.own();
-        let node = if node.is_empty() { "local".to_string() } else { node };
+        let (_, limit) = self.limits.own();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let snap = self.store.snapshot();
         let zone = snap.find_zone(host).filter(|z| Self::serves(z, host)).map_or("-", |z| z.zone.name.as_str());
@@ -82,10 +81,7 @@ impl Edge {
         };
         let agent = req.headers().get(header::USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).unwrap_or_default();
         let warp = warp_status(ip, &snap.nodes, location.asn);
-        let node_pos = snap.nodes.iter().position(|n| n.name == node);
-        let configured_dc = node_pos.and_then(|i| snap.nodes[i].dc);
-        let (colo, dc) = colo_and_dc(&node, configured_dc);
-        let fl = format!("{}f{}", node_pos.map_or(0, |i| i + 1), std::process::id());
+        let Here { colo, dc, fl } = self.here();
         // The first keys are Cloudflare's, with their meaning; ours follow.
         let lines = [
             ("fl", fl),
@@ -127,10 +123,31 @@ pub(super) fn plain(status: u16, body: &str) -> Response<Body> {
 
 /// Split a node name into `(COLO, dc)`: trailing digits become `dc` (default 1),
 /// e.g. `us` -> `("US", 1)`, `us2` -> `("US", 2)`, unless overridden by `configured_dc`.
-fn colo_and_dc(node: &str, configured_dc: Option<u32>) -> (String, u32) {
+/// Where this node is, as visitors are told (trace, error pages).
+pub struct Here {
+    /// Airport code of the location.
+    pub colo: String,
+    /// Which machine at that location.
+    pub dc: u32,
+    /// `<dc>f<process>`: tells machines (and restarts) apart, like Cloudflare's `fl`.
+    pub fl: String,
+}
+
+impl Edge {
+    pub(super) fn here(&self) -> Here {
+        let (node, _) = self.limits.own();
+        let node = if node.is_empty() { "local".to_string() } else { node };
+        let snap = self.store.snapshot();
+        let me = snap.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(&node));
+        let (colo, dc) = colo_and_dc(&node, me.and_then(|n| n.colo.as_deref()), me.and_then(|n| n.dc));
+        Here { fl: format!("{dc}f{}", std::process::id()), colo, dc }
+    }
+}
+
+fn colo_and_dc(node: &str, configured_colo: Option<&str>, configured_dc: Option<u32>) -> (String, u32) {
     let trimmed = node.trim_end_matches(|c: char| c.is_ascii_digit());
     let digits = &node[trimmed.len()..];
-    let colo = if trimmed.is_empty() { node } else { trimmed }.to_ascii_uppercase();
+    let colo = configured_colo.unwrap_or(if trimmed.is_empty() { node } else { trimmed }).to_ascii_uppercase();
     let dc = configured_dc.unwrap_or_else(|| digits.parse::<u32>().ok().filter(|&n| n >= 1).unwrap_or(1));
     (colo, dc)
 }
@@ -231,9 +248,11 @@ mod tests {
         assert_eq!(warp_status("8.8.8.8".parse().unwrap(), &nodes, Some(13335)), "cloudflare");
         assert_eq!(warp_status("127.0.0.1".parse().unwrap(), &nodes, None), "off");
         assert_eq!(warp_status("192.0.2.1".parse().unwrap(), &nodes, Some(15169)), "off");
-        assert_eq!(colo_and_dc("us", None), ("US".into(), 1));
-        assert_eq!(colo_and_dc("us2", None), ("US".into(), 2));
-        assert_eq!(colo_and_dc("sgp", None), ("SGP".into(), 1));
-        assert_eq!(colo_and_dc("us", Some(3)), ("US".into(), 3));
+        assert_eq!(colo_and_dc("us", None, None), ("US".into(), 1));
+        assert_eq!(colo_and_dc("us2", None, None), ("US".into(), 2));
+        assert_eq!(colo_and_dc("sgp", None, None), ("SGP".into(), 1));
+        assert_eq!(colo_and_dc("us", None, Some(3)), ("US".into(), 3));
+        assert_eq!(colo_and_dc("us2", Some("cmh"), None), ("CMH".into(), 2));
+        assert_eq!(colo_and_dc("jp", Some("NRT"), Some(1)), ("NRT".into(), 1));
     }
 }

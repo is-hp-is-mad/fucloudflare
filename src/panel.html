@@ -111,6 +111,7 @@ a:hover{text-decoration:underline;text-decoration-color:color-mix(in srgb,curren
 :focus-visible{outline:2px solid var(--clay-dark);outline-offset:2px}
 ::selection{background:color-mix(in srgb,var(--clay) 28%,transparent)}
 h1,h2,h3,h4,p{margin:0}
+.live{width:7px;height:7px;border-radius:50%;background:var(--text-color-kumo-subtle,#87867f);flex:none}.live.on{background:#4a9b6e;box-shadow:0 0 0 0 rgba(74,155,110,.5);animation:pulse 2.4s cubic-bezier(.165,.85,.45,1) infinite}@keyframes pulse{70%{box-shadow:0 0 0 6px rgba(74,155,110,0)}100%{box-shadow:0 0 0 0 rgba(74,155,110,0)}}
 .mono,code{font-family:var(--mono);font-size:12.5px}
 code{display:inline-block;max-width:100%;vertical-align:middle;background:var(--color-kumo-recessed);border:1px solid var(--color-kumo-hairline);padding:1px 6px;border-radius:var(--r-sm);overflow-wrap:anywhere;color:var(--text-color-kumo-strong)}
 .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
@@ -1436,7 +1437,7 @@ function shell(v) {
       <button type="button" class="mob-menu" data-act="mobMenuOpen" aria-label="打开菜单">${IC.menu}</button>
       <div class="zsel">${IC.globe}<select id="zsw" aria-label="切换域名"><option value="">全部域名</option>${(C.zones || []).map(x => `<option value="${esc(x.id)}" ${z && x.id === z.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></div>
       <span class="sp"></span>
-      <div class="meta">${btn("theme", `${IC[THEME_IC[theme]]}<span>${THEME_TEXT[theme]}</span>`, {}, "ghost sm", 'data-mode-toggle aria-label="切换主题" title="切换浅色/深色/跟随系统"')}${
+      <div class="meta">${AUTO_VIEWS(S) ? btn("autoRefresh", `<span class="live ${autoOn() ? "on" : ""}" aria-hidden="true"></span><span>${autoOn() ? "自动刷新" : "自动刷新已关"}</span>`, {}, "ghost sm", `aria-pressed="${autoOn()}" title="每 30 秒刷新本页数据（标签页在后台、打开表单或正在输入时暂停）"`) : ""}${btn("theme", `${IC[THEME_IC[theme]]}<span>${THEME_TEXT[theme]}</span>`, {}, "ghost sm", 'data-mode-toggle aria-label="切换主题" title="切换浅色/深色/跟随系统"')}${
         `<a class="who" href="#/account" title="账户与安全">${IC.lock}<span>${esc(me.api_token ? "API 令牌" : me.email || "")}</span></a>`}${
         btn("logout", `${IC.exit}<span>退出</span>`, {}, "ghost sm")}</div></header>
     <main><div class="wrap">${sys.role === "accelerate" ? '<div class="note warn">这是只读加速节点（accelerate），部分写操作请在任意对等节点（peer）执行。</div>' : ""}
@@ -1477,6 +1478,7 @@ async function render() {
     if (my !== seq) return;
     app.innerHTML = shell(v);
     applyFilters();
+    lastRender = Date.now();
   } catch (e) {
     if (my !== seq || !token) return;
     app.innerHTML = shell({ title: "加载失败", body: `<div class="errbox"><span class="code">出错了</span><h2>这一页没能加载出来</h2><p>${esc(e.message)}</p><div class="acts"><button class="pri" data-act="retry">重试</button><a class="btn" href="#/zones">返回账户主页</a></div></div>` });
@@ -1488,6 +1490,7 @@ const byId = (list, id) => (C[list] || []).find(x => x.id === id) || {};
 const del = async (path, what) => { if (await confirmBox(`删除${what}？`, "删除后无法恢复。")) { await api("DELETE", path); toast("已删除"); render(); } };
 const A = {
   retry: render,
+  autoRefresh: () => { try { localStorage.setItem("fucf_autorefresh", autoOn() ? "0" : "1"); } catch {} render(); },
   logout: async () => { loginError = ""; try { await api("POST", "/account/logout"); } catch {} logout(); },
   theme: () => {
     const order = ["auto", "light", "dark"];
@@ -1710,7 +1713,7 @@ const A = {
     toast("记录已添加"); render();
   },
   nodeEdit: d => openForm(d.id ? "编辑节点" : "添加节点", [
-    { k: "name", label: "名称", hint: "小写字母、数字、-" }, { k: "dc", label: "机房编号（dc）", type: "number", min: 1, opt: 1 }, { k: "ipv4", label: "IPv4", opt: 1 }, { k: "ipv6", label: "IPv6", opt: 1 },
+    { k: "name", label: "名称", hint: "小写字母、数字、-" }, { k: "colo", label: "位置代号（机场三字码，如 NRT、CMH）", opt: 1, hint: "显示在报错页与 fucf-trace 的 colo；同一地点的多台机器用相同代号、不同 dc 区分（fl 以 dc 开头）" }, { k: "dc", label: "同地点机器编号（dc）", type: "number", min: 1, opt: 1 }, { k: "ipv4", label: "IPv4", opt: 1 }, { k: "ipv6", label: "IPv6", opt: 1 },
     { k: "role", label: "节点角色", type: "select", def: "peer", options: [["peer", "Peer (完整控制面)"], ["accelerate", "Accelerate (纯加速节点)"]] },
     { k: "accel_hosts", label: "Accelerate 允许域名（逗号分隔，支持 *.domain）", type: "list" },
     { k: "continents", label: "负责的大洲", type: "multi", options: Object.entries(CONT) },
@@ -1947,6 +1950,20 @@ document.addEventListener("drop", e => {
     });
   }
 });
+// Pages showing live numbers refresh by themselves, unless that would get in the way.
+function autoOn() { try { return localStorage.getItem("fucf_autorefresh") !== "0"; } catch { return true; } }
+function AUTO_VIEWS(s) { return s && (s.view === "overview" || s.view === "fleet" || (s.view === "zone" && (s.tab === "overview" || s.tab === "analytics"))); }
+let lastRender = Date.now();
+setInterval(async () => {
+  if (!token || !autoOn() || !AUTO_VIEWS(S) || document.hidden || Date.now() - lastRender < 25000) return;
+  if (document.getElementById("modal").innerHTML.trim()) return; // a form or dialog is open
+  const f = document.activeElement;
+  if (f && /^(INPUT|SELECT|TEXTAREA)$/.test(f.tagName) && f.id !== "zsw") return;
+  if (String(window.getSelection() || "")) return; // someone is copying something
+  const y = window.scrollY;
+  await render();
+  window.scrollTo(0, y);
+}, 5000);
 window.addEventListener("hashchange", () => { window.scrollTo(0, 0); render(); });
 render();
 </script>

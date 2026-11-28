@@ -129,8 +129,17 @@ impl EdgeError {
     /// The text the visitor gets.
     pub fn public_detail(&self) -> String {
         match &self.origin {
-            Some(fault) => format!("{} 这个站点暂时无法访问；站点管理员可凭下面的 Ray ID 在面板或节点日志中查看原因。", fault.reason),
+            Some(fault) => format!("{} 边缘节点工作正常，但没能从源站得到有效的响应。", fault.reason),
             None => self.detail.clone(),
+        }
+    }
+
+    /// Which part of the path failed.
+    pub fn hop(&self) -> Hop {
+        match (self.origin.is_some(), self.status) {
+            (true, _) => Hop::Origin,
+            (false, 400 | 411 | 413 | 414 | 431) => Hop::Browser,
+            _ => Hop::Edge,
         }
     }
 
@@ -141,6 +150,26 @@ impl EdgeError {
             None => format!("{}: {}", self.title, self.detail),
         }
     }
+}
+
+/// The three stops of a request, as an error page draws them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hop {
+    /// The request itself is malformed or too large.
+    Browser,
+    /// The edge answered by itself (unknown host, `/cdn-cgi/*`, security
+    /// rules, limits): the origin was not involved.
+    Edge,
+    /// The edge could not get a usable answer from the origin.
+    Origin,
+}
+
+/// What an error page tells about where it comes from.
+pub struct PageCtx {
+    pub hop: Hop,
+    /// The host name the visitor asked for (never the origin's address).
+    pub host: String,
+    pub here: cgi::Here,
 }
 
 /// Origin-side failures as visitors are told about them.
@@ -198,6 +227,18 @@ footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--line);font-
 footer code{font:12.5px ui-monospace,'SF Mono',Consolas,monospace;color:var(--sub)}\
 .spin{width:28px;height:28px;border-radius:50%;border:2.5px solid var(--line);border-top-color:var(--clay);animation:r 0.9s linear infinite;margin-bottom:1.75rem}\
 @keyframes r{to{transform:rotate(360deg)}}\
+.path{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:2rem 0 1.5rem;padding:1.25rem .5rem;border:1px solid var(--line);border-radius:1rem}\
+.hop{position:relative;text-align:center;min-width:0}\
+.hop:not(:last-child)::after{content:'';position:absolute;top:22px;left:calc(50% + 30px);right:calc(-50% + 22px);border-top:2px dashed var(--line)}\
+.hop i{display:grid;place-items:center;width:44px;height:44px;margin:0 auto .6rem;border-radius:50%;background:var(--chip);color:var(--sub)}\
+.hop i svg{width:22px;height:22px}\
+.hop b{display:block;font-size:14px;font-weight:500;line-height:1.35}\
+.hop small{display:block;font:12px/1.4 ui-monospace,'SF Mono',Consolas,monospace;color:var(--faint);overflow-wrap:anywhere}\
+.hop em{display:inline-block;margin-top:.5rem;padding:3px 9px;border-radius:999px;font:500 12px/1.4 inherit;font-style:normal;background:var(--chip);color:var(--faint)}\
+.hop.ok i,.hop.ok em{background:rgba(74,155,110,.14);color:#2f7a52}\
+.hop.bad i,.hop.bad em{background:rgba(217,119,87,.16);color:#b5462a}\
+@media (prefers-color-scheme:dark){.hop.ok i,.hop.ok em{color:#7cc49b}.hop.bad i,.hop.bad em{color:#f0a283}}\
+.what h2{font-size:15px;font-weight:600;margin:1.25rem 0 .25rem}.what p{font-size:15px;margin:0}\
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
 /// A small mark for the edge's pages (an open sector: the edge between visitor and origin).
@@ -216,18 +257,74 @@ fn html_page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
     resp
 }
 
-fn page(status: u16, title: &str, detail: &str, ray: &str) -> Response<Body> {
+const ICON_BROWSER: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3.5\" y=\"4.5\" width=\"17\" height=\"15\" rx=\"2\"/><path d=\"M3.5 9h17M7 6.8h.01M9.5 6.8h.01\"/></svg>";
+const ICON_EDGE: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"><path d=\"M4 17a8 8 0 0 1 16 0\"/><path d=\"M12 17l4.5-5.5\"/><circle cx=\"12\" cy=\"17\" r=\"1.3\" fill=\"currentColor\"/></svg>";
+const ICON_ORIGIN: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"4\" y=\"4.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><rect x=\"4\" y=\"13.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><path d=\"M7.5 7.5h.01M7.5 16.5h.01\"/></svg>";
+
+/// The path of the request and where it broke, like Cloudflare's 5xx pages.
+fn path_html(ctx: &PageCtx) -> String {
+    let state = |hop: Hop| -> (&str, &str) {
+        match (ctx.hop, hop) {
+            (failed, h) if failed == h => ("bad", "出错 Error"),
+            (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", "未涉及 Not involved"),
+            _ => ("ok", "正常 Working"),
+        }
+    };
+    let stop = |hop: Hop, icon: &str, name: &str, sub: &str| {
+        let (class, text) = state(hop);
+        format!("<div class=\"hop {class}\"><i aria-hidden=\"true\">{icon}</i><b>{name}</b><small>{}</small><em>{text}</em></div>", escape(sub))
+    };
+    let host = if ctx.host.is_empty() { "-" } else { ctx.host.as_str() };
+    format!(
+        "<div class=\"path\" role=\"img\" aria-label=\"请求路径：浏览器、边缘节点 {colo}、源站\">{}{}{}</div>",
+        stop(Hop::Browser, ICON_BROWSER, "你的浏览器", "Browser"),
+        stop(Hop::Edge, ICON_EDGE, "边缘节点", &format!("fucf · {}", ctx.here.colo)),
+        stop(Hop::Origin, ICON_ORIGIN, "源站", host),
+        colo = escape(&ctx.here.colo),
+    )
+}
+
+/// What happened and what to do, by where it broke.
+fn advice(status: u16, ctx: &PageCtx) -> (String, &'static str) {
+    let colo = escape(&ctx.here.colo);
+    match ctx.hop {
+        Hop::Origin => (
+            format!("请求已到达边缘节点 {colo}，但回源失败：问题在源站或回源配置，与你的浏览器和网络无关。"),
+            "访客：几分钟后重新加载即可。站点管理员：凭下方 Ray ID 在面板「分析 → 回源错误」查看原因与修复方法。",
+        ),
+        Hop::Browser => (
+            format!("这次请求的格式或大小不被接受，边缘节点 {colo} 没有处理它，也没有转发到源站。"),
+            "请检查网址，或清除这个站点的 Cookie 后再试。",
+        ),
+        Hop::Edge => (
+            format!("这次请求由边缘节点 {colo} 直接作答，没有转发到源站，与源站无关。"),
+            match status {
+                404 => "请检查网址是否正确；如果这个地址本应可用，请联系站点管理员核对 fucf 中的域名与规则配置。",
+                403 => "如果你认为不该被拦截，请把下方 Ray ID 告诉站点管理员。",
+                429 => "请求太频繁了，请稍等片刻再试。",
+                _ if status >= 500 => "这通常是暂时的，请稍后重新加载；持续出现时请把 Ray ID 告诉站点管理员。",
+                _ => "请检查网址；持续出现时请把 Ray ID 告诉站点管理员。",
+            },
+        ),
+    }
+}
+
+fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Response<Body> {
     let (t, d) = (escape(title), escape(detail));
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     // a retry helps with what is temporary; a 4xx will not change by itself
     let retry = if status >= 500 { "<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">重新加载</button></div>" } else { "" };
     let when = crate::store::now();
+    let (what, todo) = advice(status, ctx);
+    let (colo, fl) = (escape(&ctx.here.colo), escape(&ctx.here.fl));
     html_page(
         code,
         &format!("{status} · {t}"),
         &format!(
-            "{PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{t}</h1><p>{d}</p>{retry}\
-             <footer><span>Ray ID <code>{ray}</code></span><span>{when}</span><span>fucf</span></footer>"
+            "{PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{t}</h1><p>{d}</p>{path}\
+             <div class=\"what\"><h2>发生了什么</h2><p>{what}</p><h2>可以怎么做</h2><p>{todo}</p></div>{retry}\
+             <footer><span>Ray ID <code>{ray}</code></span><span>节点 <code>{colo}</code> · <code>fl={fl}</code></span><span>{when}</span><span>fucf</span></footer>",
+            path = path_html(ctx),
         ),
     )
 }
@@ -1687,10 +1784,11 @@ impl Edge {
                 Verdict::Pass => None,
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
-                    Some(page(403, "Access denied", &detail, ray))
+                    Some(page(403, "Access denied", &detail, ray, &PageCtx { hop: Hop::Edge, host: host.clone(), here: self.here() }))
                 }
                 Verdict::RateLimited { retry_after } => {
-                    let mut resp = page(429, "Too many requests", "You are being rate limited.", ray);
+                    let ctx = PageCtx { hop: Hop::Edge, host: host.clone(), here: self.here() };
+                    let mut resp = page(429, "Too many requests", "You are being rate limited.", ray, &ctx);
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
                 }
@@ -1805,6 +1903,15 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     let head = req.method() == Method::HEAD;
     let accept = req.headers().get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(String::from);
     let grpc = req.version() >= hyper::Version::HTTP_2 && is_grpc(req.headers());
+    // for the error page: the name the visitor asked for, if it is a sane one
+    let asked_host = req
+        .uri()
+        .host()
+        .map(str::to_string)
+        .or_else(|| req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).map(str::to_string))
+        .map(|h| request_host(&h))
+        .filter(|h| h.len() <= 253 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:".contains(&b)))
+        .unwrap_or_default();
     let mut seen = None;
     // `refusal`: why the edge answered by itself instead of passing on the origin's answer
     let (resp, refusal) = match edge.clone().process(peer.ip().to_canonical(), ssl, req, &ray, &mut seen).await {
@@ -1825,7 +1932,9 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
                     edge.waf.origin_error(&s.zone_id, &ray, e.status, fault.reason, fault.hint, &s.host, &line, peer.ip().to_canonical(), &s.country);
                 }
             }
-            (page(e.status, e.title, &public, &ray), Some(e.public_line()))
+            let host = seen.as_ref().map(|s| s.host.clone()).unwrap_or(asked_host);
+            let ctx = PageCtx { hop: e.hop(), host, here: edge.here() };
+            (page(e.status, e.title, &public, &ray, &ctx), Some(e.public_line()))
         }
     };
     // HTTP/3 is on offer where it works: through the front for the names its
@@ -1840,7 +1949,8 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     let alt_svc = offered.filter(|_| ssl && !cn_udp_blocked).and_then(|host| {
         edge.front.get().and_then(|front| front.alt_svc(&host)).or_else(|| edge.alt_svc.get().cloned())
     });
-    let mut resp = compress::apply(accept, head, resp).await;
+    let page_host = seen.as_ref().map(|s| s.host.clone()).unwrap_or_default();
+    let mut resp = compress::apply(accept, head, resp, || PageCtx { hop: Hop::Origin, host: page_host, here: edge.here() }).await;
     let internal = cgi::is_fucf_node(peer.ip().to_canonical(), &edge.store.snapshot().nodes);
     let is_cdn = seen.is_some();
     if let Some(seen) = seen {

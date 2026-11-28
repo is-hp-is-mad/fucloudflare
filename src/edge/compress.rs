@@ -81,7 +81,7 @@ fn compressible(resp: &Response<Body>) -> bool {
 
 /// Compress the response body when the client supports it and it is worth
 /// it: a compressible type of known, moderate size that shrinks.
-pub async fn apply(accept_encoding: Option<String>, head: bool, resp: Response<Body>) -> Response<Body> {
+pub async fn apply(accept_encoding: Option<String>, head: bool, resp: Response<Body>, ctx: impl FnOnce() -> super::PageCtx) -> Response<Body> {
     let Some(encoding) = accept_encoding.as_deref().and_then(negotiate) else { return resp };
     let size = hyper::body::Body::size_hint(resp.body()).exact();
     if head || !compressible(&resp) || !size.is_some_and(|s| (MIN_SIZE..=MAX_SIZE).contains(&s)) {
@@ -89,7 +89,7 @@ pub async fn apply(accept_encoding: Option<String>, head: bool, resp: Response<B
     }
     let (mut parts, body) = resp.into_parts();
     let Ok(data) = collect_limited(body, MAX_SIZE as usize).await else {
-        return super::page(502, super::ORIGIN_ERROR, &super::ORIGIN_BAD_RESPONSE.to_string(), "-");
+        return super::page(502, super::ORIGIN_ERROR, &super::ORIGIN_BAD_RESPONSE.to_string(), "-", &ctx());
     };
     let packed = if data.len() > 64 * 1024 {
         let input = data.clone();

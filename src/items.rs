@@ -964,6 +964,12 @@ pub struct EdgeNode {
     /// (defaults to trailing digits in `name`, or 1 when omitted).
     #[serde(default)]
     pub dc: Option<u32>,
+    /// Location code shown as `colo=` in the trace and on the edge's error
+    /// pages: the IATA code of the nearest airport, like Cloudflare's (`NRT`,
+    /// `CMH`). Several machines at one place share it and differ in `dc`
+    /// (and so in `fl`). Defaults to the node name without trailing digits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colo: Option<String>,
     /// Node role (`"peer"` or `"accelerate"`, empty defaults to `"peer"`).
     #[serde(default)]
     pub role: String,
@@ -993,6 +999,13 @@ impl EdgeNode {
     }
 
     pub fn validate(&mut self, others: &[EdgeNode]) -> Result<(), StoreError> {
+        self.colo = self.colo.as_deref().map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty());
+        if self.colo.as_deref().is_some_and(|c| c.len() != 3 || !c.bytes().all(|b| b.is_ascii_uppercase())) {
+            return invalid("colo must be a three-letter airport code (e.g. NRT), or null");
+        }
+        if self.dc.is_some_and(|n| n == 0 || n > 999) {
+            return invalid("dc must be between 1 and 999");
+        }
         let amounts = [
             ("traffic_dns_gb", self.traffic_dns_gb),
             ("traffic_throttle_gb", self.traffic_throttle_gb),

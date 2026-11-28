@@ -1906,3 +1906,22 @@ fn request_hosts_are_normalized() {
         assert_eq!(request_host(raw), want, "{raw}");
     }
 }
+
+#[tokio::test]
+async fn error_pages_show_where_the_request_broke() {
+    let env = setup().await;
+    let hops = |body: &str| -> Vec<String> {
+        body.split("<div class=\"hop ").skip(1).map(|h| h.split('"').next().unwrap_or_default().to_string()).collect()
+    };
+    // answered by the edge itself: the origin is not involved
+    let r = get(&env, "nowhere.test", "/").await;
+    assert_eq!((r.status, hops(&r.body)), (404, vec!["ok".to_string(), "bad".into(), "".into()]), "{}", r.body);
+    assert!(r.body.contains("与源站无关") && r.body.contains("nowhere.test") && r.body.contains("fl="), "{}", r.body);
+    let r = get(&env, "example.com", "/cdn-cgi/no-such-thing").await;
+    assert_eq!((r.status, hops(&r.body)), (404, vec!["ok".to_string(), "bad".into(), "".into()]), "{}", r.body);
+    // the origin failed: browser and edge worked
+    env.store.save_item::<OriginRule>(&env.zone, None, json!({ "expression": "http.request.uri.path eq \"/down\"", "origin_port": 1 }), true).unwrap();
+    let r = get(&env, "example.com", "/down").await;
+    assert_eq!((r.status, hops(&r.body)), (521, vec!["ok".to_string(), "ok".into(), "bad".into()]), "{}", r.body);
+    assert!(r.body.contains("回源失败") && r.body.contains("重新加载"), "{}", r.body);
+}
