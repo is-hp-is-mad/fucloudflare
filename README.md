@@ -192,6 +192,15 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
 - `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
 
+### DNS 响应限速与内核层封禁
+
+- `--dns-rrl`（`FUCF_DNS_RRL`，默认 100，0 为关闭）：UDP 上对同一网络（/24、/56）同一名字每秒最多应答这么多次；超出的部分一半以截断（TC）应答，
+  真正的解析器会改用 TCP 重试，其余丢弃。UDP 的来源地址可以伪造，不限速的权威服务器会被用来放大攻击别人。本机回环不限。
+- `--ban-export 文件`（`FUCF_BAN_EXPORT`）：把自动防火墙当前封禁的地址（只含动作为拦截的规则）写成 nftables 脚本，每 30 秒检查、有变化才重写。
+  fucf 自己没有改内核表的权限，也不替你决定封禁覆盖哪些端口：由宿主机用 `nft -f 文件` 加载（例如配一个 systemd path 单元），并自己加丢弃规则，如
+  `nft add chain inet fucf input '{ type filter hook input priority -10; }'` 和 `nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop`。
+  注意同一台机器上的其他服务是否也该被这条规则覆盖。
+
 ### 限速的计数方式
 
 - `characteristics`：区分客户端的依据，默认只按 `ip`；可选 `asn`、`country`、`host`、`path`、`header:名称`、`cookie:名称`，最多 4 个，组合成一个计数键（例如 `["header:x-api-key"]` 按 API 密钥限速）。

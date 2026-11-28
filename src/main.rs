@@ -195,6 +195,18 @@ struct Args {
     #[arg(long, env = "FUCF_EDGE_TTL", default_value_t = 300)]
     edge_ttl: u32,
 
+    /// Answers per second the DNS server sends over UDP to one network (/24,
+    /// /56) for one name; beyond it half go out truncated (ask again over
+    /// TCP) and the rest is dropped. 0: no limit.
+    #[arg(long, env = "FUCF_DNS_RRL", default_value_t = 100)]
+    dns_rrl: u32,
+
+    /// Write the addresses the automatic firewall bans (by rules that block)
+    /// to this file as an nftables script (sets `banned4` and `banned6` of the
+    /// table `inet fucf`), for the host to load and drop them in the kernel.
+    #[arg(long, env = "FUCF_BAN_EXPORT")]
+    ban_export: Option<PathBuf>,
+
     /// SMTP listener for inbound e-mail routing (e.g. `0.0.0.0:25`). Off unless set.
     #[arg(long, env = "FUCF_SMTP_LISTEN")]
     smtp_listen: Option<SocketAddr>,
@@ -782,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
         rtt: edge.rtt.clone(),
     });
 
+    dns::rrl::configure(args.dns_rrl);
     let mut dns_listeners = Vec::new();
     for addr in &args.dns_listen {
         if accel && !addr.ip().is_loopback() {
@@ -960,6 +973,9 @@ async fn main() -> anyhow::Result<()> {
     if !accel {
         // secondaries hear of a changed zone at once
         tokio::spawn(dns::transfer::notify(store.clone()));
+    }
+    if let Some(path) = args.ban_export.clone() {
+        tokio::spawn(edge::banset::run(store.clone(), path));
     }
     // every node checks the origins itself: what it can reach is what it sends requests to
     tokio::spawn(edge::origins::run(edge.clone()));

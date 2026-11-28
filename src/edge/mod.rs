@@ -5,6 +5,7 @@ pub mod cache;
 pub mod certdir;
 pub mod cgi;
 pub mod autofw;
+pub mod banset;
 pub mod challenge;
 pub mod origins;
 pub mod reputation;
