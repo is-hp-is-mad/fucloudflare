@@ -152,13 +152,29 @@ pub fn http_date(value: &header::HeaderValue) -> Option<i64> {
     chrono::DateTime::parse_from_rfc2822(value.to_str().ok()?.trim()).ok().map(|t| t.timestamp())
 }
 
-fn accept_encoding_bucket(headers: &HeaderMap) -> &'static str {
+/// The compressions a visitor's answer may come in, as the last part of
+/// its key: those of br, gzip and zstd it accepts (by q-value, as
+/// [`super::compress::accepts`] reads it), in that order, comma separated.
+/// An origin answers compressed in one of what the visitor asked for, so
+/// a copy kept under a bucket only goes to visitors that take every coding
+/// of it ([`Cache::put`] refuses the rest).
+fn accept_encoding_bucket(headers: &HeaderMap) -> String {
     let ae = headers.get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).unwrap_or("");
-    match (ae.contains("br"), ae.contains("gzip")) {
-        (true, true) => "br,gzip",
-        (true, false) => "br",
-        (false, true) => "gzip",
-        _ => "",
+    let taken: Vec<&str> = BUCKET_CODINGS.into_iter().filter(|c| super::compress::accepts(ae, c)).collect();
+    taken.join(",")
+}
+
+/// The codings a key tells apart; any other one is never stored (see
+/// [`Cache::put`]).
+const BUCKET_CODINGS: [&str; 3] = ["br", "gzip", "zstd"];
+
+/// Whether an answer in `coding` (lower case) may be kept under `key`:
+/// the coding is one of the key's compression part. Keys without one
+/// (not from [`cache_key`]) take anything.
+fn bucket_allows(key: &str, coding: &str) -> bool {
+    match key.rsplit_once(&format!("|{ENC}")) {
+        Some((_, bucket)) => bucket.split(',').any(|b| b == coding),
+        None => true,
     }
 }
 
@@ -363,12 +379,24 @@ impl Cache {
         identity_key(key).unwrap_or_else(|| key.to_string())
     }
 
+    /// Keep an answer to a request with this key. An uncompressed one goes
+    /// under the shared key; a compressed one only under a key whose
+    /// compression part names its coding, else it is not kept at all: an
+    /// origin that sends zstd, deflate or several codings to a visitor that
+    /// did not ask for them (or gzip to one that sent no Accept-Encoding)
+    /// must not have that body served to the next visitor from the cache.
     pub fn put(&self, key: String, entry: Entry) {
-        // an uncompressed answer serves every client
-        let key = match identity_key(&key) {
-            Some(shared) if !entry.headers.contains_key(header::CONTENT_ENCODING) => shared,
+        let coding = entry.headers.get(header::CONTENT_ENCODING).map(|v| v.to_str().unwrap_or("?").trim().to_ascii_lowercase());
+        let key = match (identity_key(&key), &coding) {
+            // an uncompressed answer serves every client
+            (Some(shared), None) => shared,
             _ => key,
         };
+        if let Some(coding) = coding.filter(|c| c != "identity") {
+            if !bucket_allows(&key, &coding) {
+                return;
+            }
+        }
         self.put_exact(key, entry);
     }
 
@@ -935,6 +963,62 @@ mod tests {
         let br = cache_key(true, "a.test", "/y.js", "", &ae("br"));
         cache.put(br.clone(), entry(true));
         assert!(cache.get(&br).is_some() && cache.get(&cache_key(true, "a.test", "/y.js", "", &ae("gzip"))).is_none(), "compressed copies stay apart");
+    }
+
+    #[test]
+    fn the_compression_part_of_a_key_follows_the_q_values_and_names_zstd() {
+        let bucket = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
+            accept_encoding_bucket(&h)
+        };
+        assert_eq!(bucket("gzip, deflate, br, zstd"), "br,gzip,zstd");
+        assert_eq!(bucket("gzip, deflate, br"), "br,gzip", "keys of clients without zstd are as before");
+        assert_eq!(bucket("zstd"), "zstd");
+        assert_eq!(bucket("br;q=0, gzip"), "gzip", "a refused coding is not in the bucket");
+        assert_eq!(bucket("zstd;q=0"), "");
+        assert_eq!(bucket("deflate, identity, *"), "", "only br, gzip and zstd are told apart");
+        assert_eq!(bucket("xbr, gzipped"), "", "whole tokens only");
+        assert_eq!(accept_encoding_bucket(&HeaderMap::new()), "");
+    }
+
+    #[test]
+    fn a_compressed_answer_is_kept_only_where_every_visitor_takes_its_coding() {
+        let ae = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
+            h
+        };
+        let entry = |coding: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_ENCODING, coding.parse().unwrap());
+            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"packed"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: "z".into(), url: "u".into(), piece: None }
+        };
+        let key = |path: &str, accept: &str| cache_key(true, "a.test", path, "", &ae(accept));
+        let cache = Cache::new(1 << 20);
+
+        cache.put(key("/a.css", "gzip, br, zstd"), entry("zstd"));
+        assert!(cache.get(&key("/a.css", "zstd, br, gzip")).is_some());
+        for other in ["gzip, br", "gzip", "br", "zstd;q=0, gzip, br", "identity"] {
+            assert!(cache.get(&key("/a.css", other)).is_none(), "{other}");
+        }
+        assert!(cache.get("https|a.test/a.css|ae=").is_none(), "nothing went to the shared key");
+
+        // an origin that answered in a coding the visitor did not ask for: not kept
+        cache.put(key("/b.css", "gzip, br"), entry("zstd"));
+        cache.put(key("/c.css", "gzip"), entry("deflate"));
+        cache.put(key("/d.css", "gzip, br"), entry("gzip, br"));
+        cache.put("https|a.test/e.css|ae=".into(), entry("gzip"));
+        for path in ["/b.css", "/c.css", "/d.css", "/e.css"] {
+            for accept in ["gzip, br, zstd", "gzip", "identity"] {
+                assert!(cache.get(&key(path, accept)).is_none(), "{path} {accept}");
+            }
+        }
+        // a coding written in capitals is still the coding, and keys not made by cache_key take anything
+        cache.put(key("/f.css", "gzip"), entry(" GZIP "));
+        assert!(cache.get(&key("/f.css", "gzip, br")).is_none() && cache.get(&key("/f.css", "gzip")).is_some());
+        cache.put("warp|x".into(), entry("zstd"));
+        assert!(cache.get("warp|x").is_some());
     }
 
     #[test]

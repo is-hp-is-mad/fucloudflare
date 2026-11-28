@@ -554,6 +554,28 @@ visitor gets its first byte (it is cut into chunks as it is read); answers witho
 are kept whole; a range request for an object that is not cached still goes to the origin as it is,
 and its answer is not kept.
 
+#### Compression
+
+The edge compresses text answers (`text/*`, JSON, JavaScript, XML, SVG, WASM and the like) of 1 KiB
+to 8 MiB with a known length on the way out, when the visitor's `Accept-Encoding` takes one of
+`br` (brotli, quality 4), `zstd` (level 3) or `gzip` (level 5). The order is fixed, whatever the
+q-values above zero say: brotli, then zstd, then gzip, so a browser that sends
+`gzip, deflate, br, zstd` keeps getting brotli; `zstd` is used for clients that take it but not
+brotli. A coding with `q=0` is never used. Answers already compressed by the origin, ranges, non-`200`
+answers and `Cache-Control: no-transform` are left alone; the answer gets `Vary: accept-encoding` and
+a strong `ETag` becomes weak. Nothing to configure.
+
+The visitor's `Accept-Encoding` goes to the origin as it is, so an origin may answer compressed
+itself. The cache keeps such a copy under the codings the visitor takes, out of `br`, `gzip` and
+`zstd` (by q-value, as above), and only ever serves it to visitors that take exactly the same set:
+a visitor without `zstd` never gets the copy an origin compressed with zstd for another one. A
+compressed answer in a coding the visitor did not take (zstd or deflate to a client that did not
+ask for it, several codings, or anything to a client that sent no `Accept-Encoding`) is passed on as
+it came but not stored. An uncompressed answer is kept once for every client, as before.
+
+Pages that get the challenge script put in (zone setting `challenge_script`) may come from the
+origin as gzip, deflate, brotli or zstd; a zstd page with a window over 8 MiB is passed on as it is.
+
 ### Origins: health checks, weights and session affinity
 
 ```

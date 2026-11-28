@@ -96,6 +96,7 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
             let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
             let h_inm = req.headers().get("if-none-match").and_then(|v| v.to_str().ok()).map(String::from);
             let (h_range, h_if_range) = (req.headers().get("range").and_then(|v| v.to_str().ok()).map(String::from), req.headers().get("if-range").and_then(|v| v.to_str().ok()).map(String::from));
+            let h_ae = req.headers().get("accept-encoding").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
             let (path, line) = {
             let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
             let path = req.uri().path().to_string();
@@ -133,7 +134,20 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
                     gz.write_all(html.as_bytes()).unwrap();
                     return ([("content-type", "text/html; charset=utf-8"), ("content-encoding", "gzip"), ("cf-ray", "abc-SIN")], gz.finish().unwrap()).into_response();
                 }
+                if path.contains("zs") {
+                    let packed = zstd::bulk::compress(html.as_bytes(), 3).unwrap();
+                    return ([("content-type", "text/html; charset=utf-8"), ("content-encoding", "zstd")], packed).into_response();
+                }
                 return ([("content-type", "text/html; charset=utf-8"), ("cf-ray", "abc-SIN")], html).into_response();
+            }
+            if path.starts_with("/zstd-origin/") {
+                // zstd when asked for it, or always under /always/ (an origin that ignores Accept-Encoding)
+                let headers = [("content-type", "text/css"), ("cache-control", "public, max-age=60")];
+                if path.contains("/always/") || crate::edge::compress::accepts(&h_ae, "zstd") {
+                    let packed = zstd::bulk::compress(format!("zstd hit={n}").as_bytes(), 3).unwrap();
+                    return (headers, [("content-encoding", "zstd")], packed).into_response();
+                }
+                return (headers, format!("plain hit={n}")).into_response();
             }
             if path.contains("big") {
                 return ([("content-type", "text/plain; charset=utf-8")], "compress me ".repeat(500)).into_response();
@@ -1093,9 +1107,48 @@ async fn compresses_responses() {
     brotli::BrotliDecompress(&mut &body[..], &mut out).unwrap();
     assert_eq!(out.len(), plain_len);
 
+    let (head, body) = fetch("gzip, zstd").await;
+    assert!(head.contains("content-encoding: zstd") && head.contains(&format!("content-length: {}", body.len())), "{head}");
+    assert_eq!(zstd::stream::decode_all(&body[..]).unwrap().len(), plain_len);
+    let (head, _) = fetch("zstd;q=0, gzip").await;
+    assert!(head.contains("content-encoding: gzip"), "{head}");
+
     // small bodies and non-text types are left alone
     let small = send(&env, "GET", "example.com", "/hello", "Accept-Encoding: gzip\r\n", "").await;
     assert!(small.header("content-encoding").is_none() && small.body.contains("origin=main"));
+}
+
+#[tokio::test]
+async fn a_visitor_that_does_not_take_zstd_never_gets_a_zstd_body_from_the_cache() {
+    let env = setup().await;
+    let (chrome, safari) = ("Accept-Encoding: gzip, deflate, br, zstd\r\n", "Accept-Encoding: gzip, deflate, br\r\n");
+    let hits = || env.hits.load(Ordering::SeqCst);
+
+    let first = send(&env, "GET", "example.com", "/zstd-origin/a.css", chrome, "").await;
+    assert_eq!((first.header("content-encoding"), first.header("fcf-cache-status")), (Some("zstd"), Some("MISS")), "{}", first.head);
+    let again = send(&env, "GET", "example.com", "/zstd-origin/a.css", chrome, "").await;
+    assert_eq!((again.header("content-encoding"), again.header("fcf-cache-status")), (Some("zstd"), Some("HIT")));
+    assert_eq!(hits(), 1);
+    // a client that takes less gets the origin's plain answer, never the zstd copy;
+    // that plain copy then serves every client, zstd-only ones included
+    let r = send(&env, "GET", "example.com", "/zstd-origin/a.css", safari, "").await;
+    assert!(r.header("content-encoding").is_none() && r.body == "plain hit=2" && r.header("fcf-cache-status") == Some("MISS"), "{} {}", r.head, r.body);
+    for extra in ["Accept-Encoding: zstd;q=0, gzip\r\n", "", "Accept-Encoding: ZSTD\r\n", safari] {
+        let r = send(&env, "GET", "example.com", "/zstd-origin/a.css", extra, "").await;
+        assert!(r.header("content-encoding").is_none() && r.body == "plain hit=2" && r.header("fcf-cache-status") == Some("HIT"), "{extra}: {} {}", r.head, r.body);
+    }
+    let again = send(&env, "GET", "example.com", "/zstd-origin/a.css", chrome, "").await;
+    assert_eq!(again.header("content-encoding"), Some("zstd"), "the compressed copy is still there for those that take it");
+    assert_eq!(hits(), 2);
+
+    // an origin that sends zstd to anyone: passed on as it came, never kept for the next visitor
+    let before = hits();
+    for extra in [safari, safari, ""] {
+        let r = send(&env, "GET", "example.com", "/zstd-origin/always/b.css", extra, "").await;
+        assert_eq!(r.header("content-encoding"), Some("zstd"));
+        assert_ne!(r.header("fcf-cache-status"), Some("HIT"));
+    }
+    assert_eq!(hits(), before + 3, "each one went to the origin");
 }
 
 #[tokio::test]
@@ -2337,6 +2390,8 @@ async fn pages_get_the_script_and_scripts_get_json() {
     assert!(r.header("fcf-cache-status").is_some() && r.header("cf-cache-status").is_none());
     let r = get(&env, "example.com", "/gz/page.html").await;
     assert!(r.body.contains(super::SCRIPT_TAG) && r.body.contains("hello"), "{}", r.body);
+    let r = get(&env, "example.com", "/zs/page.html").await;
+    assert!(r.body.contains(super::SCRIPT_TAG) && r.body.contains("hello") && r.header("content-encoding").is_none(), "{}", r.body);
     let r = get(&env, "example.com", "/cdn-cgi/challenge-platform/fcf.js").await;
     assert!(r.status == 200 && r.body.contains("fcf-mitigated") && r.header("content-type").unwrap().contains("javascript"));
     let r = get(&env, "example.com", "/cdn-cgi/challenge-platform/ticket").await;

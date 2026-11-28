@@ -2432,12 +2432,12 @@ pub const SCRIPT_TAG: &str = "<script src=\"/cdn-cgi/challenge-platform/fcf.js\"
 const INJECT_LIMIT: usize = 4 << 20;
 
 /// Put [`SCRIPT_TAG`] into an HTML page (before `</head>`, else after
-/// `<body ...>`): plain or gzip / deflate / brotli bodies of 200 answers.
+/// `<body ...>`): plain or gzip / deflate / brotli / zstd bodies of 200 answers.
 async fn inject_script(resp: Response<Body>) -> Response<Body> {
     let html = resp.status() == StatusCode::OK
         && resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html"));
     let encoding = resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(|e| e.trim().to_ascii_lowercase()).unwrap_or_default();
-    if !html || !matches!(encoding.as_str(), "" | "identity" | "gzip" | "x-gzip" | "deflate" | "br") {
+    if !html || !matches!(encoding.as_str(), "" | "identity" | "gzip" | "x-gzip" | "deflate" | "br" | "zstd") {
         return resp;
     }
     let (mut parts, body) = resp.into_parts();
@@ -2454,6 +2454,8 @@ async fn inject_script(resp: Response<Body>) -> Response<Body> {
         "gzip" | "x-gzip" => decode(flate2::read::MultiGzDecoder::new(&raw[..])),
         "deflate" => decode(flate2::read::ZlibDecoder::new(&raw[..])),
         "br" => decode(brotli::Decompressor::new(&raw[..], 4096)),
+        // windows past 8 MiB are refused, as browsers do (RFC 9659), so a page cannot ask for more memory
+        "zstd" => zstd::stream::read::Decoder::new(&raw[..]).ok().and_then(|mut d| d.window_log_max(23).ok().map(|_| d)).and_then(decode),
         _ => Some(raw.clone()),
     };
     let Some(page) = decoded.and_then(|d| with_script(&d)) else {

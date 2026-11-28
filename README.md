@@ -7,7 +7,7 @@
 | DNS | 权威 DNS（UDP/TCP），代理记录解析到边缘 IP；按访客国家 / 大洲 / 运营商（ECS 感知）调度到节点，带健康检查与故障切换，可按地区屏蔽解析 |
 | 面板 | 内嵌的网页控制面板：DNS 记录、机群与节点（含分档限流）、调度规则、区域设置、规则、电子邮件路由、Workers；完全托管与 CNAME 接入两种模式 |
 | 多节点 | 无主对等同步（`--role peer --peers ...`）：每个对等节点都可读写，配置、面板账户、Workers KV / D1 和各节点的上报（流量统计、安全事件）在节点之间双向同步，冲突按混合逻辑时钟后写者胜；`--role accelerate` 节点只拉取配置、内存运行、拒绝写入 |
-| CDN | HTTP/1.1、HTTP/2、HTTP/3 (QUIC) 反向代理，WebSocket，gRPC，SNI 证书，边缘缓存与清除（Range、源站故障时回退到过期副本），brotli/gzip 压缩，源站故障转移 |
+| CDN | HTTP/1.1、HTTP/2、HTTP/3 (QUIC) 反向代理，WebSocket，gRPC，SNI 证书，边缘缓存与清除（Range、源站故障时回退到过期副本），brotli/zstd/gzip 压缩，源站故障转移 |
 | 节点限流 | 每个节点可设周期流量配额（摘除 DNS / 开始限速 / 硬限流三档）和限速；超限节点自动退出 DNS 应答，硬限流后只返回提示页 |
 | 证书 | 内置 ACME 客户端：向 Let's Encrypt 等 CA 自动签发并续期证书（DNS-01 / TLS-ALPN-01 / HTTP-01），也可上传自有证书 |
 | 规则 | 重定向规则、请求/响应改写规则、缓存规则 |
@@ -395,7 +395,8 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
 
 - HTTP/3：与 HTTPS 同端口号的 UDP 上提供，HTTPS 响应带 `Alt-Svc` 头引导客户端升级；三种协议共用同一条处理链路。
-- 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli 或 gzip（源站已压缩的不动）。
+- 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli、zstd 或 gzip（源站已压缩的不动）。固定按 brotli → zstd → gzip 的顺序选，`q=0` 的不用；同时支持 br 和 zstd 的浏览器照旧拿 brotli，只支持 zstd 不支持 br 的才拿 zstd（级别 3）。zstd 用的是 C 库（zstd-sys），编译要有 C 编译器，静态（musl）构建照 aws-lc-rs 的设置用 `musl-gcc` 就够。
+- 压缩副本入缓存：源站自己压缩的应答按访客接受的编码（br、gzip、zstd 三者，按 q 值算）分开存放，只发给接受同样编码的访客，不接受 zstd 的访客永远拿不到 zstd 副本；源站用访客没要的编码（例如给不支持 zstd 的访客发 zstd、发 deflate、没带 `Accept-Encoding` 也压缩）时照样转发，但不入缓存。
 - 重验证：缓存过期且带 `ETag`/`Last-Modified` 时向源站发条件请求，304 则续期（`REVALIDATED`）；客户端的 `If-None-Match`/`If-Modified-Since` 可直接由缓存回 304。
 - Range：缓存里有完整对象时，单段 Range 请求直接切片返回 206（`If-Range` 不匹配或多段时返回整个对象）；缓存里没有时原样转给源站，其应答不入缓存。
 - 源站故障：源站连不上、超时或返回 500/502/503/504 时，过期不超过 24 小时的缓存副本照常返回（`STALE`）。
