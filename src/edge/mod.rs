@@ -1889,6 +1889,7 @@ impl Edge {
         let on_upgrade = is_upgrade.then(|| hyper::upgrade::on(&mut req));
         let grpc = settings.grpc && req.version() >= hyper::Version::HTTP_2 && is_grpc(req.headers());
         let (parts, incoming) = req.into_parts();
+        let page_lang = Lang::from_headers(&parts.headers);
         let declared = parts.headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
         let has_body_method = matches!(parts.method, Method::POST | Method::PUT | Method::PATCH);
         let (body, inspect_prefix) = match declared {
@@ -1925,11 +1926,11 @@ impl Edge {
                 Verdict::Pass => None,
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
-                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(&parts.headers) };
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: page_lang };
                     Some(page(403, "Access denied", &detail, ray, &ctx))
                 }
                 Verdict::RateLimited { retry_after } => {
-                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(&parts.headers) };
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: page_lang };
                     let mut resp = page(429, "Too many requests", "You are being rate limited.", ray, &ctx);
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
