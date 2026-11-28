@@ -318,19 +318,29 @@ fn answer(status: StatusCode, body: Value) -> Response<Body> {
 }
 
 /// `POST /cdn-cgi/challenge-platform/verify`: the page's answer.
-pub async fn verify(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Request<Body>, ray: String) -> Result<Response<Body>, EdgeError> {
+pub fn verify(
+    waf: std::sync::Arc<Waf>,
+    ip: IpAddr,
+    ssl: bool,
+    req: Request<Body>,
+    ray: String,
+) -> impl std::future::Future<Output = Result<Response<Body>, EdgeError>> + Send + 'static {
+    async move { Ok(answer_of(waf, ip, ssl, req, ray).await) }
+}
+
+async fn answer_of(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Request<Body>, ray: String) -> Response<Body> {
     if req.method() != Method::POST {
-        return Ok(answer(StatusCode::METHOD_NOT_ALLOWED, json!({ "ok": false, "code": "post_only" })));
+        return answer(StatusCode::METHOD_NOT_ALLOWED, json!({ "ok": false, "code": "post_only" }));
     }
     let (parts, body) = req.into_parts();
     let bytes: Bytes = match Limited::new(body, MAX_ANSWER).collect().await {
         Ok(c) => c.to_bytes(),
-        Err(_) => return Ok(answer(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "code": "too_large" }))),
+        Err(_) => return answer(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "code": "too_large" })),
     };
     let Ok(report) = serde_json::from_slice::<Value>(&bytes) else {
-        return Ok(answer(StatusCode::BAD_REQUEST, json!({ "ok": false, "code": "unreadable" })));
+        return answer(StatusCode::BAD_REQUEST, json!({ "ok": false, "code": "unreadable" }));
     };
-    Ok(judge(&waf, ip, ssl, &parts.headers, &report, &ray))
+    judge(&waf, ip, ssl, &parts.headers, &report, &ray)
 }
 
 /// The verdict on a page's answer (no awaiting from here on).
