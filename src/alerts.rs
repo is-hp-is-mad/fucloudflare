@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The events a channel can ask for, in the order they are listed.
-pub const EVENTS: [&str; 6] = ["node_offline", "sync_lagging", "certificate_failing", "traffic_limit", "under_attack", "origin_errors"];
+pub const EVENTS: [&str; 7] = ["node_offline", "sync_lagging", "certificate_failing", "traffic_limit", "under_attack", "origin_errors", "new_script"];
 
 /// How often the fleet is looked at.
 const CHECK_EVERY: Duration = Duration::from_secs(30);
@@ -60,6 +60,8 @@ const MAX_LINES: usize = 30;
 const MAX_TEXT: usize = 4000;
 /// What a secret looks like in the API's answers.
 pub const MASK: &str = "***";
+/// New scripts named in one alert (the rest are counted).
+const NEW_SCRIPTS_LISTED: usize = 5;
 
 fn yes() -> bool {
     true
@@ -295,6 +297,10 @@ pub struct Observed {
     pub under_attack: Vec<String>,
     /// Per zone: origin error events within [`ORIGIN_WINDOW`].
     pub origin_errors: BTreeMap<String, usize>,
+    /// Per zone that asks for it: the scripts its pages loaded for the first
+    /// time within the last hour, newest first, with when (see
+    /// crate::edge::pageshield::new_scripts).
+    pub new_scripts: BTreeMap<String, Vec<(String, u64)>>,
 }
 
 /// An alert that fires.
@@ -437,6 +443,16 @@ pub fn evaluate(prev: &AlertState, seen: &Observed, now: u64, started: u64) -> (
             let mins = ORIGIN_WINDOW / 60;
             add(firing("origin_errors", zone, zone.clone(), "", format!("{zone} 在 {mins} 分钟内有 {count} 次回源错误 · {zone} had {count} origin errors within {mins} minutes")));
         }
+    }
+
+    for (zone, scripts) in &seen.new_scripts {
+        let Some(newest) = scripts.iter().map(|(_, at)| *at).max() else { continue };
+        // the hour of the newest: a script after it is told again, a flood at most once an hour
+        let level = crate::store::rfc3339((newest - newest % 3600) as i64);
+        let shown: Vec<&str> = scripts.iter().take(NEW_SCRIPTS_LISTED).map(|(url, _)| url.as_str()).collect();
+        let more = if scripts.len() > shown.len() { format!(" (+{})", scripts.len() - shown.len()) } else { String::new() };
+        let n = scripts.len();
+        add(firing("new_script", zone, zone.clone(), &level, format!("{zone} 的页面一小时内加载了 {n} 个新脚本 · pages of {zone} loaded {n} new scripts within the hour: {}{more}", shown.join(", "))));
     }
 
     let mut notices = Vec::new();
@@ -688,7 +704,8 @@ pub fn spawn(store: Arc<Store>, fleet: Arc<Fleet>, waf: Arc<Waf>, edge: Arc<Edge
             }
             let now = unix_now();
             let me = crate::fleet::self_name(&store, &edge_ips, node_name.as_deref());
-            let seen = observe(&store, &fleet, &waf, &me, now);
+            let mut seen = observe(&store, &fleet, &waf, &me, now);
+            seen.new_scripts = crate::edge::pageshield::new_scripts(&store, &edge.page_shield, now);
             let (next, notices) = evaluate(&state, &seen, now, started);
             state = next;
             *BOARD.lock().unwrap() = Some(Board { checked_at: Some(now), alerts: state.active.values().cloned().collect() });
@@ -893,6 +910,38 @@ mod tests {
         assert_eq!(told(&got[0]), vec![("origin_errors example.com".to_string(), "resolved", false)]);
         // and a count below the threshold does not start it again
         assert!(rounds(&mut state, &errors(1), [NOW + 120], STARTED)[0].is_empty());
+    }
+
+    #[test]
+    fn a_new_script_fires_is_told_again_for_a_later_hour_and_recovers_when_none_is_new() {
+        let mut state = AlertState::default();
+        let scripts = |list: &[(&str, u64)]| Observed { new_scripts: [("example.com".to_string(), list.iter().map(|(u, at)| (u.to_string(), *at)).collect())].into(), ..Observed::default() };
+        let hour = NOW - NOW % 3600;
+        let got = rounds(&mut state, &scripts(&[("https://cdn.example.net/a.js", hour + 10)]), [hour + 20], STARTED);
+        assert_eq!(told(&got[0]), vec![("new_script example.com".to_string(), "firing", false)]);
+        assert!(state.active["new_script:example.com"].message.contains("https://cdn.example.net/a.js"));
+        // another one within the same hour: the list grows, nobody is told again
+        let two = scripts(&[("https://cdn.example.net/b.js", hour + 30), ("https://cdn.example.net/a.js", hour + 10)]);
+        let got = rounds(&mut state, &two, [hour + 40], STARTED);
+        assert!(got[0].is_empty());
+        assert!(state.active["new_script:example.com"].message.contains(" 2 "));
+        // one in the next hour is told
+        let later = scripts(&[("https://cdn.example.net/c.js", hour + 3700), ("https://cdn.example.net/b.js", hour + 30)]);
+        let got = rounds(&mut state, &later, [hour + 3710], STARTED);
+        assert_eq!(told(&got[0]), vec![("new_script example.com".to_string(), "firing", false)]);
+        // nothing new any more: resolved
+        let got = rounds(&mut state, &Observed::default(), [hour + 7400], STARTED);
+        assert_eq!(told(&got[0]), vec![("new_script example.com".to_string(), "resolved", false)]);
+        // many at once: five named, the rest counted
+        let many: Vec<(String, u64)> = (0..12).map(|i| (format!("https://cdn.example.net/{i}.js"), hour + 100 - i)).collect();
+        let flood = Observed { new_scripts: [("example.com".to_string(), many)].into(), ..Observed::default() };
+        rounds(&mut state, &flood, [hour + 200], STARTED);
+        let message = &state.active["new_script:example.com"].message;
+        assert!(message.contains("https://cdn.example.net/4.js") && !message.contains("https://cdn.example.net/5.js") && message.ends_with("(+7)"), "{message}");
+        // a channel asks for it like for any other event
+        let mut c = webhook("https://hooks.example.com/x", &["new_script"]);
+        assert!(c.validate(None).is_ok());
+        assert_eq!(c.events, vec!["new_script"]);
     }
 
     #[test]

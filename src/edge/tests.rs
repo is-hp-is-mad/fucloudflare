@@ -150,6 +150,11 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
                 return (axum::http::StatusCode::from_u16(status).unwrap(), [("etag", "\"v1\""), ("cache-control", "public, max-age=1")], body)
                     .into_response();
             }
+            if path.contains("csp.html") {
+                // a page whose origin sets policies of its own
+                let headers = [("content-type", "text/html"), ("content-security-policy", "default-src 'self'"), ("content-security-policy-report-only", "img-src 'self'")];
+                return (headers, "<!doctype html><p>csp</p>").into_response();
+            }
             if path.contains("page.html") {
                 let html = "<!doctype html><html><HEAD><title>t</title></HEAD><body>hello</body></html>";
                 if path.contains("gz") {
@@ -2425,6 +2430,62 @@ async fn a_zone_can_add_preload_hints_to_its_pages_and_only_to_them() {
     }
     env.store.update_setting(&env.zone, "early_hints_links", json!([])).unwrap();
     assert!(get(&env, "example.com", "/page.html").await.header("link").is_none(), "cleared");
+}
+
+#[tokio::test]
+async fn page_shield_adds_its_policy_to_html_pages_and_counts_the_scripts_browsers_report() {
+    let env = setup().await;
+    let report = "/cdn-cgi/script_monitor/report";
+    let csp2 = |document: &str, blocked: &str| json!({ "csp-report": { "document-uri": document, "blocked-uri": blocked, "effective-directive": "script-src-elem" } }).to_string();
+    let post = |ctype: &str, body: String| {
+        let extra = format!("Content-Type: {ctype}\r\n");
+        let env = &env;
+        async move { send(env, "POST", "example.com", report, &extra, &body).await }
+    };
+    assert!(get(&env, "example.com", "/page.html").await.header("content-security-policy-report-only").is_none(), "off by default");
+    // a zone without Page Shield takes nothing, and says nothing about it
+    assert_eq!(post("application/csp-report", csp2("https://example.com/page.html", "https://cdn.example.net/early.js")).await.status, 204);
+    assert!(env.edge.page_shield.scripts(&env.zone).is_empty());
+
+    env.store.update_setting(&env.zone, "page_shield", json!({ "enabled": true })).unwrap();
+    let r = get(&env, "example.com", "/page.html").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("content-security-policy-report-only"), Some("script-src 'none'; report-uri /cdn-cgi/script_monitor/report"), "{}", r.head);
+    assert!(r.header("content-security-policy").is_none() && r.header("reporting-endpoints").is_none(), "plain HTTP: report-uri only\n{}", r.head);
+    assert!(get(&env, "example.com", "/hello").await.header("content-security-policy-report-only").is_none(), "not a page");
+
+    // the origin's own policies stay as they are, ours is one more line
+    let r = get(&env, "example.com", "/csp.html").await;
+    let lines = |name: &str| r.head.lines().filter(|l| l.split_once(':').is_some_and(|(k, _)| k.eq_ignore_ascii_case(name))).map(|l| l.split_once(':').unwrap().1.trim().to_string()).collect::<Vec<_>>();
+    assert_eq!(lines("content-security-policy"), vec!["default-src 'self'"], "{}", r.head);
+    assert_eq!(lines("content-security-policy-report-only"), vec!["img-src 'self'", "script-src 'none'; report-uri /cdn-cgi/script_monitor/report"], "{}", r.head);
+
+    // both report formats; the query string of a script is never kept
+    assert_eq!(post("application/csp-report", csp2("https://example.com/page.html", "https://cdn.example.net/lib.js?v=1&token=abc")).await.status, 204);
+    let batch = json!([
+        { "type": "csp-violation", "url": "https://example.com/", "body": { "documentURL": "https://example.com/", "blockedURL": "https://CDN.example.net:443/app.js#x", "effectiveDirective": "script-src-elem" } },
+        { "type": "csp-violation", "url": "https://example.net/", "body": { "documentURL": "https://example.net/", "blockedURL": "https://cdn.example.net/elsewhere.js", "effectiveDirective": "script-src-elem" } },
+        { "type": "csp-violation", "url": "https://example.com/", "body": { "documentURL": "https://example.com/", "blockedURL": "https://cdn.example.net/style.css", "effectiveDirective": "style-src-elem" } },
+    ]);
+    assert_eq!(post("application/reports+json", batch.to_string()).await.status, 204);
+    let mut seen: Vec<(String, u64)> = env.edge.page_shield.scripts(&env.zone).into_iter().map(|(url, s)| (url, s.count)).collect();
+    seen.sort();
+    assert_eq!(seen, vec![("https://cdn.example.net/app.js".to_string(), 1), ("https://cdn.example.net/lib.js".to_string(), 1)], "another page's report and a style are not scripts of this zone");
+
+    // what the endpoint refuses
+    assert_eq!(get(&env, "example.com", report).await.status, 405);
+    assert_eq!(post("text/plain", csp2("https://example.com/", "https://cdn.example.net/x.js")).await.status, 415);
+    assert_eq!(post("application/csp-report", "{not json".to_string()).await.status, 400);
+    // a body declared too large is refused before it is read
+    let big = format!("POST {report} HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nContent-Type: application/csp-report\r\nContent-Length: {}\r\n\r\n{{", pageshield::MAX_BODY + 1);
+    assert_eq!(exchange(TcpStream::connect(("127.0.0.1", env.port)).await.unwrap(), big).await.status, 413);
+    assert_eq!(env.edge.page_shield.scripts(&env.zone).len(), 2);
+
+    assert!(env.store.update_setting(&env.zone, "page_shield", json!({ "enabled": true, "policy": "script-src 'self'\r\nX-Evil: 1" })).is_err());
+    assert!(env.store.update_setting(&env.zone, "page_shield", json!({ "enabled": true, "mode": "enforce" })).is_err(), "enforce needs a policy of its own");
+    env.store.update_setting(&env.zone, "page_shield", json!({ "enabled": true, "mode": "enforce", "policy": "script-src 'self'" })).unwrap();
+    let r = get(&env, "example.com", "/page.html").await;
+    assert_eq!(r.header("content-security-policy"), Some("script-src 'self'; report-uri /cdn-cgi/script_monitor/report"), "{}", r.head);
 }
 
 /// An answer with its body as bytes (a picture is no text).

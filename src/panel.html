@@ -1008,7 +1008,7 @@ const ZONE = {
           setRow("按网络（ASN）验证", "同一个网络里有很多机房 / VPN / 黑名单地址在攻击时，整个网络的访客都要先点一下人机验证（家庭宽带不会被整网处理；节点自己的 IP 除外）。", sw("auto_firewall_networks", z.settings.auto_firewall_networks, "按网络验证") + " " +
             nsel("auto_firewall_network_ips", z.settings.auto_firewall_network_ips, [[3, "3 个地址"], [5, "5 个地址"], [10, "10 个地址"], [20, "20 个地址"], [50, "50 个地址"]], "地址数")) +
           setRow("攻击潮时自动进入受攻击模式", "统计窗口内攻击地址数达到这个数，就自动开启受攻击模式一小时，攻击停了再恢复原来的级别。", nsel("auto_firewall_surge", z.settings.auto_firewall_surge, [[0, "不自动"], [20, "20 个地址"], [50, "50 个地址"], [100, "100 个地址"], [500, "500 个地址"]], "攻击潮")) : "")) +
-      card("伪装子域", "", setRow("伪装子域", `开启后，${esc(z.name)} 下任何没有记录的子域都能解析（指向没有流量限制、其次流量配额最大的节点，不用仅加速节点），但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。已有的记录和通配记录不受影响。`, sw("decoy_subdomains", z.settings.decoy_subdomains, "伪装子域"))) + errPagesSection(z) +
+      card("伪装子域", "", setRow("伪装子域", `开启后，${esc(z.name)} 下任何没有记录的子域都能解析（指向没有流量限制、其次流量配额最大的节点，不用仅加速节点），但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。已有的记录和通配记录不受影响。`, sw("decoy_subdomains", z.settings.decoy_subdomains, "伪装子域"))) + errPagesSection(z) + await pageShieldCard(z) +
       `<div class="note">按地区或运营商屏蔽：<code>ip.geoip.country in {"RU" "KP"}</code>　<code>ip.geoip.asnum eq 4134</code>　<code>ip.geoip.as_org contains "telecom"</code><br>按 Bot 分（1 几乎肯定是程序，99 几乎肯定是真人；搜索引擎爬虫固定 50）：<code>fcf.bot_score lt 30</code><span class="hint">要在 DNS 层面拒绝解析，使用账户主页的 <a href="#/steering">调度与 DNS 屏蔽</a>。</span></div>` +
       await ruleSection(z.id, "firewall") + await ruleSection(z.id, "rate") + await apiShieldCard(z) };
   },
@@ -1198,6 +1198,31 @@ async function originHealthCard(z) {
     { label: "状态", fmt: state }, { label: "最近检查", fmt: o => (o.checked_at ? when(o.checked_at) : '<span class="hint">—</span>') },
     { label: "结果", fmt: o => (o.detail ? `<span class="mono">${esc(o.detail)}</span>` : '<span class="hint">—</span>') },
   ], list, null, empty, "originHealth"));
+}
+// GET /zones/{id}/page_shield: { enabled, mode, policy, alerts, header, effective_policy, report_uri }
+// GET /zones/{id}/page_shield/scripts: [{ id, url, host, first_seen_at, last_seen_at, count }]
+// Both are read on their own so that one failing still shows the other.
+const PS_MODES = [["report_only", "只报告（Report-Only，默认）"], ["enforce", "强制执行（浏览器会真的拦下不在策略里的脚本）"]];
+async function pageShieldCard(z) {
+  const [s, list] = await Promise.all([
+    api("GET", `/zones/${z.id}/page_shield`).catch(e => ({ error: e.message })),
+    api("GET", `/zones/${z.id}/page_shield/scripts?per_page=200`).catch(e => ({ error: e.message }))]);
+  const ok = isObj(s) && typeof s.error !== "string";
+  const rows = Array.isArray(list) ? list.filter(isObj) : [];
+  const ro = me.role === "viewer" ? "disabled" : "";
+  const head = ok ? `<p class="hint">${s.enabled
+      ? `已开启。这个域名的 HTML 响应带上 <code>${esc(s.header)}</code>，浏览器把加载的外部脚本报告到 <code>${esc(s.report_uri)}</code>。源站自己设置的 CSP 头原样保留。${s.alerts ? "出现新脚本时按告警渠道通知（事件“页面加载了新脚本”）。" : "新脚本不发告警。"}`
+      : "没有开启。开启后，边缘在这个域名的 HTML 响应里加一条只报告的 CSP 头，浏览器把页面加载的外部脚本报告回来，这里列出每个脚本的地址和第一次、最近一次出现的时间。默认只报告，不会拦下任何脚本。"}</p>` +
+      (s.enabled ? `<p class="hint">策略：<code>${esc(s.effective_policy)}</code></p>` : "")
+    : `<div class="note warn">读不到 Page Shield 设置：${esc(s && s.error)}</div>`;
+  const empty = isObj(list) && typeof list.error === "string" ? `<b>读不到脚本列表</b>${esc(list.error)}`
+    : ok && !s.enabled ? "<b>没有开启</b>开启后这里列出页面加载的脚本。"
+    : "<b>还没有报告</b>有访客打开这个域名的 HTML 页面后，第一批脚本在一两分钟内出现。";
+  return card(`Page Shield 脚本监控 <span class="cnt">${rows.length}</span>`, ok ? btn("pageShieldEdit", "设置", {}, "pri sm", ro) : "", head +
+    `<p class="hint">只记录脚本的协议、主机名和路径，查询串和片段不保存；每个域名最多 2000 个，满了先删最久没出现的。各节点各自收集，几分钟内在节点之间合并；次数是近似值。</p>` +
+    table([{ label: "脚本", fmt: r => `<span class="mono">${esc(r.url || "—")}</span>` }, { label: "第一次出现", fmt: r => when(r.first_seen_at) },
+      { label: "最近出现", fmt: r => when(r.last_seen_at) }, { label: "报告次数", fmt: r => num(r.count), cls: "num" }], rows, null, empty, "pageShieldScripts") +
+    (rows.length >= 200 ? '<p class="hint">只显示最近出现的 200 个；完整列表用 API 分页读取。</p>' : ""));
 }
 // GET /zones/{id}/dns_analytics: { total, by_type: { A: n, ... }, by_rcode: { NOERROR: n, ... } }
 function dnsStatsCard(qa) {
@@ -2023,6 +2048,16 @@ const A = {
     { k: "enabled", label: "启用", type: "check", def: true }],
     d.id ? byId("logJobs", d.id) : {}, v => api(d.id ? "PUT" : "POST", `/zones/${S.zone}/logpush/jobs` + (d.id ? "/" + d.id : ""), v)),
   logJobDel: d => del(`/zones/${S.zone}/logpush/jobs/${d.id}`, "这个推送任务"),
+  pageShieldEdit: async () => {
+    const s = await api("GET", `/zones/${S.zone}/page_shield`);
+    openForm("Page Shield 脚本监控", [
+      { k: "enabled", label: "开启脚本监控", type: "check" },
+      { k: "mode", label: "模式", type: "select", options: PS_MODES },
+      { k: "policy", label: "CSP 策略（留空 = script-src 'none'，即报告每个外部脚本）", type: "textarea", opt: 1,
+        hint: "如 script-src 'self' https://cdn.example.com。不要写 report-uri / report-to，边缘自己加；不能有换行和逗号，最多 2048 字符。强制执行模式必须填写策略。" },
+      { k: "alerts", label: "出现新脚本时发告警（需要在“告警”里有勾选“页面加载了新脚本”的渠道）", type: "check" }],
+      s, v => api("PATCH", `/zones/${S.zone}/page_shield`, v));
+  },
   errPagesEdit: () => openForm("自定义错误页", [{ type: "html", html: `<p class="hint">${esc(ERR_HINT)}</p>` },
     ...ERR_PAGES.map(([k, label, note]) => ({ k, label: `${label}（${k}）`, type: "textarea", tall: 1, hint: note }))], C.zone.settings.error_pages || {},
     v => api("PATCH", `/zones/${S.zone}/settings/error_pages`, { value: v }), true),
@@ -2315,7 +2350,8 @@ Object.assign(A, {
 // Channels that are told when something goes wrong; the checks run on the panel's node only.
 const ALERT_EVENTS = [
   ["node_offline", "节点离线（连续 3 次检查）"], ["sync_lagging", "同步落后（在线但 5 分钟未同步）"], ["certificate_failing", "证书签发失败或 14 天内到期"],
-  ["traffic_limit", "节点流量到档"], ["under_attack", "被自动切到受攻击模式"], ["origin_errors", "5 分钟内回源错误达到阈值"]];
+  ["traffic_limit", "节点流量到档"], ["under_attack", "被自动切到受攻击模式"], ["origin_errors", "5 分钟内回源错误达到阈值"],
+  ["new_script", "页面加载了新脚本（区域需在 Page Shield 里开启告警）"]];
 const ALERT_EV = Object.fromEntries(ALERT_EVENTS);
 async function viewAlerts() {
   const [channels, act] = await Promise.all([api("GET", "/alerts/channels"), api("GET", "/alerts/active")]);

@@ -494,6 +494,7 @@ impl PeerSync {
             "rtt": self.edge.rtt.take_changed(),
             "blocks": self.edge.waf.take_blocks(),
             "rate": self.edge.waf.rate_report(),
+            "scripts": self.edge.page_shield.take_outbox(),
         });
         Some((payload, Some((stats, events)), usage))
     }
@@ -524,13 +525,15 @@ impl PeerSync {
             _ => false,
         };
         let any_ok = kept || results.iter().any(Result::is_ok);
-        if let Some((_, raw, usage)) = tele {
+        if let Some((mut payload, raw, usage)) = tele {
             if any_ok {
                 self.report_seq.fetch_add(1, Ordering::Relaxed);
                 *self.last_told_usage.lock().await = Some(usage);
                 *self.last_report_at.lock().await = std::time::Instant::now();
             } else {
                 *self.pending_telemetry.lock().await = raw;
+                // the scripts it told go with the next report (crate::edge::pageshield)
+                self.edge.page_shield.restore_outbox(serde_json::from_value(payload["scripts"].take()).unwrap_or_default());
             }
         }
     }

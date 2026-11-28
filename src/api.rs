@@ -242,6 +242,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(api_gateway_routes())
         .route("/zones/{zone_id}/origins/health", get(origin_health))
         .route("/zones/{zone_id}/dns_analytics", get(dns_analytics))
+        .route("/zones/{zone_id}/page_shield", get(get_page_shield).patch(patch_page_shield).put(patch_page_shield))
+        .route("/zones/{zone_id}/page_shield/scripts", get(list_page_shield_scripts))
+        .route("/zones/{zone_id}/page_shield/scripts/{script_id}", get(get_page_shield_script))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -3187,6 +3190,8 @@ struct TelemetryPush {
     blocks: Vec<crate::edge::waf::Block>,
     #[serde(default, deserialize_with = "crate::edge::fleetrate::lenient")]
     rate: Vec<crate::edge::fleetrate::RateCount>,
+    #[serde(default, deserialize_with = "crate::edge::pageshield::lenient")]
+    scripts: Vec<crate::edge::pageshield::ScriptSeen>,
 }
 
 #[derive(Deserialize)]
@@ -3253,6 +3258,7 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
                     rtt: tele.rtt,
                     blocks: tele.blocks,
                     rate: tele.rate,
+                    scripts: tele.scripts,
                 },
                 true,
             );
@@ -3390,6 +3396,7 @@ async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
             rtt: Default::default(),
             blocks: Default::default(),
             rate: Default::default(),
+            scripts: Default::default(),
         },
         true,
     );
@@ -3416,6 +3423,32 @@ async fn list_nodes(State(st): St) -> ApiResult {
 async fn dns_analytics(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
     st.store.get_zone(&zone_id)?;
     ok(serde_json::to_value(crate::dns::resolver::query_count(&zone_id)).unwrap_or_default())
+}
+
+/// A zone's Page Shield settings (crate::edge::pageshield).
+async fn get_page_shield(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(crate::edge::pageshield::view(&st.store.get_zone(&zone_id)?.settings.page_shield))
+}
+
+/// Change them: the fields given (Cloudflare's PUT takes the same body).
+async fn patch_page_shield(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let current = st.store.get_zone(&zone_id)?.settings.page_shield;
+    let next = crate::edge::pageshield::patch(&current, &body::<Value>(&bytes)?)?;
+    let value = serde_json::to_value(&next).map_err(|e| bad(e.to_string()))?;
+    let zone = st.store.update_setting_async(&zone_id, "page_shield", value).await?;
+    ok(crate::edge::pageshield::view(&zone.settings.page_shield))
+}
+
+/// The scripts the zone's pages load, as the fleet's reports reached this node.
+async fn list_page_shield_scripts(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    let list = crate::edge::pageshield::list(&st.edge.page_shield, &zone_id, &q).map_err(bad)?;
+    paginated(list, &q, 100)
+}
+
+async fn get_page_shield_script(State(st): St, Path((zone_id, script_id)): Path<(String, String)>) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    ok(crate::edge::pageshield::script(&st.edge.page_shield, &zone_id, &script_id).ok_or(StoreError::NotFound)?)
 }
 
 /// What this node's health checks say about the zone's origins (see crate::edge::origins).
@@ -3677,7 +3710,7 @@ mod tests {
             front: None,
         });
         Arc::new(ApiState {
-            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), || "au".to_string())),
+            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), edge.page_shield.clone(), || "au".to_string())),
             store,
             token: "test-token".into(),
             cache,
@@ -3716,6 +3749,54 @@ mod tests {
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
         (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn page_shield_settings_change_through_the_api_and_its_scripts_are_listed_per_zone() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-ps-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let mut app = router(st.clone());
+        let base = format!("/client/v4/zones/{}/page_shield", zone.id);
+        let json = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+
+        let (sc, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(json(&b)["result"]["enabled"], false);
+        assert_eq!(json(&b)["result"]["header"], "content-security-policy-report-only");
+
+        let (sc, b) = call(&mut app, "PATCH", &base, br#"{"enabled": true, "alerts": true, "use_cloudflare_reporting_endpoint": true}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!((json(&b)["result"]["enabled"].clone(), json(&b)["result"]["alerts"].clone()), (json!(true), json!(true)));
+        assert!(st.store.get_zone(&zone.id).unwrap().settings.page_shield.enabled, "kept as a zone setting");
+        for bad in [&br#"{"mode": "block"}"#[..], br#"{"policy": "script-src 'self'; report-uri /x"}"#, br#"{"surprise": 1}"#, br#"[]"#] {
+            let (sc, _) = call(&mut app, "PATCH", &base, bad.to_vec()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(bad));
+        }
+        assert!(st.store.get_zone(&zone.id).unwrap().settings.page_shield.alerts, "a refused change changes nothing");
+
+        let now = 1_800_000_000;
+        st.edge.page_shield.record_at(&zone.id, "https://cdn.example.net/a.js", now);
+        st.edge.page_shield.record_at(&zone.id, "https://cdn.example.net/a.js", now + 5);
+        st.edge.page_shield.record_at(&zone.id, "https://static.example.com/b.js", now + 1);
+        st.edge.page_shield.record_at(&other.id, "https://cdn.example.net/other.js", now);
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/scripts?per_page=1"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let page = json(&b);
+        assert_eq!(page["result_info"]["total_count"], 2, "only this zone's");
+        let first = &page["result"][0];
+        assert_eq!((first["url"].as_str(), first["count"].as_u64()), (Some("https://cdn.example.net/a.js"), Some(2)), "the latest seen first");
+        let id = first["id"].as_str().unwrap().to_string();
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/scripts/{id}"), vec![]).await;
+        assert_eq!((sc, json(&b)["result"]["url"].clone()), (StatusCode::OK, json!("https://cdn.example.net/a.js")));
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/zones/{}/page_shield/scripts/{id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "an id of one zone opens nothing in another");
+        let (sc, _) = call(&mut app, "GET", &format!("{base}/scripts?sort=url"), vec![]).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let (sc, _) = call(&mut app, "GET", "/client/v4/zones/0123456789abcdef0123456789abcdef/page_shield/scripts", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

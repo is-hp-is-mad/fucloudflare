@@ -53,6 +53,11 @@ pub struct Report {
     /// one it cannot read is left out without failing the report.
     #[serde(default, deserialize_with = "crate::edge::fleetrate::lenient")]
     pub rate: Vec<crate::edge::fleetrate::RateCount>,
+    /// The scripts its visitors' pages reported since its report before
+    /// (see crate::edge::pageshield), taken as leniently as `rate`; left out
+    /// when there are none.
+    #[serde(default, deserialize_with = "crate::edge::pageshield::lenient", skip_serializing_if = "Vec::is_empty")]
+    pub scripts: Vec<crate::edge::pageshield::ScriptSeen>,
 }
 
 struct Kept {
@@ -75,6 +80,7 @@ pub struct Reports {
     waf: Arc<Waf>,
     fleet: Arc<Fleet>,
     rtt: Arc<crate::rtt::Rtt>,
+    page_shield: Arc<crate::edge::pageshield::PageShield>,
     /// The name of this node: its own reports come back from the peers.
     me: Box<dyn Fn() -> String + Send + Sync>,
     /// One run of this process: a peer that knew another one starts over.
@@ -86,12 +92,20 @@ pub struct Reports {
 }
 
 impl Reports {
-    pub fn new(stats: Arc<Stats>, waf: Arc<Waf>, fleet: Arc<Fleet>, rtt: Arc<crate::rtt::Rtt>, me: impl Fn() -> String + Send + Sync + 'static) -> Reports {
+    pub fn new(
+        stats: Arc<Stats>,
+        waf: Arc<Waf>,
+        fleet: Arc<Fleet>,
+        rtt: Arc<crate::rtt::Rtt>,
+        page_shield: Arc<crate::edge::pageshield::PageShield>,
+        me: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Reports {
         Reports {
             stats,
             waf,
             fleet,
             rtt,
+            page_shield,
             me: Box::new(me),
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             floor: AtomicU64::new(now_secs()),
@@ -150,6 +164,7 @@ impl Reports {
         self.rtt.merge(&report.node, &report.rtt);
         self.waf.absorb_blocks(&report.blocks);
         self.waf.absorb_rate(&(self.me)(), &report.node, &report.rate);
+        self.page_shield.absorb(&report.scripts);
         if latest && now.saturating_sub(report.at) < LIVE_SECS {
             self.fleet.heard(&report.node, &report.version, &report.build, &report.role);
             if let Some(usage) = report.usage.clone() {
@@ -231,14 +246,16 @@ mod tests {
         stats: Arc<Stats>,
         fleet: Arc<Fleet>,
         waf: Arc<Waf>,
+        page_shield: Arc<crate::edge::pageshield::PageShield>,
         reports: Reports,
     }
 
     fn node(name: &'static str) -> Node {
         let (stats, fleet, waf) = (Arc::new(Stats::default()), Arc::new(Fleet::default()), Arc::new(Waf::new()));
-        let reports = Reports::new(stats.clone(), waf.clone(), fleet.clone(), Arc::default(), move || name.to_string());
+        let page_shield = Arc::new(crate::edge::pageshield::PageShield::default());
+        let reports = Reports::new(stats.clone(), waf.clone(), fleet.clone(), Arc::default(), page_shield.clone(), move || name.to_string());
         reports.floor.store(0, Ordering::Relaxed);
-        Node { stats, fleet, waf, reports }
+        Node { stats, fleet, waf, page_shield, reports }
     }
 
     /// A report of `node` made `ago` seconds ago: `n` requests for zone "z".
@@ -333,6 +350,34 @@ mod tests {
         }
         let earlier: Earlier = serde_json::from_value(serde_json::to_value(Report { rate: rate(3), ..made }).unwrap()).unwrap();
         assert_eq!((earlier.node.as_str(), earlier.seq), ("x", 0));
+    }
+
+    #[test]
+    fn the_scripts_a_node_saw_reach_every_peer_once_and_an_empty_list_is_not_sent() {
+        use crate::edge::pageshield::ScriptSeen;
+        let (a, b, c) = (node("a"), node("b"), node("c"));
+        let (mut b_from_a, mut c_from_b, mut a_from_c) = <((String, u64), (String, u64), (String, u64))>::default();
+        let at = now_secs();
+        let seen = ScriptSeen { zone: "z".into(), url: "https://cdn.example.net/a.js".into(), first: at - 10, last: at, count: 4 };
+        a.page_shield.record_at("z", "https://cdn.example.net/a.js", at);
+        assert!(a.reports.own(Report { node: "a".into(), scripts: vec![seen.clone()], ..report("", "run", 0, 1, 0) }));
+        assert!(fetch(&b, &a, &mut b_from_a) && fetch(&c, &b, &mut c_from_b));
+        let count = |n: &Node| n.page_shield.scripts("z").first().map_or(0, |(_, s)| s.count);
+        assert_eq!((count(&a), count(&b), count(&c)), (1, 4, 4), "a counted its own as it saw them, the peers once each");
+        assert!(!fetch(&a, &c, &mut a_from_c), "its own report, back from c");
+        assert_eq!(count(&a), 1);
+        // x's report comes by two ways: counted once
+        assert!(b.reports.take(Report { scripts: vec![seen.clone()], ..report("x", "run", 0, 1, 0) }, false));
+        assert!(c.reports.take(Report { scripts: vec![seen.clone()], ..report("x", "run", 0, 1, 0) }, false));
+        let mut b_from_c = Default::default();
+        fetch(&b, &c, &mut b_from_c);
+        assert_eq!(count(&b), 8);
+        assert!(serde_json::to_value(report("x", "run", 9, 1, 0)).unwrap().get("scripts").is_none(), "no scripts, no field");
+        // a list of another shape does not fail the report
+        let mut odd = serde_json::to_value(report("y", "run", 0, 2, 0)).unwrap();
+        odd["scripts"] = json!({ "z": "a later shape" });
+        let delta = DomainDelta { domain: "reports".into(), epoch: "e".into(), from_rev: 0, to_rev: 1, full_resync: true, payload: json!({ "reports": [odd] }) };
+        assert!(c.reports.merge_delta(&delta, &HlcClock::default()).unwrap());
     }
 
     #[test]

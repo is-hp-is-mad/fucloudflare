@@ -185,6 +185,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `auto_firewall` 及 `auto_firewall_*` | 见"自动防火墙" | 按近期安全事件自动封禁地址、网络，或切到受攻击模式 |
 | `auto_level_restore` / `auto_level_until` | 字符串（默认空）/ unix 秒（默认 0） | 自动防火墙把区域切到受攻击模式期间自己记下的：恢复成哪个级别、到什么时候；不用手动设置 |
 | `error_pages` | 对象（默认 `{}`） | 自定义错误页：键为 `5xx` / `block` / `ratelimit` / `1xxx`，值为 HTML（见"自定义错误页"） |
+| `page_shield` | 对象（默认关） | 脚本监控：`{"enabled", "mode", "policy", "alerts"}`，见"Page Shield 脚本监控"（面板：域名 → 安全 → Page Shield 脚本监控） |
 
 ### 规则表达式
 
@@ -397,6 +398,7 @@ TLS 1.3 下按访客客户端的偏好选：支持它的浏览器就用它，TLS
 | `/cdn-cgi/fucf-warp`（及其下所有路径） | **预留**：由节点接管，目前一律返回 501。实现位置在 `src/edge/warp.rs`，处理函数拿到完整的请求（方法、子路径、头、流式请求体，HTTP/1.1 下可升级连接）和访客信息。它在边缘缓存里有自己的一块（`warp::cached` / `warp::store`，与各区域的缓存互不影响，共用节点的缓存上限），用 `POST /warp/purge_cache` 在所有节点上清除 |
 | `/cdn-cgi/limit/page.css`、`mark.svg` | 节点限流提示页的资源（见下一节） |
 | `/cdn-cgi/challenge-platform/widget.js`、`widget/ticket`、`widget/verify`、`siteverify` | 人机验证组件的脚本、出题、答题和后端校验（见“人机验证组件”） |
+| `/cdn-cgi/script_monitor/report` | 浏览器上报 CSP 违规的地址，只对开了 Page Shield 的域名记录（见"Page Shield 脚本监控"） |
 
 `fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`<dc>f<进程号>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
 `colo`（节点的 `colo`，没设时取节点名去掉末尾数字后大写）、`dc`（节点的 `dc`，没设时取节点名末尾的数字，默认 1）、`http`（`http/1.0` / `http/1.1` / `http/2` / `http/3`）、
@@ -776,6 +778,7 @@ DNS 记录的 Cloudflare 兼容补充：
 | `traffic_limit` | 节点流量到档（`dns_limited` / `throttled` / `limited`），换档会再通知 |
 | `under_attack` | 域名被自动防火墙切到受攻击模式（手动开的不算） |
 | `origin_errors` | 某域名 5 分钟内有 3 次回源错误事件；之后整整 5 分钟没有回源错误才算恢复 |
+| `new_script` | 开了 Page Shield 告警的域名一小时内出现第一次见到的脚本；消息里列出前 5 个，其余只计数。之后的小时里又有新脚本会再通知，所以一个域名最多一小时通知一次；一小时没有新脚本算恢复 |
 
 ```
 /alerts/channels[/{id}]       GET POST PUT PATCH DELETE   {"name", "kind": "webhook|telegram", "enabled", "events": [...], "url", "bot_token", "chat_id"}
@@ -877,6 +880,40 @@ DNS 记录的 Cloudflare 兼容补充：
 ```sh
 curl -s -X PATCH "http://127.0.0.1:8787/client/v4/zones/$ZONE/settings/error_pages" -H "Authorization: Bearer $TOKEN" \
   -d '{"value": {"5xx": "<h1>稍后再试</h1><p>状态 ::STATUS::，Ray ID ::RAY_ID::</p>"}}'
+```
+
+## Page Shield 脚本监控
+
+区域设置 `page_shield`（面板：域名 → 安全 → Page Shield 脚本监控）：看这个域名的页面都加载了哪些脚本，新出现的第三方脚本能及时发现。
+开启后，边缘给这个域名的每个 HTML 响应（`text/html`，不论状态码）加一条 CSP 头，浏览器把页面加载的外部脚本报告回本域名的
+`/cdn-cgi/script_monitor/report`，这里按脚本地址汇总，记下第一次、最近一次出现的时间和报告次数。
+
+```
+GET    /zones/{id}/page_shield                  设置：{"enabled", "mode", "policy", "alerts", "header", "effective_policy", "report_uri"}
+PATCH  /zones/{id}/page_shield                  改给出的字段（PUT 相同）
+GET    /zones/{id}/page_shield/scripts          脚本列表：host（精确）、url（包含）、order_by（last_seen_at / first_seen_at / count / url）、direction、page、per_page
+GET    /zones/{id}/page_shield/scripts/{id}     单个脚本
+```
+
+| 字段 | 取值 |
+|------|------|
+| `enabled` | 默认关 |
+| `mode` | `report_only`（默认，发 `Content-Security-Policy-Report-Only`，只报告不拦截）或 `enforce`（发 `Content-Security-Policy`，浏览器真的会拦下策略不允许的脚本） |
+| `policy` | 留空即 `script-src 'none'`（报告每个外部脚本）；也可以写自己的策略，如 `script-src 'self' https://cdn.example.net`。只能是可打印 ASCII，不能有换行和逗号，最多 2048 字节、32 条指令，不能写 `report-uri` / `report-to`（边缘自己加）。`enforce` 必须写自己的策略，免得默认策略把所有脚本都拦掉 |
+| `alerts` | 默认关；开启后出现新脚本时发 `new_script` 告警（见"告警"） |
+
+- 源站自己的 `Content-Security-Policy` / `Content-Security-Policy-Report-Only` 头原样保留：我们的是另加的一行，浏览器对每条策略各自生效。
+  HTTPS 下还会加 `Reporting-Endpoints` 和 `report-to`；源站自己发了 `Reporting-Endpoints` 时不加，只用 `report-uri`。
+- 上报地址谁都能 POST，所以收得少、存得更少：只收 `POST`；请求体最多 64 KiB，一批最多读 100 条；每个地址每分钟最多 120 次（IPv6 按 /64 算）；
+  只认 `script-src*` 指令、`http(s)` 地址、页面就在上报的这个主机名上的报告；`inline`、`eval` 和本主机 `/cdn-cgi/` 下边缘自己的脚本不记。
+  两种格式都收：`application/csp-report`（CSP2）和 `application/reports+json`（Reporting API）。
+- 每个脚本只存“协议 + 主机名 + 路径”，查询串、片段和用户信息一律丢掉。每个域名最多 2000 个，满了先删最久没出现的；30 天没人报告的也删掉。
+- 列表和分析数据一样：每个节点在内存里汇总自己收到的报告，随下一次节点报告发给其他节点，各节点合并（最早的第一次、最晚的最近一次、次数相加），
+  每两分钟和退出时存到数据目录的 `page-shield.json`。所以列表会晚几分钟，次数是近似值；没有删除接口（只能清掉一个节点上的那份）。
+- API 令牌要 Page Shield Read / Write；普通用户只能看自己的域名。
+
+```sh
+curl -s -X PATCH "http://127.0.0.1:8787/client/v4/zones/$ZONE/page_shield" -H "Authorization: Bearer $TOKEN" -d '{"enabled": true, "alerts": true}'
 ```
 
 ## 滚动更新与自动回滚

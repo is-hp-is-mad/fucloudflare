@@ -104,6 +104,7 @@ by `id` or by `name`:
 | Account Analytics Read, Audit Logs Read | account | `/analytics`, `/audit` |
 | Backup Read | account | `GET /backup` (everything, secrets included: guard such a token) |
 | Account Filter Lists Read / Write | account | `/rules/lists…` (IP lists) |
+| Page Shield Read / Write | zone | `/zones/{id}/page_shield…` (settings and the scripts list) |
 | Turnstile Sites Read / Write | account | `/challenges/widgets…` (human-check widgets) |
 | API Tokens Read / Write | user | `/user/tokens…` |
 
@@ -186,6 +187,7 @@ CRUD   /zones/{id}/rate_limits                      {"expression", "threshold", 
                                                      "characteristics", "status_codes"}
 GET    /zones/{id}/security/events?limit=
 GET    /steering/test?ip=&ua=                       where an address is placed, and its threat score
+GET    /zones/{id}/page_shield  PATCH               which scripts the zone's pages load, see [Page Shield](#page-shield)
 ```
 
 Firewall actions: `block`, `js_challenge` (the human check; a click only when the browser looks
@@ -417,6 +419,7 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `api_shield_schema_action` | `none`, `log`, `block`: what to do with a request whose body breaks its API operation's schema, see [API Shield](#api-shield) |
 | `api_shield_fallthrough_action` | `none`, `log`, `block`: the same for a request to a host with API operations that matches none of them |
 | `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
+| `page_shield` | `{"enabled": false, "mode": "report_only", "policy": "", "alerts": false}`: see [Page Shield](#page-shield) |
 
 ```sh
 curl -s -X PATCH $BASE/zones/$ZONE/settings/security_level -H "Authorization: Bearer $TOKEN" -d '{"value": "high"}'
@@ -1116,6 +1119,95 @@ GET    /zones/{id}/security/events?limit=100      newest first (at most 5000), f
 GET    /steering/test?ip=&ua=                     where an address is placed, and its threat score
 ```
 
+### Page Shield
+
+Page Shield lists the scripts that the zone's pages load. When it is on, every `text/html` answer of
+the zone (whatever its status) carries a Content Security Policy that reports each script the
+browser loads. By default the policy is report-only, so nothing is blocked. Browsers post their
+reports to the zone's own host, and the edge keeps one row per script.
+
+```
+GET    /zones/{id}/page_shield                    {"enabled", "mode", "policy", "alerts",
+                                                   "header", "effective_policy", "report_uri"}
+PATCH  /zones/{id}/page_shield  PUT              the fields given change; answers as GET
+GET    /zones/{id}/page_shield/scripts            [{"id", "url", "host", "added_at", "first_seen_at",
+                                                   "last_seen_at", "count"}], paged (per_page 100)
+GET    /zones/{id}/page_shield/scripts/{id}       one of them
+POST   https://{zone host}/cdn-cgi/script_monitor/report    where browsers send reports (not an API path)
+```
+
+| Field | Values (default first) |
+| --- | --- |
+| `enabled` | `false`, `true` |
+| `mode` | `report_only` (sends `Content-Security-Policy-Report-Only`) or `enforce` (sends `Content-Security-Policy`: the browser really blocks what the policy does not allow) |
+| `policy` | `""`, which means `script-src 'none'` (every script is reported), or your own policy, such as `script-src 'self' https://cdn.example.net`. It is printable ASCII only: no newlines, control characters or commas. It is at most 2048 bytes and 32 directives, and directive names are letters, digits and `-`. It must not contain `report-uri` or `report-to`, because the edge adds them. `enforce` needs a policy of your own, so that the default cannot block every script by mistake. `null` in a PATCH means `""`. |
+| `alerts` | `false`, `true`: a script seen for the first time raises the `new_script` alert, see [Alerts](#alerts) |
+
+Cloudflare's `use_cloudflare_reporting_endpoint` and `use_connection_url_path` are accepted and have
+no effect. Any other field is refused. The same value can also be written whole through
+`/zones/{id}/settings/page_shield`.
+
+The header. The edge sends `<policy>; report-uri /cdn-cgi/script_monitor/report`. Over HTTPS it
+also adds `; report-to fucf-page-shield` and a `Reporting-Endpoints:
+fucf-page-shield="/cdn-cgi/script_monitor/report"` header (`effective_policy` shows the HTTPS form).
+
+The origin's own headers:
+
+- An origin's own `Content-Security-Policy` or `Content-Security-Policy-Report-Only` is never
+  replaced or changed. Ours is one more header line, and browsers apply each policy they get on its
+  own.
+- When the origin sends its own `Reporting-Endpoints`, ours is left out, and `report-to` with it, so
+  that reports still arrive through `report-uri`.
+
+The report endpoint takes `application/csp-report` (CSP level 2: `{"csp-report": {"document-uri",
+"blocked-uri", "effective-directive" | "violated-directive", …}}`) and `application/reports+json`
+(the Reporting API: `[{"type": "csp-violation", "url", "body": {"documentURL", "blockedURL",
+"effectiveDirective", …}}]`). `application/json` is read by its shape. Since anybody can post to the
+endpoint, it takes little and keeps less:
+
+- Only `POST` is taken (405 otherwise). For a zone without Page Shield the endpoint answers 204
+  without reading the body.
+- A body is at most 64 KiB (413), in one of the types above (415), and readable JSON of the right
+  shape (400). Only the first 100 reports of a batch are read.
+- Each address may post at most 120 times a minute, counting an IPv6 /64 as one address (429).
+- Only violations of `script-src`, `script-src-elem` and `script-src-attr` count. They must be on a
+  page of the same host the report was posted to; reports about other pages are ignored. So are
+  `inline`, `eval` and anything that is not an `http` or `https` URL, and the edge's own scripts
+  under the host's `/cdn-cgi/`.
+- Of a script only `scheme://host[:port]/path` is kept. The query, the fragment and any user info
+  are dropped, the host is lowercased and the default port is dropped. URLs over 1024 bytes are not
+  kept.
+- A zone keeps at most 2000 scripts. A new script makes room by letting go of the one seen longest
+  ago. A script nobody has reported for 30 days is let go.
+- A good report is answered 204 with an empty body, even when nothing in it was kept.
+
+Where the list lives. Each node counts what its visitors report, in memory, and sends what changed
+with its next report to its peers, the way the analytics travel. Every node merges what it gets:
+the earliest first sight, the latest last sight, the counts added up. It saves the list to
+`page-shield.json` in its data directory every two minutes and at shutdown. The lists can lag a
+few minutes behind, and `count` is approximate: a node that cannot reach any peer keeps what it
+has for its next report, but a restart in between loses it. There is no DELETE, since it could
+only clear one node's copy. A deleted zone's scripts go at the next save.
+
+Token permissions: Page Shield Read for the GETs, Page Shield Write to change the settings. Panel
+users see the scripts of their own zones, as with any other zone path.
+
+`GET /zones/{id}/page_shield/scripts` takes these query parameters:
+
+- `host`: exact match.
+- `url`: a substring, case-insensitive.
+- `order_by`: `last_seen_at` (default), `first_seen_at`, `count` or `url`.
+- `direction`: `desc` (default) or `asc`.
+- `page` and `per_page`.
+
+Other parameters are refused. `added_at` is the same as `first_seen_at`.
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/page_shield -H "Authorization: Bearer $TOKEN" \
+  -d '{"enabled": true, "alerts": true}'
+curl -s "$BASE/zones/$ZONE/page_shield/scripts?host=cdn.example.net&order_by=first_seen_at" -H "Authorization: Bearer $TOKEN"
+```
+
 ### Workers
 
 ```
@@ -1628,6 +1720,7 @@ is told again.
 | `traffic_limit` | a node is past a threshold of its traffic allowance (`dns_limited`, `throttled`, `limited`); a new tier is told again | it is back under |
 | `under_attack` | the automatic firewall switched a zone to under attack mode (not when it was set by hand) | the zone is switched back |
 | `origin_errors` | 3 origin error events of one zone within 5 minutes (each failing host is logged at most once a minute per status and node) | 5 minutes pass without one |
+| `new_script` | a zone with Page Shield and its `alerts` on has scripts its pages loaded for the first time within the last hour. The message names up to 5 and counts the rest. A new script in a later hour is told again, so a flood is told at most once an hour per zone | an hour passes without a new script |
 
 ```
 GET    /alerts/channels

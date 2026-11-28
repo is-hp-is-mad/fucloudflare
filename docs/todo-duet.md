@@ -241,7 +241,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 规则字段：`cf.api_gateway.request_violates_schema` 等，照 `src/expr.rs` 现有字段写法。
 - 测试：模板匹配、schema 子集校验、未知端点的处理、清单大小上限。
 
-### [ ] T16 Page Shield
+### [x] T16 Page Shield
 
 - 给 HTML 响应加 `Content-Security-Policy-Report-Only`（可配置），收 `/cdn-cgi/` 下的 CSP 报告，按脚本来源聚合成"页面加载的脚本清单"。
 - 新出现的脚本来源可接 T6 的告警。报告体有大小和频率上限，来源只记主机名和路径，不记查询串。
@@ -413,6 +413,14 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - OpenAPI 只读 JSON（依赖里没有 YAML），最大 2 MiB，只增改不删，不支持的部分列在 warnings 里；参数不校验，只校验请求体。超过 1 MiB 或流式的请求体按不合规处理。
 - 上限：每域名 2000 个接口、单个 schema 64 KiB、合计 2 MiB、嵌套 32 层。接口条目加进了 T14 的 full_resync 集合清单。
 - 拿不准：两个动作也能经通用的 `/zones/{id}/settings/...` 用 Zone Settings 写令牌改；自定义主机名不受保护；每次配置变动都会重编译全部 schema；路径里的 `%2F` 当作分段。
+
+### T16
+
+- 区域设置 `page_shield`：在 text/html 响应上追加 CSP（默认 Report-Only，`script-src 'none'`），从不覆盖源站自己的 CSP；`enforce` 模式必须写自己的策略。上报端点 `/cdn-cgi/script_monitor/report`，`application/csp-report` 和 `application/reports+json` 都收。
+- 上限：请求体 64 KiB，每 IP（IPv6 按 /64）每分钟 120 次，每个区域 2000 个脚本、每节点 10 万个，满了淘汰最久没出现的，30 天过期；只存协议 + 主机 + 路径。
+- 列表在各节点内存里，随 reports 通道同步，各节点存 `page-shield.json`，不进配置库；计数是近似值，没有删除接口。
+- API：`/zones/{id}/page_shield`（GET/PATCH/PUT）和 `/scripts[/{id}]`，令牌组 Page Shield Read / Write；告警 `new_script` 需开启，每区域一小时最多通知一次；面板在 域名 → 安全。
+- 拿不准：伪造的报告能塞进假条目、触发告警（公开端点本身如此，只靠限速和淘汰减损）；令牌组 id 是自编的。
 
 ## 5. 部署（通过 Komari）
 

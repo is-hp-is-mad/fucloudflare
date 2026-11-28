@@ -212,6 +212,9 @@ pub struct Settings {
     /// The same for a request to a host with API operations that matches
     /// none of them.
     pub api_shield_fallthrough_action: String,
+    /// Page Shield (crate::edge::pageshield): a CSP on the zone's HTML
+    /// answers, its reports gathered into the list of scripts its pages load.
+    pub page_shield: crate::edge::pageshield::PageShieldSettings,
 }
 
 impl Default for Settings {
@@ -254,6 +257,7 @@ impl Default for Settings {
             image_resizing: false,
             api_shield_schema_action: "none".into(),
             api_shield_fallthrough_action: "none".into(),
+            page_shield: Default::default(),
         }
     }
 }
@@ -300,6 +304,7 @@ impl Settings {
         }
         self.error_pages.validate()?;
         crate::edge::earlyhints::validate(&self.early_hints_links).map_err(StoreError::Invalid)?;
+        self.page_shield.validate()?;
         Ok(())
     }
 }

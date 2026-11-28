@@ -24,6 +24,7 @@ pub mod h3;
 pub mod ja4;
 pub mod mtls;
 pub mod openapi;
+pub mod pageshield;
 pub mod proxy;
 pub mod quic_mux;
 pub mod reqlog;
@@ -1055,6 +1056,8 @@ pub struct Edge {
     pub rtt: Arc<crate::rtt::Rtt>,
     /// Which origin addresses pass this node's health checks.
     pub origins: Arc<origins::Health>,
+    /// The scripts the zones' pages load, as their CSP reports tell (see [`pageshield`]).
+    pub page_shield: Arc<pageshield::PageShield>,
     /// Copies answered stale, waiting to be fetched anew (see [`Edge::refresh_stale`]), and the keys of those under way.
     refresh_tx: tokio::sync::mpsc::Sender<Refresh>,
     refresh_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Refresh>>>,
@@ -1337,6 +1340,7 @@ impl Edge {
             node_name: Default::default(),
             rtt: Default::default(),
             origins: Default::default(),
+            page_shield: Default::default(),
             refresh_tx,
             refresh_rx: std::sync::Mutex::new(Some(refresh_rx)),
             refreshing: Default::default(),
@@ -2425,6 +2429,7 @@ impl Edge {
             }
         }
         earlyhints::apply(&mut resp, &settings.early_hints_links);
+        pageshield::apply(&mut resp, &settings.page_shield, ssl);
         for rule in response_rules {
             for name in &rule.remove_response_headers {
                 resp.headers_mut().remove(name.as_str());

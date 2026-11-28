@@ -575,6 +575,8 @@ async fn main() -> anyhow::Result<()> {
             reports: Default::default(),
             reports_path: args.data_dir.join("reports.json"),
             limits: Arc::new(limits::Limits::open_ephemeral()),
+            page_shield: Default::default(),
+            page_shield_path: args.data_dir.join("page-shield.json"),
         })
     } else {
         let t = Arc::new(Telemetry {
@@ -586,6 +588,8 @@ async fn main() -> anyhow::Result<()> {
             reports: Default::default(),
             reports_path: args.data_dir.join("reports.json"),
             limits: Arc::new(limits::Limits::load(&args.data_dir.join("usage.json"))),
+            page_shield: Arc::new(edge::pageshield::PageShield::load(&args.data_dir.join("page-shield.json"))),
+            page_shield_path: args.data_dir.join("page-shield.json"),
         });
         waf.load(&t.events_path);
         let t_exec = t.clone();
@@ -625,6 +629,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = edge.kv.set(kv_store.clone());
     let _ = edge.d1.set(d1_store.clone());
     edge.stats = telemetry.stats.clone();
+    edge.page_shield = telemetry.page_shield.clone();
     edge.limits = node_limits.clone();
     edge.gfw = gfw.clone();
     let _ = edge.node_name.set(fleet::self_name(&store, &args.edge_ips, args.node_name.as_deref()));
@@ -888,7 +893,7 @@ async fn main() -> anyhow::Result<()> {
     // what the nodes report is taken here and kept for the peers: every peer has the whole fleet's
     let reports = {
         let (store, ips, name) = (store.clone(), args.edge_ips.clone(), args.node_name.clone());
-        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
+        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), edge.page_shield.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
     };
     if !accel {
         reports.load(&telemetry.reports_path);
@@ -917,6 +922,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let sync = if !peer_targets.is_empty() {
         edge.stats.set_reporting();
+        edge.page_shield.set_reporting();
         waf.set_reporting();
         let sync_polled = polled.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let s = sync::PeerSync::new(
@@ -1169,6 +1175,9 @@ struct Telemetry {
     reports: std::sync::OnceLock<Arc<reports::Reports>>,
     reports_path: PathBuf,
     limits: Arc<limits::Limits>,
+    /// The scripts the zones' pages load (see edge::pageshield); an accelerate node keeps no file.
+    page_shield: Arc<edge::pageshield::PageShield>,
+    page_shield_path: PathBuf,
 }
 
 impl Telemetry {
@@ -1182,6 +1191,9 @@ impl Telemetry {
         }
         if let Some(Err(e)) = self.reports.get().map(|r| r.save(&self.reports_path)) {
             tracing::warn!("cannot save the report marks to {}: {e}", self.reports_path.display());
+        }
+        if let Err(e) = self.page_shield.save(&self.page_shield_path, &zones) {
+            tracing::warn!("cannot save the Page Shield list to {}: {e}", self.page_shield_path.display());
         }
         self.limits.save();
     }
