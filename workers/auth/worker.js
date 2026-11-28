@@ -418,18 +418,12 @@ async function ensureSchema(env) {
   const db = env.AUTH_DB;
   if (!db) throw new Error("AUTH_DB binding is not configured");
   if (_migratedDbs.has(db)) return;
-  const hasClients = await db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='oauth_clients'")
-    .first();
-  const hasSpent = await db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='spent_tokens'")
-    .first();
-  if (hasClients && hasSpent) {
-    _migratedDbs.add(db);
-    return;
-  }
-  if (hasClients && !hasSpent) {
-    await db.exec("CREATE TABLE IF NOT EXISTS spent_tokens (jti TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);");
+  // A database made by an older version lacks the newer tables: every
+  // statement below is idempotent, so run them whenever one is missing.
+  const wanted = ["users", "oauth_clients", "passkeys", "federated_identities", "consents", "tokens", "oauth_providers", "spent_tokens", "settings"];
+  const present = await db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
+  const names = new Set(((present && present.results) || []).map((r) => r.name));
+  if (wanted.every((t) => names.has(t))) {
     _migratedDbs.add(db);
     return;
   }

@@ -1012,3 +1012,17 @@ test("Admin: registration switch, roles, apps and providers are set on the auth 
   assert.equal((await api(boss, { action: "provider-toggle", id: "linuxdo", enabled: false })).status, 200);
   assert.ok(!(await (await worker.fetch(new Request(base + "/login"), env, {})).text()).includes("Linux.do"));
 });
+
+test("A database from an older version gets the newer tables", async () => {
+  const env = makeEnv();
+  // what an earlier version left behind: no settings table
+  await env.AUTH_DB.exec(`
+    CREATE TABLE oauth_clients (client_id TEXT PRIMARY KEY, client_secret_hash TEXT, name TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+      scopes TEXT NOT NULL DEFAULT 'openid profile email', require_pkce INTEGER NOT NULL DEFAULT 1, trusted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+    CREATE TABLE spent_tokens (jti TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+  `);
+  const res = await worker.fetch(new Request("https://auth.fucloudflare.com/login"), env, {});
+  assert.equal(res.status, 200);
+  const t = await env.AUTH_DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'").first();
+  assert.ok(t, "the settings table was added");
+});
