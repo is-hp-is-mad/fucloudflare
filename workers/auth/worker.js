@@ -806,6 +806,7 @@ h2{font:500 19px/1.3 var(--serif);letter-spacing:-.01em;color:var(--strong);marg
 .sub{color:var(--sub);font-size:13.5px;margin:0 0 20px}
 .card{background:var(--base);border:1px solid var(--hairline);border-radius:16px;box-shadow:var(--shadow);margin-bottom:18px}
 .card>.hd{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid var(--hairline)}
+.card>.hd:last-child{border-bottom:0}
 .card>.bd{padding:6px 20px}
 .login{background:var(--base);border:.5px solid var(--line);border-radius:32px;padding:32px 28px;
   box-shadow:0 4px 24px rgba(0,0,0,.016),0 4px 32px rgba(0,0,0,.016),0 2px 64px rgba(0,0,0,.012),0 16px 32px rgba(0,0,0,.012)}
@@ -867,6 +868,44 @@ form .wide-btn{margin-top:18px}
 @media (max-width:520px){.login{border-radius:24px;padding:26px 20px}main{padding-top:24px}.top{padding:0 12px}.hide-sm{display:none}}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 `;
+
+// What the API's error codes mean to a person (the codes themselves stay, OAuth clients read them).
+const ERROR_TEXT = {
+  "Invalid credentials": ["邮箱、用户名或密码不正确。", "Wrong email, username or password."],
+  "Email or username already exists": ["这个邮箱或用户名已被注册。", "This email or username is already taken."],
+  "Email/username and password are required": ["请填写邮箱或用户名，以及密码。", "Enter your email or username, and your password."],
+  "Valid email, username, and password (>= 8 chars) are required": ["请填写有效的邮箱、用户名和至少 8 位的密码。", "Enter a valid email, a username and a password of at least 8 characters."],
+  csrf_origin_mismatch: ["请求来源与本站不一致，已拒绝。请直接在本页面操作。", "The request did not come from this site and was refused. Please use this page directly."],
+  invalid_csrf_token: ["页面已过期，请刷新后重试。", "This page has expired. Reload it and try again."],
+  invalid_challenge: ["验证已过期，请重试。", "The check expired. Please try again."],
+  invalid_state: ["登录流程已过期，请重新开始。", "The sign-in flow expired. Please start again."],
+  invalid_callback: ["第三方登录返回的数据不完整。", "The sign-in provider sent an incomplete answer."],
+  token_exchange_failed: ["无法从第三方登录换取令牌。", "Could not get a token from the sign-in provider."],
+  userinfo_failed: ["无法读取第三方账户信息。", "Could not read the account from the sign-in provider."],
+  missing_provider_user_id: ["第三方账户缺少用户标识。", "The provider's account has no user id."],
+  identity_already_linked: ["这个第三方账户已绑定到另一个用户。", "This account is already linked to another user."],
+  credential_already_registered: ["这个通行密钥已经添加过了。", "This passkey is already registered."],
+  "passkey not registered": ["这个通行密钥没有登记，请换一个或用密码登录。", "This passkey is not registered. Try another or use your password."],
+  "passkey signature invalid": ["通行密钥验证失败。", "The passkey could not be verified."],
+  "clientDataJSON verification failed": ["通行密钥验证失败（来源或质询不符）。", "The passkey could not be verified (origin or challenge mismatch)."],
+  "rpIdHash mismatch": ["通行密钥不属于这个网站。", "This passkey belongs to another site."],
+  "passkey sign_count rollback detected": ["检测到通行密钥可能被复制，已拒绝。", "This passkey may have been cloned; refused."],
+  "user presence flag missing": ["需要在设备上确认。", "Confirmation on the device is required."],
+  unknown_provider: ["没有这个登录方式。", "There is no such sign-in method."],
+  login_required: ["请先登录。", "Please sign in first."],
+  unauthorized: ["请先登录。", "Please sign in first."],
+  forbidden: ["没有权限执行这个操作。", "You are not allowed to do this."],
+  session_not_found: ["这个会话已不存在。", "This session no longer exists."],
+  invalid_request: ["请求不完整或格式有误。", "The request is incomplete or malformed."],
+};
+
+function errorText(code) {
+  const known = ERROR_TEXT[code];
+  return known ? t(known[0], known[1]) : escapeHtml(code);
+}
+
+// In the page: the same, for answers that arrive later.
+const ERROR_SCRIPT = `var ERR=${JSON.stringify(ERROR_TEXT)};function E(code,zh,en){var k=code&&ERR[code];return k?L(k[0],k[1]):(code||L(zh,en));}`;
 
 // Both languages; CSS shows the chosen one.
 function t(zh, en) {
@@ -956,7 +995,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
 <div class="login">
   <h1>${t("登录 fucloudflare", "Sign in to fucloudflare")}</h1>
   <p class="sub">${t("一个账户登录面板及所有接入的应用。", "One account for the dashboard and every connected app.")}</p>
-  <div id="auth-err" class="alert${errorMsg ? "" : " hidden"}" role="alert">${escapeHtml(errorMsg || "")}</div>
+  <div id="auth-err" class="alert${errorMsg ? "" : " hidden"}" role="alert">${errorMsg ? errorText(errorMsg) : ""}</div>
 
   <div class="stack">
     <button type="button" id="btn-passkey" class="pri wide-btn">${KEY_SVG}${t("使用通行密钥登录", "Sign in with a passkey")}</button>
@@ -1000,6 +1039,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
     errBox.classList.remove("hidden");
   }
   ${B64U_SCRIPT}
+  ${ERROR_SCRIPT}
   function busy(btn, on) { btn.disabled = on; }
 
   function pick(login) {
@@ -1029,7 +1069,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
         password: document.getElementById("login-pw").value,
         return_to: nextUrl
       });
-      if (!res.ok) return showErr(res.d.error || L("登录失败", "Sign in failed"));
+      if (!res.ok) return showErr(E(res.d.error, "登录失败", "Sign in failed"));
       location.href = res.d.redirect || nextUrl;
     } finally { busy(btn, false); }
   };
@@ -1046,7 +1086,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
         password: document.getElementById("reg-pw").value,
         return_to: nextUrl
       });
-      if (!res.ok) return showErr(res.d.error || L("注册失败", "Registration failed"));
+      if (!res.ok) return showErr(E(res.d.error, "注册失败", "Registration failed"));
       location.href = res.d.redirect || nextUrl;
     } finally { busy(btn, false); }
   };
@@ -1057,7 +1097,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
     var btn = this; busy(btn, true);
     try {
       var begin = await post("/login/passkey/begin", {});
-      if (!begin.ok) return showErr(begin.d.error || L("无法开始通行密钥登录", "Could not start passkey sign-in"));
+      if (!begin.ok) return showErr(E(begin.d.error, "无法开始通行密钥登录", "Could not start passkey sign-in"));
       var beginData = begin.d;
       var pk = beginData.publicKey;
       pk.challenge = challengeBuf(pk.challenge);
@@ -1079,7 +1119,7 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
         },
         return_to: nextUrl
       });
-      if (!fin.ok) return showErr(fin.d.error || L("通行密钥验证失败", "Passkey verification failed"));
+      if (!fin.ok) return showErr(E(fin.d.error, "通行密钥验证失败", "Passkey verification failed"));
       location.href = fin.d.redirect || nextUrl;
     } catch (err) {
       showErr(err && err.name === "NotAllowedError" ? L("已取消或超时。", "Cancelled or timed out.") : (err && err.message) || L("通行密钥登录已取消", "Passkey sign-in cancelled"));
@@ -1191,6 +1231,7 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
 (function() {
   var csrfToken = ${JSON.stringify(csrfToken)};
   ${B64U_SCRIPT}
+  ${ERROR_SCRIPT}
   var msgEl = document.getElementById("pk-msg");
   function showMsg(txt, ok) {
     msgEl.textContent = txt;
@@ -1203,7 +1244,7 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
     try {
       var r1 = await fetch("/register/passkey/begin", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: "{}" });
       var d1 = await r1.json();
-      if (!r1.ok) return showMsg(d1.error || L("无法开始添加通行密钥", "Could not start adding a passkey"));
+      if (!r1.ok) return showMsg(E(d1.error, "无法开始添加通行密钥", "Could not start adding a passkey"));
       var pk = d1.publicKey;
       pk.challenge = challengeBuf(pk.challenge);
       pk.user.id = b64uToBuf(pk.user.id);
@@ -1224,7 +1265,7 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
         })
       });
       var d2 = await r2.json();
-      if (!r2.ok) return showMsg(d2.error || L("添加通行密钥失败", "Adding the passkey failed"));
+      if (!r2.ok) return showMsg(E(d2.error, "添加通行密钥失败", "Adding the passkey failed"));
       location.reload();
     } catch (e) {
       showMsg(e && e.name === "NotAllowedError" ? L("已取消或超时。", "Cancelled or timed out.") : (e && e.message) || L("已取消", "Cancelled"));
