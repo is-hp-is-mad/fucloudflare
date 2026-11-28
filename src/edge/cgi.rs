@@ -45,11 +45,16 @@ impl Edge {
         host: &str,
         ray: &str,
     ) -> Result<Response<Body>, EdgeError> {
+        if endpoint == "challenge-platform/verify" {
+            // the human check's answer (see `super::challenge`)
+            // nothing borrowed may live across the await (a `Send` that is not general enough)
+            let (waf, ray) = (self.waf.clone(), ray.to_string());
+            return super::challenge::verify(waf, ip, ssl, req, ray).await;
+        }
         let (name, below) = endpoint.split_once('/').map_or((endpoint, None), |(name, below)| (name, Some(below)));
         let internal = is_fucf_node(ip, &self.store.snapshot().nodes);
         let resp = match (name, below) {
             ("fucf-trace", None) => self.trace(ip, ssl, &req, host, ray),
-            ("challenge-platform", Some("verify")) => return super::challenge::verify(self.waf.clone(), ip, ssl, req, ray.to_string()).await,
             ("warp", _) if self.warp_upstream.get().is_some() => return warp::handle(self.clone(), warp::Visitor { ip, ssl, host, ray }, req).await,
             ("fucf-warp", _) => return warp::handle(self.clone(), warp::Visitor { ip, ssl, host, ray }, req).await,
             // The notice of a node over its traffic allowance takes its looks

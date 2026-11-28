@@ -330,10 +330,17 @@ pub async fn verify(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Reques
     let Ok(report) = serde_json::from_slice::<Value>(&bytes) else {
         return Ok(answer(StatusCode::BAD_REQUEST, json!({ "ok": false, "code": "unreadable" })));
     };
+    Ok(judge(&waf, ip, ssl, &parts.headers, &report, &ray))
+}
+
+/// The verdict on a page's answer (no awaiting from here on).
+fn judge(waf: &Waf, ip: IpAddr, ssl: bool, headers: &HeaderMap, report: &Value, ray: &str) -> Response<Body> {
     let sealed = report["t"].as_str().unwrap_or_default();
-    let ua = parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default();
-    let refuse = |code: &str| Ok(answer(StatusCode::FORBIDDEN, json!({ "ok": false, "code": code })));
-    let Some(ticket) = Ticket::open(&waf, sealed) else { return refuse("bad_ticket") };
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    fn refuse(code: &'static str) -> Response<Body> {
+        answer(StatusCode::FORBIDDEN, json!({ "ok": false, "code": code }))
+    }
+    let Some(ticket) = Ticket::open(waf, sealed) else { return refuse("bad_ticket") };
     let age = now().saturating_sub(ticket.issued);
     if ticket.issued > now() + 5 || age > TICKET_SECS {
         return refuse("expired");
@@ -346,9 +353,9 @@ pub async fn verify(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Reques
     }
     let clicked = report["m"] == "click";
     if ticket.click && !clicked {
-        return Ok(answer(StatusCode::OK, json!({ "ok": false, "need": "click" })));
+        return answer(StatusCode::OK, json!({ "ok": false, "need": "click" }));
     }
-    let (outcome, score, why) = assess(&report, &parts.headers, ssl, clicked);
+    let (outcome, score, why) = assess(report, headers, ssl, clicked);
     tracing::info!(%ray, client = %ip, score, clicked, signals = ?why, "challenge answer: {outcome:?}");
     match outcome {
         Outcome::Pass => {
@@ -362,9 +369,9 @@ pub async fn verify(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Reques
             if let Ok(v) = HeaderValue::from_str(&cookie) {
                 resp.headers_mut().insert(header::SET_COOKIE, v);
             }
-            Ok(resp)
+            resp
         }
-        Outcome::NeedClick => Ok(answer(StatusCode::OK, json!({ "ok": false, "need": "click" }))),
+        Outcome::NeedClick => answer(StatusCode::OK, json!({ "ok": false, "need": "click" })),
         Outcome::Fail(code) => refuse(code),
     }
 }
