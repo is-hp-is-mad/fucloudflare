@@ -1980,3 +1980,12 @@ async fn error_pages_carry_both_languages() {
         assert!(r.body.contains(text), "{text}: {}", r.body);
     }
 }
+
+#[test]
+fn panel_origin_is_an_address_reached_under_the_panel_name() {
+    let t = panel_origin("203.0.113.7", "dashboard.example.com").unwrap();
+    assert_eq!((t.host.as_str(), t.port, t.tls, t.sni.as_str(), t.host_header.as_str()), ("203.0.113.7", 443, Tls::Verify, "dashboard.example.com", "dashboard.example.com"));
+    let t = panel_origin("https://[2001:db8::1]:8443/", "dashboard.example.com").unwrap();
+    assert_eq!((t.host.as_str(), t.port), ("2001:db8::1", 8443));
+    assert!(panel_origin("dashboard.example.com", "dashboard.example.com").is_err(), "an address, not a name to resolve");
+}

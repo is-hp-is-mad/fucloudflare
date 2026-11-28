@@ -71,6 +71,15 @@ struct Args {
     #[arg(long, env = "FUCF_PANEL_HOST")]
     panel_host: Option<String>,
 
+    /// Serve the panel host from every node (it may then resolve to any of
+    /// them, like a proxied site): this node forwards its requests to the
+    /// node that runs the panel, at this address (`ip[:port]`, port 443 by
+    /// default), over HTTPS under the panel host name (certificate checked).
+    /// Peers reached under the panel host name are synced with there
+    /// directly, whatever the name resolves to.
+    #[arg(long, env = "FUCF_PANEL_ORIGIN")]
+    panel_origin: Option<String>,
+
     /// Node role in the fleet: `peer` (read/write control plane + bidirectional
     /// sync + persistent state) or `accelerate` (read-only ephemeral data plane
     /// with zero persistent control-plane files and suppressed public NS).
@@ -417,6 +426,21 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .map(sync::peer_target)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let panel_origin = match (&panel_host, args.panel_origin.as_deref().map(str::trim).filter(|o| !o.is_empty())) {
+        (Some(host), Some(origin)) => Some(edge::panel_origin(origin, host)?),
+        (None, Some(_)) => anyhow::bail!("--panel-origin needs --panel-host"),
+        _ => None,
+    };
+    // a peer known by the panel's name is where the panel runs: go there directly
+    let peer_targets: Vec<edge::upstream::Target> = peer_targets
+        .into_iter()
+        .map(|mut t| {
+            if let Some(origin) = panel_origin.as_ref().filter(|_| panel_host.as_deref() == Some(t.host.as_str())) {
+                (t.host, t.port) = (origin.host.clone(), origin.port);
+            }
+            t
+        })
+        .collect();
 
     let fleet_self = fleet::self_name(&store, &args.edge_ips, args.node_name.as_deref());
     let sync_node_id = sync::resolve_sync_node_id(if accel { None } else { Some(args.data_dir.as_path()) }, &fleet_self);
@@ -738,6 +762,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = edge.internal_listeners.set(internal_listeners);
     if let Some(host) = &panel_host {
         let _ = edge.panel.set((host.clone(), args.api_listen));
+        if let Some(origin) = panel_origin.clone() {
+            tracing::info!("the panel {host} is served by {}:{}: its requests go there", origin.host, origin.port);
+            let _ = edge.panel_origin.set(origin);
+        }
     }
     let fleet = Arc::new(fleet::Fleet::default());
     let releases = Arc::new(release::Releases::new(updater.clone(), !accel));

@@ -39,6 +39,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--geoip-cn-db` | `--geoip-db` 同目录下的 `ip2region_v4.xdb`、`ip2region_v6.xdb`（如果有） | [ip2region](https://github.com/lionsoul2014/ip2region) 库（Apache-2.0 / MIT）：中国大陆地址的省份。GeoLite2 只知道约六分之一大陆地址的省份，按省份调度要靠它 |
 | `--cname-base` | 无 | 该域名下的所有子名都解析到边缘（如 `cdn.example.com`，需委托给本服务）；CNAME 接入模式的区域把主机名 CNAME 到它 |
 | `--panel-host` | 无 | 在边缘上以该主机名对外发布面板和管理 API（HTTPS，仍需令牌） |
+| `--panel-origin` | 无 | 多节点承载面板：本节点把面板主机名的请求转给运行面板的节点（`ip[:port]`，HTTPS，按面板主机名校验证书），访客地址随 `X-Forwarded-For` 带过去；以面板主机名配置的同步对端也直连这里。这样面板的 DNS 记录可以开代理、解析到任意节点 |
 | `--primary` | 无 | 作为只读副本运行：主节点的面板主机名（走 HTTPS），或它的管理 API 地址 `http://host:port` |
 | `--node-name` | 自动 | 本节点在机群里的名字；默认取 `--edge-ip` 所属的已登记节点 |
 | `--acme-directory` | Let's Encrypt | 签发托管证书的 CA 的 ACME 目录地址；`off` 关闭。使用即表示同意该 CA 的服务条款 |

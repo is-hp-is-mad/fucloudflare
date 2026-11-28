@@ -107,6 +107,30 @@ impl std::fmt::Display for Reason {
 /// The title of every error page about the origin.
 pub const ORIGIN_ERROR: &str = "回源错误 Origin error";
 
+/// Set on panel requests a node passes on to the node that runs the panel.
+const PANEL_HOP: &str = "fucf-panel-hop";
+
+/// Where a node that does not run the panel sends the panel's requests:
+/// `origin` (`ip[:port]`, port 443 by default) over HTTPS, under the panel
+/// host name, with its certificate checked.
+pub fn panel_origin(origin: &str, panel_host: &str) -> anyhow::Result<Target> {
+    let origin = origin.trim().trim_start_matches("https://").trim_end_matches('/');
+    let (ip, port) = match origin.parse::<SocketAddr>() {
+        Ok(addr) => (addr.ip(), addr.port()),
+        Err(_) => (origin.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().map_err(|_| anyhow::anyhow!("--panel-origin '{origin}' is not ip[:port]"))?, 443),
+    };
+    Ok(Target {
+        host: ip.to_string(),
+        alternates: Vec::new(),
+        port,
+        tls: Tls::Verify,
+        sni: panel_host.to_string(),
+        host_header: panel_host.to_string(),
+        h2: false,
+        block_private_ips: false,
+    })
+}
+
 /// Status of [`EdgeError::hang_up`] (nginx's convention): nothing is answered.
 const HANG_UP: u16 = 444;
 
@@ -955,6 +979,8 @@ pub struct Edge {
     /// Host name under which the management panel/API is published, and
     /// the local API address it is forwarded to.
     pub panel: std::sync::OnceLock<(String, SocketAddr)>,
+    /// The node that runs the panel, when it is not this one (see [`panel_origin`]).
+    pub panel_origin: std::sync::OnceLock<Target>,
     /// Internal loopback listeners of this node (API, HTTP/3 front) that
     /// worker subrequests must not reach directly.
     pub internal_listeners: std::sync::OnceLock<Vec<SocketAddr>>,
@@ -1230,6 +1256,7 @@ impl Edge {
             alt_svc: Default::default(),
             front: Default::default(),
             panel: Default::default(),
+            panel_origin: Default::default(),
             internal_listeners: Default::default(),
             geo: Default::default(),
             stats: Default::default(),
@@ -1918,19 +1945,36 @@ impl Edge {
                 }
                 return Ok(resp);
             }
-            let target = Target {
-                host: api.ip().to_string(),
-                alternates: Vec::new(),
-                port: api.port(),
-                tls: Tls::Off,
-                sni: String::new(),
-                host_header: host.clone(),
-                h2: false,
-                block_private_ips: false,
+            let from_node = cgi::is_fucf_node(ip, &self.store.snapshot().nodes);
+            let hopped = req.headers().contains_key(PANEL_HOP);
+            let target = match self.panel_origin.get() {
+                // another node runs the panel; never send on what a node already sent on
+                Some(origin) if !hopped => origin.clone(),
+                Some(_) => return Err(EdgeError::new(508, "Loop detected", "the panel request went from node to node")),
+                None => Target {
+                    host: api.ip().to_string(),
+                    alternates: Vec::new(),
+                    port: api.port(),
+                    tls: Tls::Off,
+                    sni: String::new(),
+                    host_header: host.clone(),
+                    h2: false,
+                    block_private_ips: false,
+                },
             };
+            // the visitor's address: as the node that passed the request on names it
+            let visitor = from_node
+                .then(|| req.headers().get("x-forwarded-for")?.to_str().ok()?.rsplit(',').next()?.trim().parse::<IpAddr>().ok())
+                .flatten()
+                .unwrap_or(ip);
             strip_hop_by_hop(req.headers_mut());
-            if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
+            if let Ok(v) = HeaderValue::from_str(&visitor.to_string()) {
                 req.headers_mut().insert("x-forwarded-for", v);
+            }
+            if self.panel_origin.get().is_some() {
+                req.headers_mut().insert(PANEL_HOP, HeaderValue::from_static("1"));
+            } else {
+                req.headers_mut().remove(PANEL_HOP);
             }
             let (mut parts, body) = self.upstream.send(&target, req).await?.into_parts();
             strip_hop_by_hop(&mut parts.headers);
