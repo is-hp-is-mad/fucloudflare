@@ -915,7 +915,111 @@ struct ConfigDeltaPayload {
     alert_channels: Vec<crate::alerts::AlertChannel>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     challenge_widgets: Vec<crate::edge::widget::ChallengeWidget>,
+    /// In a full snapshot, the collections it covers (all those named in
+    /// [`SNAPSHOT_COLLECTIONS`] that the sender knows): an empty collection
+    /// is not written out, so without this a collection the sender has none
+    /// of could not be told from one it has never heard of.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    collections: Vec<String>,
     tombstones: Tombstones,
+}
+
+/// The collections a full snapshot covers, as named in the payload. On an
+/// accelerate node (which writes nothing of its own) a full snapshot is the
+/// whole truth for each of them: what is not in it was deleted, possibly so
+/// long ago that the sender no longer keeps the tombstone. Telemetry and the
+/// ACME lease are not among them: each is newest-wins by itself.
+const SNAPSHOT_COLLECTIONS: [&str; 25] = [
+    "zones",
+    "records",
+    "firewall_rules",
+    "rate_limits",
+    "origin_rules",
+    "certificates",
+    "certificate_packs",
+    "spectrum_apps",
+    "workers",
+    "worker_routes",
+    "redirect_rules",
+    "transform_rules",
+    "cache_rules",
+    "email_rules",
+    "log_jobs",
+    "waiting_rooms",
+    "custom_hostnames",
+    "nodes",
+    "steering",
+    "local_proxy_rules",
+    "purges",
+    "acme_challenges",
+    "ip_lists",
+    "alert_channels",
+    "challenge_widgets",
+];
+
+/// What a full snapshot from a sender that does not list its collections
+/// (one from before [`ConfigDeltaPayload::collections`]) is taken to cover
+/// even when they are empty: the ones such senders were always reconciled
+/// by. Any other collection counts as covered only if it holds something,
+/// so an older sender that has never heard of, say, IP lists does not wipe
+/// them.
+const LEGACY_SNAPSHOT_COLLECTIONS: [&str; 6] = ["zones", "records", "workers", "nodes", "steering", "acme_challenges"];
+
+/// Keep in `active` only what a full snapshot that covers it sent (by
+/// `key`); a collection it does not cover is left as it is. Whether
+/// anything was dropped.
+fn keep_sent<T>(covered: bool, active: &mut Vec<T>, sent: &[T], key: impl Fn(&T) -> String) -> bool {
+    if !covered {
+        return false;
+    }
+    let keys: HashSet<String> = sent.iter().map(&key).collect();
+    let before = active.len();
+    active.retain(|x| keys.contains(&key(x)));
+    active.len() != before
+}
+
+/// On an accelerate node, drop from every collection a full snapshot
+/// covers what the snapshot does not hold. Whether anything was dropped.
+fn reconcile_full_snapshot(d: &mut Data, p: &ConfigDeltaPayload) -> bool {
+    let covers = |name: &str, sent_any: bool| {
+        if p.collections.is_empty() {
+            sent_any || LEGACY_SNAPSHOT_COLLECTIONS.contains(&name)
+        } else {
+            p.collections.iter().any(|c| c == name)
+        }
+    };
+    let mut changed = false;
+    macro_rules! keep {
+        ($field:ident, $key:expr) => {
+            changed |= keep_sent(covers(stringify!($field), !p.$field.is_empty()), &mut d.$field, &p.$field, $key);
+        };
+    }
+    keep!(zones, |z| z.id.clone());
+    keep!(records, |r| r.id.clone());
+    keep!(firewall_rules, |x| x.meta.id.clone());
+    keep!(rate_limits, |x| x.meta.id.clone());
+    keep!(origin_rules, |x| x.meta.id.clone());
+    keep!(certificates, |x| x.meta.id.clone());
+    keep!(certificate_packs, |x| x.meta.id.clone());
+    keep!(spectrum_apps, |x| x.meta.id.clone());
+    keep!(workers, |w| w.name.clone());
+    keep!(worker_routes, |x| x.meta.id.clone());
+    keep!(redirect_rules, |x| x.meta.id.clone());
+    keep!(transform_rules, |x| x.meta.id.clone());
+    keep!(cache_rules, |x| x.meta.id.clone());
+    keep!(email_rules, |x| x.meta.id.clone());
+    keep!(log_jobs, |x| x.meta.id.clone());
+    keep!(waiting_rooms, |x| x.meta.id.clone());
+    keep!(custom_hostnames, |x| x.meta.id.clone());
+    keep!(nodes, |n| n.id.clone());
+    keep!(steering, |s| s.id.clone());
+    keep!(local_proxy_rules, |r| r.id.clone());
+    keep!(purges, |x| x.id.clone());
+    keep!(acme_challenges, AcmeChallenge::sync_key);
+    keep!(ip_lists, |l| l.id.clone());
+    keep!(alert_channels, |c| c.id.clone());
+    keep!(challenge_widgets, |w| w.id.clone());
+    changed
 }
 
 impl Store {
@@ -2693,6 +2797,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
         acme_lease: d.acme_lease.as_ref().filter(|l| full_resync || l.sync.local_rev > since).cloned(),
         alert_channels: d.alert_channels.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         challenge_widgets: d.challenge_widgets.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
+        collections: if full_resync { SNAPSHOT_COLLECTIONS.iter().map(|c| c.to_string()).collect() } else { Vec::new() },
         tombstones: Tombstones {
             zones: filter_tombs(&d.tombstones.zones, since),
             records: filter_tombs(&d.tombstones.records, since),
@@ -2858,26 +2963,10 @@ fn merge_delta_data(
     let mut changed = false;
 
     // On full_resync in `accelerate` mode, reconcile deleted items whose tombstones
-    // may already have expired on the peer by removing items absent from the full snapshot.
+    // may already have expired on the peer by removing items absent from the full
+    // snapshot, in every collection the snapshot covers.
     if delta.full_resync && is_accelerate {
-        let z_ids: HashSet<String> = payload.zones.iter().map(|z| z.id.clone()).collect();
-        let before = (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len(), d.ip_lists.len());
-        d.zones.retain(|z| z_ids.contains(&z.id));
-        let r_ids: HashSet<String> = payload.records.iter().map(|r| r.id.clone()).collect();
-        d.records.retain(|r| r_ids.contains(&r.id));
-        let w_ids: HashSet<String> = payload.workers.iter().map(|w| w.name.clone()).collect();
-        d.workers.retain(|w| w_ids.contains(&w.name));
-        let n_ids: HashSet<String> = payload.nodes.iter().map(|n| n.id.clone()).collect();
-        d.nodes.retain(|n| n_ids.contains(&n.id));
-        let s_ids: HashSet<String> = payload.steering.iter().map(|s| s.id.clone()).collect();
-        d.steering.retain(|s| s_ids.contains(&s.id));
-        let l_ids: HashSet<String> = payload.ip_lists.iter().map(|l| l.id.clone()).collect();
-        d.ip_lists.retain(|l| l_ids.contains(&l.id));
-        let c_keys: HashSet<String> = payload.acme_challenges.iter().map(AcmeChallenge::sync_key).collect();
-        d.acme_challenges.retain(|c| c_keys.contains(&c.sync_key()));
-        if (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len(), d.ip_lists.len()) != before {
-            changed = true;
-        }
+        changed |= reconcile_full_snapshot(d, &payload);
     }
 
     let mut rev = d.local_rev;
@@ -3379,5 +3468,124 @@ mod tests {
         let delta = peer.export_since(0, None).unwrap();
         assert!(accel.merge_delta(&delta, &accel.clock()).unwrap());
         assert!(accel.snapshot().find_zone("www.accel.test").is_some());
+    }
+
+    /// A peer with a zone, two firewall rules, a Worker with a route and an
+    /// IP list, and an accelerate node that has taken all of it.
+    async fn peer_and_accelerate_node() -> (Store, Store, String) {
+        let peer = temp_store();
+        peer.set_sync_node_id("au".into());
+        let z = peer.create_zone("accel.test").unwrap();
+        for e in ["ip.src eq 192.0.2.1", "ip.src eq 192.0.2.2"] {
+            peer.save_item::<FirewallRule>(&z.id, None, serde_json::json!({ "expression": e, "action": "block" }), true).unwrap();
+        }
+        peer.put_worker("w1", Some("export default { fetch() { return new Response('ok'); } }".into()), None).unwrap();
+        peer.save_item::<WorkerRoute>(&z.id, None, serde_json::json!({ "pattern": "accel.test/*", "script": "w1" }), true).unwrap();
+        crate::lists::create(&peer, serde_json::json!({ "name": "office", "kind": "ip" })).await.unwrap();
+        let accel = Store::open_ephemeral(vec![]);
+        assert!(accel.merge_delta(&peer.export_since(0, None).unwrap(), &accel.clock()).unwrap());
+        let d = accel.data.lock().unwrap().clone();
+        assert_eq!((d.firewall_rules.len(), d.worker_routes.len(), d.ip_lists.len(), d.workers.len()), (2, 1, 1, 1));
+        (peer, accel, z.id)
+    }
+
+    #[tokio::test]
+    async fn a_full_resync_drops_on_an_accelerate_node_what_was_deleted_in_every_collection() {
+        let (peer, accel, zone) = peer_and_accelerate_node().await;
+        let gone = peer.items::<FirewallRule>(&zone).unwrap()[1].meta.id.clone();
+        peer.delete_item::<FirewallRule>(&zone, &gone).unwrap();
+        let route = peer.items::<WorkerRoute>(&zone).unwrap()[0].meta.id.clone();
+        peer.delete_item::<WorkerRoute>(&zone, &route).unwrap();
+        // the tombstones are gone too: only the full snapshot can tell
+        peer.force_tombstone_gc_for_test(DURABLE_TOMBSTONE_TTL_MS + 10_000);
+        let full = peer.export_since(0, None).unwrap();
+        assert!(full.full_resync && full.payload["tombstones"]["firewall_rules"].as_object().is_none_or(|t| t.is_empty()));
+        assert!(accel.merge_delta(&full, &accel.clock()).unwrap());
+        let d = accel.data.lock().unwrap().clone();
+        assert_eq!(d.firewall_rules.len(), 1);
+        assert_ne!(d.firewall_rules[0].meta.id, gone);
+        assert!(d.worker_routes.is_empty(), "the deleted route is gone");
+        // what is still there stays, the empty collection included in the snapshot's list
+        assert_eq!((d.zones.len(), d.workers.len(), d.ip_lists.len()), (1, 1, 1));
+        // the same snapshot again changes nothing
+        assert!(!accel.merge_delta(&full, &accel.clock()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_full_snapshot_lists_every_collection_it_covers() {
+        let (peer, _, _) = peer_and_accelerate_node().await;
+        let full = peer.export_since(0, None).unwrap();
+        let payload: ConfigDeltaPayload = serde_json::from_value(full.payload.clone()).unwrap();
+        assert_eq!(payload.collections, SNAPSHOT_COLLECTIONS.map(String::from).to_vec());
+        // every name is a field of the payload (unknown keys are ignored, so a
+        // misspelt one would take any value; a field refuses a number)
+        for name in SNAPSHOT_COLLECTIONS {
+            let mut one = serde_json::Map::new();
+            one.insert(name.to_string(), serde_json::json!(7));
+            assert!(serde_json::from_value::<ConfigDeltaPayload>(serde_json::Value::Object(one)).is_err(), "'{name}' is not a field of the payload");
+        }
+        assert!(serde_json::from_value::<ConfigDeltaPayload>(serde_json::json!({ "no_such_collection": 7 })).is_ok());
+        // an incremental delta lists none: it is not the whole truth of anything
+        let since = peer.export_since(peer.current_rev(), Some(&peer.epoch())).unwrap();
+        assert!(!since.full_resync && since.payload.get("collections").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_older_sender_does_not_wipe_a_collection_it_does_not_know() {
+        let (peer, accel, zone) = peer_and_accelerate_node().await;
+        // as a sender from before the list of collections, that has never heard of IP lists
+        // or Workers routes, and whose firewall rules are one fewer
+        let gone = peer.items::<FirewallRule>(&zone).unwrap()[1].meta.id.clone();
+        peer.delete_item::<FirewallRule>(&zone, &gone).unwrap();
+        peer.force_tombstone_gc_for_test(DURABLE_TOMBSTONE_TTL_MS + 10_000);
+        let mut full = peer.export_since(0, None).unwrap();
+        let o = full.payload.as_object_mut().unwrap();
+        for key in ["collections", "ip_lists", "worker_routes"] {
+            o.remove(key);
+        }
+        assert!(accel.merge_delta(&full, &accel.clock()).unwrap());
+        let d = accel.data.lock().unwrap().clone();
+        assert_eq!(d.ip_lists.len(), 1, "not wiped");
+        assert_eq!(d.worker_routes.len(), 1, "not wiped");
+        assert_eq!(d.firewall_rules.len(), 1, "what it did send is reconciled");
+        assert_eq!(d.zones.len(), 1);
+
+        // but the collections such senders always covered are reconciled even when empty
+        let mut empty = full.clone();
+        let o = empty.payload.as_object_mut().unwrap();
+        o.remove("workers");
+        assert!(accel.merge_delta(&empty, &accel.clock()).unwrap());
+        assert!(accel.list_workers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_sender_that_does_not_list_a_collection_leaves_it_alone() {
+        let (peer, accel, _) = peer_and_accelerate_node().await;
+        // a newer kind of sender that lists its collections, IP lists not among them
+        let mut full = peer.export_since(0, None).unwrap();
+        let o = full.payload.as_object_mut().unwrap();
+        o.remove("ip_lists");
+        let listed: Vec<&str> = SNAPSHOT_COLLECTIONS.iter().copied().filter(|c| *c != "ip_lists").collect();
+        o.insert("collections".into(), serde_json::json!(listed));
+        accel.merge_delta(&full, &accel.clock()).unwrap();
+        assert_eq!(accel.data.lock().unwrap().ip_lists.len(), 1);
+        // and one that lists IP lists but sends none has deleted them all
+        full.payload.as_object_mut().unwrap().insert("collections".into(), serde_json::json!(SNAPSHOT_COLLECTIONS));
+        assert!(accel.merge_delta(&full, &accel.clock()).unwrap());
+        assert!(accel.data.lock().unwrap().ip_lists.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_peer_does_not_drop_what_a_full_snapshot_lacks() {
+        // a peer writes its own changes: what it has and the sender has not is news for the sender
+        let (peer, _, zone) = peer_and_accelerate_node().await;
+        let other = temp_store();
+        other.set_sync_node_id("eu".into());
+        assert!(other.merge_delta(&peer.export_since(0, None).unwrap(), &other.clock()).unwrap());
+        let gone = peer.items::<FirewallRule>(&zone).unwrap()[1].meta.id.clone();
+        peer.delete_item::<FirewallRule>(&zone, &gone).unwrap();
+        peer.force_tombstone_gc_for_test(DURABLE_TOMBSTONE_TTL_MS + 10_000);
+        other.merge_delta(&peer.export_since(0, None).unwrap(), &other.clock()).unwrap();
+        assert_eq!(other.items::<FirewallRule>(&zone).unwrap().len(), 2);
     }
 }

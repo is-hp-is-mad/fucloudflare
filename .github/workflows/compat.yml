@@ -205,9 +205,10 @@ jobs:
       # and treats only Cloudflare's codes 10007 / 10090 as "not there yet";
       # the upload is multipart/form-data (metadata + module). The debug log
       # lists every request it made.
-      # Known to fail against fucf as of this draft: /workers/services/{name}
-      # has no route (404, code 7000, which wrangler does not take for "not
-      # found"), so wrangler stops before the upload; that needs src/api.rs.
+      # /workers/services/{name} answers 404 with code 10007 while the script
+      # does not exist (src/workers/services.rs), so a first deploy goes on to
+      # the upload; a second deploy of the same name needs the versions API,
+      # which fucf refuses with 400 (upload with curl PUT instead).
       # The upload itself is taken: PUT /workers/scripts/{name} reads a
       # multipart body with a metadata part and one JavaScript module
       # (src/workers/upload.rs) and stores the module; an upload with a
@@ -409,9 +410,8 @@ jobs:
       # with that slash), then the record (GET .../dns_records?type=A&name=home.example.com),
       # and PATCHes {"content": "203.0.113.10"} into it, printing SUCCESS.
       # The token is in the config file only; -debug prints the requests.
-      # Known to fail against fucf as of this draft (tried by hand on a local
-      # build): /zones/ with the trailing slash has no route (404), so ddclient
-      # stops at the zone lookup. Needs src/api.rs.
+      # A trailing slash on an API path is dropped before routing, so
+      # /zones/?name=... is the same as /zones?name=... (not yet run here).
       - name: run ddclient once
         run: |
           umask 077

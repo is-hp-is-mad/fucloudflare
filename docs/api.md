@@ -12,6 +12,11 @@ of your zones.
 BASE=https://panel.example.com/client/v4
 ```
 
+A path with a trailing slash is the same path without it (`GET $BASE/zones/?name=example.com` lists zones
+like `GET $BASE/zones?name=example.com`), for every method, and is checked as that path: who may see a zone
+does not depend on the slash. The one exception is Workers KV, where a key is part of the path
+(`.../values/{key}`) and may itself end in `/`.
+
 ## Authentication
 
 | How | Header | For |
@@ -254,11 +259,23 @@ firewall blocks, rate limit hits) are counted, and the zone's own rules are kept
 Banned addresses also count against their threat score on every zone.
 
 A node started with `--ban-export <file>` (`FUCF_BAN_EXPORT`) writes the addresses banned by rules
-with the action `block` (not `managed_challenge`) into that file as an nftables script: the sets
-`banned4` and `banned6` of the table `inet fucf`, each element with the time its ban has left. It
+with the action `block` (not `managed_challenge`) into that file as an nftables script: three
+sets of the table `inet fucf` (below), each element with the time its ban has left. It
 is checked every 30 seconds and written again when the addresses change. The host loads it (`nft -f`)
-and drops those addresses itself, with rules of its own choosing. IPv6 bans, which are by /64, are
-not written yet: `banned6` stays empty.
+and drops those addresses itself, with rules of its own choosing. IPv6 bans of the automatic firewall,
+which are by /64, go into a third set, `banned6net`, as prefixes (`2001:db8:1:2::/64`); it is declared
+with `flags interval`, which a set of prefixes needs, while `banned4` and `banned6` keep the flags they
+had, so a host that loaded an older file loads the new one without deleting its sets first. A rule's own
+key is read the same way: an address goes into `banned4` or `banned6`, an IPv6 network of /16 or longer
+into `banned6net`; IPv4 networks and shorter IPv6 networks are not exported. A set can only be used by
+rules of its own table, so the host's rules go into `inet fucf` too, for example:
+
+```
+nft add chain inet fucf input '{ type filter hook input priority -10; }'
+nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop
+nft add rule inet fucf input tcp dport { 80, 443 } ip6 saddr @banned6 drop
+nft add rule inet fucf input tcp dport { 80, 443 } ip6 saddr @banned6net drop
+```
 
 ## Backups
 
@@ -1110,6 +1127,40 @@ CRUD   /zones/{id}/workers/routes         {"pattern": "example.com/api/*", "scri
                                           Workers off for what matches)
 ```
 
+What `wrangler deploy` asks around the upload (below) is answered too, on the same paths with or without
+`/accounts/{id}`:
+
+```
+GET    /workers/services/{name}             the script as a service: default_environment.script has tag, tags,
+                                            last_deployed_from ("api")
+GET    /workers/workers/{name}              id (the tag), name, subdomain {"enabled": false, "previews_enabled": false}
+GET    /workers/subdomain                   404, code 1002: there is no workers.dev subdomain
+GET    /workers/scripts/{name}/subdomain    {"enabled": false, "previews_enabled": false}
+POST   /workers/scripts/{name}/subdomain    {"enabled": false, "previews_enabled": false}; true for either is a 400
+GET    /workers/scripts/{name}/secrets      [] (variables are plain text, in .../settings)
+GET    /workers/scripts/{name}/deployments  {"deployments": []}
+GET    /workers/scripts/{name}/schedules    {"schedules": [{"cron": "*/5 * * * *"}]}: the settings' crons
+PUT    /workers/scripts/{name}/schedules    [{"cron": "..."}]: replaces the crons; [] removes them
+PUT    /workers/scripts/{name}/routes       [{"pattern", "zone_id"?, "zone_name"?}]: replaces the script's routes
+POST   /workers/scripts/{name}/versions     400: no versions (below)
+POST   /workers/scripts/{name}/deployments  400: no versions (below)
+```
+
+Each of these answers Cloudflare's `404` with code `10007` ("This Worker does not exist on your account.")
+while there is no script of that name, which is how wrangler tells a first deploy. Reading them follows the
+rules of `GET /workers/scripts`; the writes are for administrators (and their tokens with Workers Scripts
+Write), like every other change to a Worker. The service's `tag` is derived from the name, so it is the same
+on every node and after every upload; fucf does not record where a script came from and says `"api"`.
+
+`PUT .../routes` resolves each pattern to a zone: the one `zone_id` or `zone_name` names (the host must be in
+it), or else the closest zone the host is in. The script's routes in every zone they are in or go to are then
+replaced; a route that stays keeps its id. The whole body is checked before anything changes: a pattern
+another script (or `"script": null`) holds is a `409`, an unknown zone, a host outside its zone, the same
+pattern twice, more than 100 routes, a `script` other than `{name}` and `custom_domain: true` are a `400`.
+Each zone's routes change as one step. An API token also needs Workers Routes Write in each zone touched,
+as it would on `/zones/{id}/workers/routes`; without it the answer is `403` with code `10000`, on which
+wrangler goes on through the zones' own routes paths.
+
 `crons` are five-field UTC expressions.
 
 **Uploading.** A Worker here is one file: `export default { ... }`, esbuild's closing
@@ -1123,10 +1174,21 @@ ignored. Refused with `400`, nothing stored: more than one module or any extra p
 modules, source maps), a non-JavaScript type, a missing or second `metadata` part, a `bindings` list that is
 not empty (set `vars`, `kv_bindings` and `d1_bindings` with `PATCH .../settings` instead), and `assets`.
 
-So bundle into one file first. `wrangler deploy` bundles with esbuild by default; `--dry-run --outdir dist`
-writes that bundle without calling any API. `wrangler deploy` itself does not finish against fucf yet: before
-uploading it reads `/accounts/{id}/workers/services/{name}`, which fucf does not have. Upload the bundle
-yourself instead, either form:
+So bundle into one file first. `wrangler deploy` bundles with esbuild by default, so a Worker that is one
+module after bundling deploys with it, pointed at the panel (`CLOUDFLARE_API_BASE_URL=$BASE`,
+`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`), as long as `wrangler.toml` has:
+
+- `workers_dev = false` and `preview_urls = false`: there is no workers.dev here;
+- no `vars` or other bindings (wrangler would send them in the upload's `bindings`): set them with
+  `PATCH .../settings`;
+- `routes` with patterns (not `custom_domain = true`) in zones of the panel, and `triggers.crons` if any.
+
+That covers the first deploy of a name. A later `wrangler deploy` of the same name does not finish: for a
+Worker that is already there, wrangler uploads through the versions API (`POST .../versions`, then
+`POST .../deployments`), and fucf keeps no versions, so both are refused with a `400` that says so (wrangler
+does not retry a `400`). Nor are `wrangler versions`, `wrangler rollback`, `wrangler delete` and custom
+domains (`/workers/domains`). `wrangler deploy --dry-run --outdir dist` writes the bundle without calling any
+API; upload it yourself to replace a Worker, either form:
 
 ```
 curl -s -X PUT $BASE/accounts/$ACCOUNT/workers/scripts/my-worker -H "Authorization: Bearer $TOKEN" \

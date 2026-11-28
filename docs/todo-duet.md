@@ -227,7 +227,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 已经排除、不做：DoH / Gateway、发信、Zero Trust、AI Gateway、Workers AI、Vectorize、Containers、Browser Rendering、Realtime、Pipelines。
 - 顺序照编号做，每个任务一个提交；做不了的子项写明原因跳过。
 
-### [ ] T14 补上已知的接口缺口
+### [x] T14 补上已知的接口缺口
 
 - `GET /accounts/{id}/workers/services/{name}`：脚本不存在时回 Cloudflare 的错误码 10007（wrangler 也认 10090），存在时回 `default_environment.script` 里 wrangler 会读的字段（`tag`、`tags`、`last_deployed_from`）。照 N12 交接里从 wrangler 4 包里读到的调用顺序，查清 `wrangler deploy` 接下来还要哪些接口（secrets 检查、`/subdomain`、`/schedules`、路由），能用现有数据回答的就回答，回答不了的在文档写清。
 - `GET /zones/`（带尾斜杠）和 `/zones` 一样回答，其他列表接口顺手检查一遍。
@@ -398,6 +398,13 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 版本全部钉死：Terraform 1.16.7（SHA-256）、cloudflare provider 5.25.0、wrangler 4.155.0、lego v4.35.2、pebble v2.10.1、ddclient v3.11.2（官方不发校验和，SHA-256 是写的时候自己算的）；actions 照 ci.yml 用大版本标签。
 - 本地 debug 构建上手工试过：Terraform 会发的建域名、记录、两个阶段的规则集请求都正常，边缘 403 也对。已知必失败、需要改 `src/api.rs`：wrangler 先查 `/accounts/{id}/workers/services/{name}`（现在 404/7000，wrangler 只认 10007/10090），上传是 multipart（现在当成脚本原文，报语法错）；ddclient 请求 `/zones/?name=`（带斜杠，404）。
 - 实际跑一次后还要调：Terraform v5 读回字段的差异（`plan` 必须无差异）、lego 的传播检查参数、provider 版本号；各作业日志都作为 artifact 上传。
+
+### T14
+
+- 补了 wrangler deploy 前后要问的接口（services、workers/workers、secrets、deployments、subdomain、schedules、PUT routes），都在新文件 `src/workers/services.rs`，`api.rs` 只加了路由和薄处理函数；脚本不存在时统一 404/10007，写入仍只限管理员，PUT routes 另按区域检查令牌，没有权限就回 403/10000。
+- 同名再部署要走 versions 接口，没有实现，回 400 并说明改用 curl PUT；workers.dev、自定义域名、secrets 都不支持；`last_deployed_from` 固定为 `api`，wrangler 会提示确认，`--strict` 下会中止。
+- 路径末尾的 `/` 在路由前统一去掉（KV 的 values 路径除外），租户检查看到的是同一路径；`--ban-export` 新增 `banned6net`（flags interval）导出 IPv6 /64，旧的两个集合声明不变，已加载旧文件的主机照样能 `nft -f`。
+- 纯加速节点全量重同步现在对齐全部 25 类集合，快照带 `collections` 列表；旧版本对端没列出的集合只在非空时对齐（老的六类除外），不会再清空 ip_lists。以后新增集合要记得加进 `SNAPSHOT_COLLECTIONS`，漏了只是不对齐（偏安全）。
 
 ## 5. 部署（通过 Komari）
 

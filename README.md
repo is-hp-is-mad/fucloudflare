@@ -78,6 +78,8 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 基址 `http://127.0.0.1:8787/client/v4`，认证头 `Authorization: Bearer <token>`，响应信封与 Cloudflare v4 一致。
 用户自己的 API 令牌和 Global API Key 见下面的“开放 API”。完整的接口文档：[docs/api.md](docs/api.md)。
 zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是简化的自有结构。
+路径末尾的 `/` 会被去掉再处理（`GET /zones/?name=example.com` 等同于 `GET /zones?name=example.com`），权限和区域归属也按去掉后的路径检查；
+只有 Workers KV 的 `.../values/{key}` 例外，键本身可以以 `/` 结尾。
 
 ```
 /system                                  GET              角色（peer / accelerate）、节点名、配置版本、NS、CNAME 基础域名，以及各对端的同步状态
@@ -121,6 +123,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码，或只含一个模块的 wrangler 式 multipart 上传，见“Workers”
 /workers/scripts/{name}/settings         GET PATCH        {"vars": {"KEY":"value"}, "kv_bindings": {"名字": 命名空间 id}, "d1_bindings": {"名字": 数据库 id}, "crons": ["*/5 * * * *"]}
 /workers/scripts/{name}/scheduled        POST             {"cron": "*/5 * * * *"}：立即运行一次 scheduled()
+/workers/services/{name} 等              GET PUT POST     wrangler deploy 要问的接口（services、schedules、routes、subdomain……），见“Workers”
 ```
 
 ### 高级回源（记录上的 `origin`）
@@ -342,9 +345,13 @@ TLS 1.3 下按访客客户端的偏好选：支持它的浏览器就用它，TLS
   真正的解析器会改用 TCP 重试，其余丢弃。UDP 的来源地址可以伪造，不限速的权威服务器会被用来放大攻击别人。本机回环不限。
 - `--ban-export 文件`（`FUCF_BAN_EXPORT`）：把自动防火墙当前封禁的地址（只含动作为拦截的规则）写成 nftables 脚本，每 30 秒检查、有变化才重写。
   fucf 自己没有改内核表的权限，也不替你决定封禁覆盖哪些端口：由宿主机用 `nft -f 文件` 加载（例如配一个 systemd path 单元），并自己加丢弃规则，如
-  `nft add chain inet fucf input '{ type filter hook input priority -10; }'` 和 `nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop`。
-  注意同一台机器上的其他服务是否也该被这条规则覆盖。脚本里是 `inet fucf` 表的 `banned4`、`banned6` 两个集合，每个地址带着封禁剩下的时间（`timeout`）。
-  目前只有 IPv4：自动防火墙对 IPv6 按 /64 封禁，这些网段还没有写进文件，`banned6` 总是空的。
+  `nft add chain inet fucf input '{ type filter hook input priority -10; }'`、`nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop`
+  和 `nft add rule inet fucf input tcp dport { 80, 443 } ip6 saddr @banned6net drop`（集合只能被同一张表里的规则引用，所以规则也加在 `inet fucf` 里）。
+  注意同一台机器上的其他服务是否也该被这条规则覆盖。脚本里是 `inet fucf` 表的三个集合，每个元素带着封禁剩下的时间（`timeout`）：
+  `banned4`（IPv4 地址）、`banned6`（单个 IPv6 地址）和 `banned6net`（IPv6 网段）。自动防火墙对 IPv6 按 /64 封禁，这些网段以前缀
+  （如 `2001:db8:1:2::/64`）写进 `banned6net`；存网段的集合必须声明 `flags interval`，只有这个新集合这样声明，`banned4`、`banned6` 的声明不变，
+  所以加载过旧文件的宿主机不用先删集合就能加载新文件。规则里手写的键同样处理：单个地址进前两个集合，/16 及更长的 IPv6 网段进 `banned6net`，
+  IPv4 网段和更短的 IPv6 网段不导出。
 
 ### 限速的计数方式
 
@@ -538,7 +545,15 @@ export default {
 
 - **隔离**：每个请求（以及每封邮件、每次定时触发）都新建一个 JS 上下文，上一个请求留下的全局变量、模块顶层变量、改过的原型、没结束的 Promise 到下一个请求都不在，两个脚本之间也什么都不共享。这是有意的：Boa 0.22 解析出的脚本绑在创建它的上下文（realm 和字符串表）上，不能跨上下文复用；只重置 realm 的话，新 realm 照样要建全部内置对象，前置脚本和用户脚本照样要重新编译，还会把上一个请求没跑完的任务带进下一个请求。要跨请求保存的东西放 KV 或 D1。
 - **字节请求体**：`request.arrayBuffer()` / `request.bytes()` 原样拿到请求体的每个字节（`text()` / `json()` 照旧按 UTF-8 解码，坏的字节换成替换符）；`new Response(...)` 除了字符串还接受 `ArrayBuffer`、`Uint8Array`、`DataView` 等，构造时复制一份，二进制体不自动加 `Content-Type`。单个体不超过 16 MiB，一次执行交给边缘的字节体合计不超过 64 MiB。
-- **上传与打包**：脚本只能是一个文件（`export default {...}`、esbuild 生成的末尾 `export { x as default };` 或 `addEventListener`），没有模块加载器，其他 `import` / `export` 上传时就被拒。`PUT` 也接受 wrangler 那样的 `multipart/form-data`：`metadata` 部分（JSON，`main_module` 或 `body_part` 指明脚本）加上恰好一个同名的 JavaScript 部分，存下的就是这个模块本身。多个模块、wasm / 文本 / 数据模块、source map、非空的 `bindings`、`assets` 一律 400，什么都不改；变量和 KV / D1 绑定用 `PATCH /workers/scripts/{name}/settings` 设置。所以先打成一个文件：`wrangler deploy --dry-run --outdir dist` 用 esbuild 打包、不调用任何接口，再用 curl 上传 `dist/` 里的文件（例子见 `docs/api.md`）。`wrangler deploy` 本身目前还走不完：上传前它要读 `/accounts/{id}/workers/services/{name}`，fucf 还没有这个接口。
+- **上传与打包**：脚本只能是一个文件（`export default {...}`、esbuild 生成的末尾 `export { x as default };` 或 `addEventListener`），没有模块加载器，其他 `import` / `export` 上传时就被拒。`PUT` 也接受 wrangler 那样的 `multipart/form-data`：`metadata` 部分（JSON，`main_module` 或 `body_part` 指明脚本）加上恰好一个同名的 JavaScript 部分，存下的就是这个模块本身。多个模块、wasm / 文本 / 数据模块、source map、非空的 `bindings`、`assets` 一律 400，什么都不改；变量和 KV / D1 绑定用 `PATCH /workers/scripts/{name}/settings` 设置。所以先打成一个文件：`wrangler deploy --dry-run --outdir dist` 用 esbuild 打包、不调用任何接口，再用 curl 上传 `dist/` 里的文件（例子见 `docs/api.md`）。
+- **用 wrangler 部署**：`wrangler deploy` 部署前后要问的接口都有应答（带不带 `/accounts/{id}` 都行）：`/workers/services/{name}`（`tag` 由名字算出，各节点一致；`last_deployed_from` 固定为 `"api"`）、
+  `/workers/workers/{name}`、`.../secrets`（总是 `[]`）、`.../deployments`（`{"deployments": []}`）、`.../subdomain`（workers.dev 只能关）、`.../schedules`（读写的就是设置里的 `crons`）
+  和 `PUT .../routes`（按模式找到所在区域，替换这个脚本在各区域的路由，其他脚本的路由不动；整个请求体先检查完再改，被别的脚本占用的模式 409）。
+  脚本还不存在时这些接口都回 Cloudflare 的 404 / 10007，wrangler 据此认出第一次部署。读取的权限与 `GET /workers/scripts` 相同，写入只限管理员（和管理员带 Workers Scripts Write 的令牌）；
+  `PUT .../routes` 还要求令牌在涉及的每个区域有 Workers Routes Write，没有就回 403 / 10000，wrangler 会改走各区域自己的路由接口。
+  所以 `wrangler.toml` 里写 `workers_dev = false`、`preview_urls = false`，不写 `vars` 和绑定（用 settings 设置），路由用区域里的模式，就能用
+  `CLOUDFLARE_API_BASE_URL=https://面板/client/v4 wrangler deploy` 完成第一次部署。同名再部署时 wrangler 走 versions 接口（`POST .../versions`、`POST .../deployments`），
+  fucf 不保存版本，两者都回 400 并说明改用 `PUT /workers/scripts/{name}`。
 
 ## 电子邮件路由
 
@@ -1007,6 +1022,8 @@ Cloudflare 令牌（Zone DNS 编辑权限）放在 WSL 的 `~/.config/fucf-cf-to
 
 - **无主对等同步（`--role peer`）**：通过 `--role peer --peers <host1,host2,...>` 组成多活控制面机群，节点间双向同步配置、面板账户与遥测数据，支持持久化状态。
 - **纯加速节点（`--role accelerate`）**：作为只读内存态数据面运行，不在磁盘落盘控制面状态，并自动抑制公共 NS 应答；可在节点配置中设置 `accel_hosts`（按子域名白名单），限制该节点仅对指定主机名提供加速与代理服务。
+  全量重同步时，纯加速节点按对端发来的完整快照对齐每一类配置（区域、记录、各类规则、证书、Workers 与路由、IP 列表等），删掉对端已删的对象；
+  快照里会列出它覆盖了哪些集合，没列出的集合原样保留，所以旧版本的对端做全量重同步不会清空它不认识的集合（如 IP 列表）。
 
 ### 原生反向代理、Hysteria 2 回落、`/cdn-cgi/*` 与节点内回源
 
@@ -1043,7 +1060,7 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 
 工具版本都钉死（Terraform 和 ddclient 校验 SHA-256，Go 模块经校验和数据库，npm 包经 registry 的完整性哈希），
 示例数据只用 `example.com` / `example.net` / `*.test` 和文档地址段。这份工作流是在没有运行过的情况下写的，
-第一次实际运行后还要按日志调整（各作业的日志作为 artifact 上传）。已知会失败的两处：wrangler 上传前要读 `/accounts/{id}/workers/services/{name}`，fucf 还没有这个接口；ddclient 请求的 `/zones/?name=…` 带结尾斜杠，fucf 不认，两处都返回 404。
+第一次实际运行后还要按日志调整（各作业的日志作为 artifact 上传）。之前已知会失败的两处（wrangler 要读的 `/workers/services/{name}`、ddclient 请求的带结尾斜杠的 `/zones/?name=…`）已在 T14 补上，还没在 CI 上实际跑过；同名 Worker 第二次 `wrangler deploy` 要走 versions 接口，fucf 不支持。
 
 ## 已知限制
 
@@ -1072,10 +1089,11 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 - 压缩：未知长度（流式）的响应不压缩。
 - 源站：主动健康检查要给区域设了 `origin_check_path` 才有，各节点各查各的，只查已代理的 A/AAAA 地址（CNAME 指向的地址不查）；超时不会重发请求。
 - 分析：按国家 / 主机名 / 路径的拆分只保留 7 天，每小时每个维度只留排名靠前的若干项（其余并入"(other)"）；DNS 查询数（`dns_analytics`）不进时间序列，也不在节点之间汇总。
-- 封禁导出（`--ban-export`）：只写 IPv4 的封禁，按 /64 封的 IPv6 还没有写进文件。
+- 封禁导出（`--ban-export`）：只导出动作为拦截的规则；规则里手写的 IPv4 网段和短于 /16 的 IPv6 网段不导出。
 - WAF：托管规则是一组正则，不是完整的 OWASP CRS；请求体只检查不超过 1 MiB 的。
 - Workers：每个请求新建 JS 上下文（无全局状态复用，每次都要重新编译前置脚本和用户脚本）；只支持单文件脚本，
-  `wrangler deploy` 还走不完（缺 `/workers/services/{name}`），要先打包再用 curl 上传；不支持流式 API；
+  `wrangler deploy` 只能完成某个名字的第一次部署（已有的 Worker 要走 versions 接口，fucf 不保存版本，
+  再部署要先 `--dry-run --outdir` 打包再用 curl 上传），不支持 workers.dev、自定义域名、secrets 和 `wrangler versions` / `rollback` / `delete`；不支持流式 API；
   单请求最多 50 个子请求，体积上限 16 MiB。
   CPU 限制靠循环次数上限，墙钟超时 30 秒后向客户端返回 500，但脚本线程要到自身结束才释放。
 - Spectrum：所有应用共用边缘 IP，同一协议端口只能被一个应用占用；UDP 会话空闲 60 秒回收。

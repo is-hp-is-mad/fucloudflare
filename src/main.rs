@@ -209,8 +209,9 @@ struct Args {
     dns_rrl: u32,
 
     /// Write the addresses the automatic firewall bans (by rules that block)
-    /// to this file as an nftables script (sets `banned4` and `banned6` of the
-    /// table `inet fucf`), for the host to load and drop them in the kernel.
+    /// to this file as an nftables script (sets `banned4`, `banned6` and, for
+    /// the IPv6 /64 networks, `banned6net` of the table `inet fucf`), for the
+    /// host to load and drop them in the kernel.
     #[arg(long, env = "FUCF_BAN_EXPORT")]
     ban_export: Option<PathBuf>,
 

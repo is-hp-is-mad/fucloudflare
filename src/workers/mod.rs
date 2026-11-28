@@ -16,6 +16,7 @@ pub mod cron;
 pub mod crypto;
 pub mod db;
 pub mod kv;
+pub mod services;
 pub mod upload;
 
 use crate::edge::{full, Body, Edge, EdgeError, WORKER_BODY_LIMIT};

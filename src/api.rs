@@ -180,6 +180,16 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/workers/scripts/{name}", get(get_worker).put(put_worker).delete(delete_worker))
         .route("/workers/scripts/{name}/settings", get(get_worker_settings).patch(patch_worker_settings))
         .route("/workers/scripts/{name}/scheduled", post(trigger_worker_scheduled))
+        // what wrangler deploy asks around the upload (crate::workers::services)
+        .route("/workers/services/{name}", get(get_worker_service))
+        .route("/workers/workers/{name}", get(get_worker_view))
+        .route("/workers/subdomain", get(get_workers_subdomain))
+        .route("/workers/scripts/{name}/subdomain", get(get_worker_subdomain).post(post_worker_subdomain))
+        .route("/workers/scripts/{name}/secrets", get(list_worker_secrets))
+        .route("/workers/scripts/{name}/schedules", get(get_worker_schedules).put(put_worker_schedules))
+        .route("/workers/scripts/{name}/routes", axum::routing::put(put_worker_routes))
+        .route("/workers/scripts/{name}/deployments", get(list_worker_deployments).post(worker_versions_refused))
+        .route("/workers/scripts/{name}/versions", post(worker_versions_refused))
         .route("/kv/namespaces", get(kv_list_namespaces).post(kv_create_namespace))
         .route("/kv/namespaces/{ns_id}", get(kv_get_namespace).patch(kv_rename_namespace).delete(kv_delete_namespace))
         .route("/kv/namespaces/{ns_id}/keys", get(kv_list_keys))
@@ -252,7 +262,36 @@ pub fn router(state: Arc<ApiState>) -> Router {
             }
         }
     });
-    Router::new().route("/client/v4/accounts/{account_id}/{*rest}", by_account).merge(app)
+    let routes = Router::new().route("/client/v4/accounts/{account_id}/{*rest}", by_account).merge(app);
+    // (a router's own layers run after it has picked the route: what changes
+    // the path has to stand in front of it, as this fallback-only router does)
+    Router::new().fallback(move |req: Request| {
+        let mut routes = routes.clone();
+        async move { tower_service::Service::call(&mut routes, without_trailing_slash(req)).await.unwrap_or_else(|never| match never {}) }
+    })
+}
+
+/// An API path with trailing slashes as the same path without them: some
+/// clients write list paths that way (`GET /zones/?name=example.com`), and
+/// no route here ends in a slash. It is done before routing, so the `auth`
+/// middleware (the token's grant, the tenancy check) sees the very path
+/// the handler answers. A Workers KV key is part of its path and may itself
+/// end in a slash, so paths with a `values` segment are left alone.
+fn without_trailing_slash(mut req: Request) -> Request {
+    let path = req.uri().path();
+    let Some(rest) = path.strip_prefix("/client/v4/") else { return req };
+    let trimmed = rest.trim_end_matches('/');
+    if trimmed.len() == rest.len() || trimmed.is_empty() || trimmed.split('/').any(|seg| seg == "values") {
+        return req;
+    }
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let mut parts = req.uri().clone().into_parts();
+    let Ok(path_and_query) = format!("/client/v4/{trimmed}{query}").parse() else { return req };
+    parts.path_and_query = Some(path_and_query);
+    if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+        *req.uri_mut() = uri;
+    }
+    req
 }
 
 /// `/client/v4/accounts/{account}/{rest}` as the path it stands for here.
@@ -264,7 +303,7 @@ fn account_path(mut req: Request) -> Result<Request, ApiError> {
         return Err(ApiError(StatusCode::NOT_FOUND, 7003, "Could not route to this account: perhaps the identifier is wrong".into()));
     }
     let under = |prefix: &str| rest == prefix || rest.strip_prefix(prefix).is_some_and(|r| r.starts_with('/'));
-    let mapped = if under("workers/scripts") {
+    let mapped = if under("workers") {
         format!("/{rest}")
     } else if under("storage/kv/namespaces") {
         format!("/kv/{}", &rest["storage/kv/".len()..])
@@ -2521,6 +2560,123 @@ async fn trigger_worker_scheduled(State(st): St, Path(name): Path<String>, bytes
         .await
         .map_err(bad)?;
     ok(json!({ "triggered": true, "cron": cron_expr, "scheduledTime": ms }))
+}
+
+// ---------------------------------------- workers: what wrangler asks ----
+
+/// The script, or Cloudflare's "no such Worker" (code 10007), the one
+/// answer wrangler takes for "not there yet" (`workers::services`).
+fn deployed_worker(st: &ApiState, name: &str) -> Result<WorkerScript, ApiError> {
+    st.store.get_worker(name).map_err(|e| match e {
+        StoreError::NotFound => ApiError(StatusCode::NOT_FOUND, 10007, "This Worker does not exist on your account.".into()),
+        other => other.into(),
+    })
+}
+
+async fn get_worker_service(State(st): St, Path(name): Path<String>) -> ApiResult {
+    ok(crate::workers::services::service(&deployed_worker(&st, &name)?))
+}
+
+async fn get_worker_view(State(st): St, Path(name): Path<String>) -> ApiResult {
+    ok(crate::workers::services::worker(&deployed_worker(&st, &name)?))
+}
+
+/// The account's `workers.dev` subdomain: there is none, and saying "not
+/// registered" (10007) would have wrangler offer to register one.
+async fn get_workers_subdomain() -> ApiResult {
+    Err(ApiError(StatusCode::NOT_FOUND, 1002, crate::workers::services::NO_WORKERS_DEV.into()))
+}
+
+async fn get_worker_subdomain(State(st): St, Path(name): Path<String>) -> ApiResult {
+    deployed_worker(&st, &name)?;
+    ok(crate::workers::services::subdomain())
+}
+
+async fn post_worker_subdomain(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    deployed_worker(&st, &name)?;
+    crate::workers::services::check_subdomain(&body::<Value>(&bytes)?).map_err(bad)?;
+    ok(crate::workers::services::subdomain())
+}
+
+/// Secrets are none here (variables are plain text, set in the settings).
+async fn list_worker_secrets(State(st): St, Path(name): Path<String>) -> ApiResult {
+    deployed_worker(&st, &name)?;
+    ok(json!([]))
+}
+
+async fn get_worker_schedules(State(st): St, Path(name): Path<String>) -> ApiResult {
+    ok(crate::workers::services::schedules(&deployed_worker(&st, &name)?))
+}
+
+async fn put_worker_schedules(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    deployed_worker(&st, &name)?;
+    let crons = crate::workers::services::parse_schedules(&body::<Value>(&bytes)?).map_err(bad)?;
+    let w = st.store.patch_worker_bindings_async(&name, None, None, None, Some(crons)).await.map_err(|e| match e {
+        // deleted meanwhile
+        StoreError::NotFound => ApiError(StatusCode::NOT_FOUND, 10007, "This Worker does not exist on your account.".into()),
+        other => other.into(),
+    })?;
+    wake_push(&st);
+    ok(crate::workers::services::schedules(&w))
+}
+
+/// Nothing here keeps deployments (one script is what runs).
+async fn list_worker_deployments(State(st): St, Path(name): Path<String>) -> ApiResult {
+    deployed_worker(&st, &name)?;
+    ok(json!({ "deployments": [] }))
+}
+
+/// The versions API (upload a version, deploy versions), which wrangler
+/// uses for a Worker that is already there: refused with a 400, which
+/// wrangler does not retry, and words that say what to do instead.
+async fn worker_versions_refused() -> ApiResult {
+    Err(bad(crate::workers::services::NO_VERSIONS))
+}
+
+/// Replace the routes of one script, in whichever zones they are or go:
+/// each zone's routes change as one step (`batch_items_async`), after the
+/// whole body has been checked against every zone it touches. The same
+/// route objects the zones' own `/workers/routes` keep, so an API token
+/// needs the right to change those in each zone touched, as it would there;
+/// without it the answer is Cloudflare's authentication error (10000), on
+/// which wrangler goes on route by route through the zones' own paths.
+async fn put_worker_routes(State(st): St, axum::Extension(who): Who, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
+    use crate::workers::services;
+    deployed_worker(&st, &name)?;
+    let specs = services::parse_routes(&name, &body::<Value>(&bytes)?).map_err(bad)?;
+    let zones = st.store.list_zones();
+    let mut wanted: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for spec in &specs {
+        let zone = services::zone_for(spec, &zones).map_err(bad)?;
+        wanted.entry(zone.id.clone()).or_default().push(spec.pattern.clone());
+    }
+    let mine = |r: &WorkerRoute| r.script.as_deref() == Some(name.as_str());
+    let mut touched: std::collections::BTreeSet<String> = wanted.keys().cloned().collect();
+    touched.extend(st.store.all_items::<WorkerRoute>().iter().filter(|r| mine(r)).map(|r| r.meta.zone_id.clone()));
+    let user = who.user_id.clone().unwrap_or_default();
+    for z in &touched {
+        let path = format!("/zones/{z}/workers/routes");
+        if matches!(who.via, Via::Token) && !who.grant.as_ref().is_some_and(|g| g.allows("PUT", &path, &user)) {
+            return Err(ApiError(StatusCode::FORBIDDEN, 10000, format!("Authentication error: this token may not change the Worker routes of the zone {z}")));
+        }
+    }
+    // every zone is checked before the first is changed
+    for (z, patterns) in &wanted {
+        services::route_ops(&name, patterns, &st.store.items::<WorkerRoute>(z)?)?;
+    }
+    for z in &touched {
+        let (script, patterns) = (name.clone(), wanted.get(z).cloned().unwrap_or_default());
+        st.store.batch_items_async::<WorkerRoute, _>(z, move |current| services::route_ops(&script, &patterns, &current)).await?;
+    }
+    let zones = st.store.list_zones();
+    let out = st
+        .store
+        .all_items::<WorkerRoute>()
+        .iter()
+        .filter(|r| mine(r))
+        .filter_map(|r| zones.iter().find(|z| z.id == r.meta.zone_id).map(|z| services::route_view(r, z)))
+        .collect();
+    ok(Value::Array(out))
 }
 
 // ------------------------------------------------------------------ kv ----
@@ -5292,6 +5448,252 @@ mod tests {
         assert_eq!((sc, json_of(&b)["result"]["owner"]["id"].clone()), (StatusCode::OK, Value::Null));
         let (sc, _) = ask("alice", "GET", &format!("/zones/{theirs}"), Value::Null).await;
         assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An editor past the first password, and the bearer header for them.
+    async fn signed_in_editor(st: &Arc<ApiState>, app: &mut Router, who: &str) -> String {
+        let email = format!("{who}@example.com");
+        st.accounts.create_user(&email, Role::Editor, Some("first-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let Login::Session(token, _) = st.accounts.login(&email, "first-pass-123", &Client::default()).unwrap() else { panic!("expected signed in") };
+        let bearer = format!("Bearer {token}");
+        let (sc, _, _) = call_raw(app, "POST", "/client/v4/account/password", vec![("authorization", &bearer), ("content-type", "application/json")],
+            br#"{"current":"first-pass-123","new":"second-pass-456"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        bearer
+    }
+
+    #[tokio::test]
+    async fn what_wrangler_deploy_asks_around_the_upload_is_answered_on_the_account_paths() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-wrangler-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let acct = format!("/client/v4/accounts/{}/workers", crate::tokens::account_id());
+        let code = |b: &[u8]| json_of(b)["errors"][0]["code"].clone();
+
+        // before the first upload: Cloudflare's "no such Worker" everywhere wrangler looks
+        for (method, path, body) in [
+            ("GET", "/services/w1", ""),
+            ("GET", "/workers/w1", ""),
+            ("GET", "/scripts/w1/deployments", ""),
+            ("GET", "/scripts/w1/secrets", ""),
+            ("GET", "/scripts/w1/subdomain", ""),
+            ("POST", "/scripts/w1/subdomain", r#"{"enabled":false}"#),
+            ("GET", "/scripts/w1/schedules", ""),
+            ("PUT", "/scripts/w1/schedules", "[]"),
+            ("PUT", "/scripts/w1/routes", "[]"),
+        ] {
+            let (sc, b) = call(&mut app, method, &format!("{acct}{path}"), body.as_bytes().to_vec()).await;
+            assert_eq!((sc, code(&b)), (StatusCode::NOT_FOUND, json!(10007)), "{method} {path}: {}", String::from_utf8_lossy(&b));
+        }
+        assert!(st.store.list_workers().is_empty(), "and nothing was made by asking");
+
+        let js = b"export default { fetch() { return new Response('ok'); } }".to_vec();
+        let (sc, _) = call(&mut app, "PUT", &format!("{acct}/scripts/w1?excludeScript=true&bindings_inherit=strict"), js.clone()).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        let (sc, b) = call(&mut app, "GET", &format!("{acct}/services/w1"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let script = json_of(&b)["result"]["default_environment"]["script"].clone();
+        assert_eq!(script["tag"], json!(crate::workers::services::tag("w1")));
+        assert_eq!((script["tags"].clone(), script["last_deployed_from"].clone()), (json!([]), json!("api")));
+        let (_, b) = call(&mut app, "GET", &format!("{acct}/scripts/w1/deployments"), vec![]).await;
+        assert_eq!(json_of(&b)["result"], json!({ "deployments": [] }));
+        let (_, b) = call(&mut app, "GET", &format!("{acct}/scripts/w1/secrets"), vec![]).await;
+        assert_eq!(json_of(&b)["result"], json!([]));
+        let (_, b) = call(&mut app, "GET", &format!("{acct}/workers/w1"), vec![]).await;
+        assert_eq!(json_of(&b)["result"]["subdomain"], json!({ "enabled": false, "previews_enabled": false }));
+        // the non-account paths answer the same
+        let (sc, _) = call(&mut app, "GET", "/client/v4/workers/services/w1", vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        // workers.dev: there is none, and switching it off is all there is to do
+        let (sc, b) = call(&mut app, "GET", &format!("{acct}/subdomain"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        assert_ne!(code(&b), json!(10007), "which would have wrangler offer to register one");
+        assert!(json_of(&b)["errors"][0]["message"].as_str().unwrap().contains("workers_dev = false"));
+        let (sc, b) = call(&mut app, "POST", &format!("{acct}/scripts/w1/subdomain"), br#"{"enabled":false,"previews_enabled":false}"#.to_vec()).await;
+        assert_eq!((sc, json_of(&b)["result"]["enabled"].clone()), (StatusCode::OK, json!(false)));
+        for body in [r#"{"enabled":true}"#, r#"{"enabled":false,"previews_enabled":true}"#, r#"{}"#, "not json"] {
+            let (sc, _) = call(&mut app, "POST", &format!("{acct}/scripts/w1/subdomain"), body.as_bytes().to_vec()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        // a Worker that is there: the versions API is refused with a 400 (not retried) that says what to do
+        for path in ["/scripts/w1/versions", "/scripts/w1/deployments"] {
+            let (sc, b) = call(&mut app, "POST", &format!("{acct}{path}"), br#"{"strategy":"percentage","versions":[]}"#.to_vec()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{path}");
+            assert!(json_of(&b)["errors"][0]["message"].as_str().unwrap().contains("PUT /workers/scripts/{name}"));
+        }
+        assert_eq!(st.store.get_worker("w1").unwrap().script.as_bytes(), js.as_slice());
+
+        // cron triggers: the same crons the settings hold
+        let (sc, b) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/schedules"), br#"[{"cron":"*/5 * * * *"},{"cron":"0 3 * * 1"}]"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(st.store.get_worker("w1").unwrap().crons, vec!["*/5 * * * *", "0 3 * * 1"]);
+        let (_, b) = call(&mut app, "GET", &format!("{acct}/scripts/w1/schedules"), vec![]).await;
+        assert_eq!(json_of(&b)["result"]["schedules"][1]["cron"], json!("0 3 * * 1"));
+        for body in [r#"[{"cron":"61 * * * *"}]"#, r#"{"cron":"* * * * *"}"#, r#"[{"cron":"* * * * *"},{"cron":"* * * * *"}]"#, "nope"] {
+            let (sc, _) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/schedules"), body.as_bytes().to_vec()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert_eq!(st.store.get_worker("w1").unwrap().crons.len(), 2, "a refused body changes nothing");
+        let (sc, _) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/schedules"), b"[]".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert!(st.store.get_worker("w1").unwrap().crons.is_empty());
+
+        // routes: replaced across zones, nobody else's touched
+        let com = st.store.create_zone("example.com").unwrap().id;
+        let net = st.store.create_zone("example.net").unwrap().id;
+        call(&mut app, "PUT", "/client/v4/workers/scripts/other", js.clone()).await;
+        let (sc, _) = call(&mut app, "POST", &format!("/client/v4/zones/{net}/workers/routes"), json!({ "pattern": "example.net/theirs/*", "script": "other" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let put_routes = |body: Value| body.to_string().into_bytes();
+        let (sc, b) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/routes"), put_routes(json!([{ "pattern": "example.com/*" }, { "pattern": "https://API.example.net/*" }]))).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let routes = json_of(&b)["result"].as_array().unwrap().clone();
+        assert_eq!(routes.len(), 2);
+        assert!(routes.iter().any(|r| r["pattern"] == "api.example.net/*" && r["zone_id"] == json!(net) && r["script"] == "w1"), "{routes:?}");
+        let com_route = st.store.items::<WorkerRoute>(&com).unwrap()[0].meta.id.clone();
+        let (sc, b) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/routes"), put_routes(json!([{ "pattern": "example.com/*" }]))).await;
+        assert_eq!((sc, json_of(&b)["result"].as_array().unwrap().len()), (StatusCode::OK, 1));
+        assert_eq!(st.store.items::<WorkerRoute>(&com).unwrap()[0].meta.id, com_route, "a route already there is kept, not made anew");
+        assert_eq!(st.store.items::<WorkerRoute>(&net).unwrap().len(), 1, "only the other script's is left there");
+        // refused bodies change nothing, wherever the refusal comes from
+        for (body, status) in [
+            (json!([{ "pattern": "example.com/*" }, { "pattern": "example.net/theirs/*" }]), StatusCode::CONFLICT),
+            (json!([{ "pattern": "example.org/*" }]), StatusCode::BAD_REQUEST),
+            (json!([{ "pattern": "example.com/*", "zone_id": net }]), StatusCode::BAD_REQUEST),
+            (json!([{ "pattern": "shop.example.com", "custom_domain": true }]), StatusCode::BAD_REQUEST),
+            (json!({ "pattern": "example.com/*" }), StatusCode::BAD_REQUEST),
+        ] {
+            let (sc, b) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/routes"), put_routes(body.clone())).await;
+            assert_eq!(sc, status, "{body}: {}", String::from_utf8_lossy(&b));
+            assert_eq!(st.store.items::<WorkerRoute>(&com).unwrap().len(), 1, "{body}");
+            assert_eq!(st.store.items::<WorkerRoute>(&net).unwrap()[0].script.as_deref(), Some("other"), "{body}");
+        }
+        let (sc, b) = call(&mut app, "PUT", &format!("{acct}/scripts/w1/routes"), b"[]".to_vec()).await;
+        assert_eq!((sc, json_of(&b)["result"].clone()), (StatusCode::OK, json!([])));
+        assert!(st.store.items::<WorkerRoute>(&com).unwrap().is_empty());
+        assert_eq!(st.store.items::<WorkerRoute>(&net).unwrap().len(), 1);
+
+        // users read these, but only administrators change them
+        let editor = signed_in_editor(&st, &mut app, "carol").await;
+        let as_editor = || vec![("authorization", editor.as_str()), ("content-type", "application/json")];
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("{acct}/services/w1"), as_editor(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        for (method, path, body) in [
+            ("POST", "/scripts/w1/subdomain", r#"{"enabled":false}"#),
+            ("PUT", "/scripts/w1/schedules", r#"[{"cron":"* * * * *"}]"#),
+            ("PUT", "/scripts/w1/routes", r#"[{"pattern":"example.com/*"}]"#),
+        ] {
+            let (sc, _, _) = call_raw(&mut app, method, &format!("{acct}{path}"), as_editor(), body.as_bytes().to_vec()).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        assert!(st.store.get_worker("w1").unwrap().crons.is_empty() && st.store.items::<WorkerRoute>(&com).unwrap().is_empty());
+
+        // an administrator's token: the Workers permission, and the routes permission in each zone touched
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let Login::Session(session, _) = st.accounts.login("admin@example.com", "strong-pass-123", &Client::default()).unwrap() else { panic!("expected signed in") };
+        let as_admin = format!("Bearer {session}");
+        let account = json!({ format!("com.cloudflare.api.account.{}", crate::tokens::account_id()): "*" });
+        let mut token = async |policies: Value| {
+            let spec = json!({ "name": "wrangler", "policies": policies });
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", vec![("authorization", &as_admin), ("content-type", "application/json")], spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let scripts_only = token(json!([{ "effect": "allow", "resources": account, "permission_groups": [{ "name": "Workers Scripts Write" }] }])).await;
+        let with_com = token(json!([
+            { "effect": "allow", "resources": account, "permission_groups": [{ "name": "Workers Scripts Write" }] },
+            { "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{com}"): "*" }, "permission_groups": [{ "name": "Workers Routes Write" }] },
+        ]))
+        .await;
+        let read_only = token(json!([{ "effect": "allow", "resources": account, "permission_groups": [{ "name": "Workers Scripts Read" }] }])).await;
+        let with = |bearer: &str| vec![("authorization", bearer.to_string()), ("content-type", "application/json".to_string())];
+        let mut ask = async |bearer: &str, method: &str, path: &str, body: &str| {
+            let h = with(bearer);
+            let (sc, _, b) = call_raw(&mut app, method, &format!("{acct}{path}"), h.iter().map(|(k, v)| (*k, v.as_str())).collect(), body.as_bytes().to_vec()).await;
+            (sc, b)
+        };
+        let (sc, b) = ask(&scripts_only, "PUT", "/scripts/w1/routes", r#"[{"pattern":"example.com/*"}]"#).await;
+        assert_eq!((sc, code(&b)), (StatusCode::FORBIDDEN, json!(10000)), "wrangler then goes zone by zone");
+        let (sc, b) = ask(&with_com, "PUT", "/scripts/w1/routes", r#"[{"pattern":"example.com/*"}]"#).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (sc, b) = ask(&with_com, "PUT", "/scripts/w1/routes", r#"[{"pattern":"example.com/*"},{"pattern":"www.example.net/*"}]"#).await;
+        assert_eq!((sc, code(&b)), (StatusCode::FORBIDDEN, json!(10000)));
+        assert!(st.store.items::<WorkerRoute>(&net).unwrap().iter().all(|r| r.script.as_deref() == Some("other")));
+        let (sc, _) = ask(&scripts_only, "PUT", "/scripts/w1/routes", "[]").await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "nor may it remove the routes of a zone it may not change");
+        assert_eq!(st.store.items::<WorkerRoute>(&com).unwrap().len(), 1);
+        let (sc, _) = ask(&read_only, "GET", "/services/w1", "").await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = ask(&read_only, "PUT", "/scripts/w1/schedules", "[]").await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_slash_on_an_api_path_is_the_same_path_and_still_only_its_owners() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-slash-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let zone = st.store.create_zone("example.com").unwrap().id;
+        st.store.create_zone("example.net").unwrap();
+
+        let (sc, b) = call(&mut app, "GET", "/client/v4/zones/?name=example.com", vec![]).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().len(), 1, "the query is kept");
+        let (_, plain) = call(&mut app, "GET", "/client/v4/zones", vec![]).await;
+        let (_, slashed) = call(&mut app, "GET", "/client/v4/zones/", vec![]).await;
+        assert_eq!(json_of(&plain)["result"], json_of(&slashed)["result"]);
+        for path in [
+            format!("/client/v4/zones/{zone}/"),
+            format!("/client/v4/zones/{zone}/dns_records/"),
+            format!("/client/v4/zones/{zone}/workers/routes//"),
+            format!("/client/v4/accounts/{}/workers/scripts/", crate::tokens::account_id()),
+            "/client/v4/user/tokens/".to_string(),
+            "/client/v4/kv/namespaces/".to_string(),
+            "/client/v4/nodes/".to_string(),
+        ] {
+            let (sc, b) = call(&mut app, "GET", &path, vec![]).await;
+            assert_eq!(sc, StatusCode::OK, "{path}: {}", String::from_utf8_lossy(&b));
+        }
+        let (sc, b) = call(&mut app, "POST", "/client/v4/zones/", json!({ "name": "example.org" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        // nothing else is made of it: the bare prefix, a KV key ending in a slash, a path that is not there
+        for path in ["/client/v4/", "/client/v4//", "/client/v4/no/such/path/"] {
+            let (sc, _) = call(&mut app, "GET", path, vec![]).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "{path}");
+        }
+        let (_, b) = call(&mut app, "POST", "/client/v4/kv/namespaces", br#"{"title":"t"}"#.to_vec()).await;
+        let ns = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let (sc, _) = call(&mut app, "PUT", &format!("/client/v4/kv/namespaces/{ns}/values/dir/"), b"v".to_vec()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "not the key 'dir'");
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/kv/namespaces/{ns}/values/dir"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // another user's zone is refused with the slash as without it
+        let alice = signed_in_editor(&st, &mut app, "alice").await;
+        let as_alice = || vec![("authorization", alice.as_str()), ("content-type", "application/json")];
+        let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/zones/", as_alice(), json!({ "name": "alice.test" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let mine = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        for path in [format!("/zones/{zone}/"), format!("/zones/{zone}/dns_records/"), format!("/zones/{zone}/settings/")] {
+            let (sc, _, b) = call_raw(&mut app, "GET", &format!("/client/v4{path}"), as_alice(), vec![]).await;
+            assert_eq!((sc, json_of(&b)["errors"][0]["code"].clone()), (StatusCode::NOT_FOUND, json!(1001)), "{path}");
+        }
+        let (sc, _, _) = call_raw(&mut app, "PATCH", &format!("/client/v4/zones/{zone}/"), as_alice(), json!({ "paused": true }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        assert!(!st.store.get_zone(&zone).unwrap().paused);
+        let (_, _, b) = call_raw(&mut app, "GET", "/client/v4/zones/", as_alice(), vec![]).await;
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().iter().map(|z| z["id"].clone()).collect::<Vec<_>>(), vec![json!(mine)]);
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{mine}/"), as_alice(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(dir);
     }
