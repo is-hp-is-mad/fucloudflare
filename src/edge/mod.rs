@@ -2212,6 +2212,8 @@ impl Edge {
             worker = route.and_then(|r| r.script.as_ref()).and_then(|name| snap.workers.get(name));
         }
 
+        // rate limits that count answers by their status need the request once the answer is there
+        let counted = zone.rate_limits.iter().any(|(r, _)| !r.status_codes.is_empty()).then(|| info.clone());
         let mut resp = match worker {
             Some(script) => {
                 if info.path == "/__scheduled" {
@@ -2245,6 +2247,9 @@ impl Edge {
             }
             None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc }).await?,
         };
+        if let Some(info) = &counted {
+            self.waf.answered(zone, info, resp.status().as_u16(), ray);
+        }
         // What the zone's settings add to an answer (rules may still change it).
         if ssl && settings.hsts_max_age > 0 {
             let subdomains = if settings.hsts_include_subdomains { "; includeSubDomains" } else { "" };

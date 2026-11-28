@@ -2667,6 +2667,8 @@ struct TelemetryPush {
     status: Value,
     #[serde(default)]
     rtt: HashMap<String, crate::rtt::Measure>,
+    #[serde(default)]
+    blocks: Vec<crate::edge::waf::Block>,
 }
 
 #[derive(Deserialize)]
@@ -2731,6 +2733,7 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
                     usage: tele.usage,
                     status: tele.status,
                     rtt: tele.rtt,
+                    blocks: tele.blocks,
                 },
                 true,
             );
@@ -2866,6 +2869,7 @@ async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
             usage: report.usage,
             status: report.status,
             rtt: Default::default(),
+            blocks: Default::default(),
         },
         true,
     );

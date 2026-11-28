@@ -45,6 +45,8 @@ pub struct Report {
     pub status: Value,
     /// What it measured of its visitors' round trips since its report before (see crate::rtt).
     pub rtt: HashMap<String, crate::rtt::Measure>,
+    /// The clients it put over a rate limit since its report before.
+    pub blocks: Vec<crate::edge::waf::Block>,
 }
 
 struct Kept {
@@ -140,6 +142,7 @@ impl Reports {
         self.stats.absorb(&report.node, &report.stats);
         self.waf.absorb(&report.node, report.events.clone());
         self.rtt.merge(&report.node, &report.rtt);
+        self.waf.absorb_blocks(&report.blocks);
         if latest && now.saturating_sub(report.at) < LIVE_SECS {
             self.fleet.heard(&report.node, &report.version, &report.build, &report.role);
             if let Some(usage) = report.usage.clone() {

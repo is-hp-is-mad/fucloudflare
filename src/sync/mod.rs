@@ -492,6 +492,7 @@ impl PeerSync {
             "usage": &usage,
             "status": status,
             "rtt": self.edge.rtt.take_changed(),
+            "blocks": self.edge.waf.take_blocks(),
         });
         Some((payload, Some((stats, events)), usage))
     }
