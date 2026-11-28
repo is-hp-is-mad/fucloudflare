@@ -17,6 +17,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 pub const MANAGED_BY: &str = "auto_firewall";
+pub const MANAGED_BY_NETWORKS: &str = "auto_firewall_networks";
+/// How long a surge keeps a zone in under attack mode after it was last seen.
+const SURGE_SECS: u64 = 3600;
 /// At most this many addresses in the rule (the latest bans are kept).
 const MAX_BANS: usize = 1000;
 const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -99,46 +102,144 @@ pub fn expression(bans: &BTreeMap<String, u64>) -> String {
     format!("ip.src in {{{}}}", bans.keys().cloned().collect::<Vec<_>>().join(" "))
 }
 
-/// Bring one zone's rule up to date. Returns how many addresses it holds.
-pub async fn update_zone(store: &Store, waf: &Waf, zone_id: &str, settings: &Settings, now: u64, spared: &HashSet<IpAddr>) -> Result<usize, crate::store::StoreError> {
-    let rules = store.items::<FirewallRule>(zone_id)?;
-    let mine = rules.iter().find(|r| r.managed_by == MANAGED_BY);
-    if !settings.auto_firewall {
-        if let Some(r) = mine {
-            store.delete_item_async::<FirewallRule>(zone_id, &r.meta.id).await?;
+/// The networks (ASNs) to challenge: those from which at least
+/// `auto_firewall_network_ips` different addresses attacked lately, counting
+/// only addresses that score as data centre, VPN or worse (a home ISP is
+/// never challenged as a whole).
+pub fn networks(events: &[Event], now: u64, settings: &Settings, current: &BTreeMap<String, u64>, spared: &HashSet<IpAddr>) -> BTreeMap<String, u64> {
+    let window = settings.auto_firewall_window.max(60) as u64;
+    let ban = settings.auto_firewall_ban.max(60) as u64;
+    let need = settings.auto_firewall_network_ips.max(2) as usize;
+    let mut by_asn: HashMap<i64, (HashSet<String>, u64)> = HashMap::new();
+    for e in events.iter().filter(|e| counts(e) && e.asn > 0 && e.threat >= 25) {
+        let Some(at) = secs(&e.occurred_at) else { continue };
+        if at + window < now || at > now + 60 {
+            continue;
         }
-        return Ok(0);
+        let Some(who) = culprit(&e.client_ip, spared) else { continue };
+        let slot = by_asn.entry(e.asn).or_default();
+        slot.0.insert(who);
+        slot.1 = slot.1.max(at);
     }
-    let current = mine.map(|r| r.auto_bans.clone()).unwrap_or_default();
-    let next = bans(&waf.events(zone_id, usize::MAX), now, settings, &current, spared);
-    let action = settings.auto_firewall_action.clone();
+    let mut out: BTreeMap<String, u64> = current.iter().filter(|(_, until)| **until > now).map(|(k, v)| (k.clone(), *v)).collect();
+    for (asn, (ips, last)) in by_asn {
+        if ips.len() >= need {
+            let slot = out.entry(format!("AS{asn}")).or_insert(0);
+            *slot = (*slot).max(last + ban);
+        }
+    }
+    out
+}
+
+/// How many different addresses attacked within the window.
+fn attackers(events: &[Event], now: u64, settings: &Settings, spared: &HashSet<IpAddr>) -> usize {
+    let window = settings.auto_firewall_window.max(60) as u64;
+    events
+        .iter()
+        .filter(|e| counts(e) && secs(&e.occurred_at).is_some_and(|at| at + window >= now))
+        .filter_map(|e| culprit(&e.client_ip, spared))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+pub fn network_expression(nets: &BTreeMap<String, u64>, spared: &HashSet<IpAddr>) -> String {
+    let asns: Vec<&str> = nets.keys().map(|k| k.trim_start_matches("AS")).collect();
+    let mut e = format!("ip.geoip.asnum in {{{}}}", asns.join(" "));
+    if !spared.is_empty() {
+        // the fleet's own nodes live in such networks too
+        let mut own: Vec<String> = spared.iter().map(IpAddr::to_string).collect();
+        own.sort();
+        e.push_str(&format!(" and not ip.src in {{{}}}", own.join(" ")));
+    }
+    e
+}
+
+/// Make the zone's rule kept by `managed_by` say what it should (or go, when there is nothing).
+#[allow(clippy::too_many_arguments)]
+async fn keep(
+    store: &Store,
+    zone_id: &str,
+    mine: Option<&FirewallRule>,
+    managed_by: &str,
+    entries: &BTreeMap<String, u64>,
+    expression: String,
+    action: &str,
+    description: String,
+    priority: i32,
+) -> Result<(), crate::store::StoreError> {
     match mine {
-        None if next.is_empty() => {}
-        Some(r) if next.is_empty() => store.delete_item_async::<FirewallRule>(zone_id, &r.meta.id).await?,
-        Some(r) if r.auto_bans == next && r.action == action && r.enabled => {}
+        None if entries.is_empty() => {}
+        Some(r) if entries.is_empty() => store.delete_item_async::<FirewallRule>(zone_id, &r.meta.id).await?,
+        Some(r) if r.auto_bans == *entries && r.action == action && r.expression == expression && r.enabled => {}
         _ => {
-            let added: Vec<&String> = next.keys().filter(|k| !current.contains_key(*k)).collect();
+            let before = mine.map(|r| r.auto_bans.clone()).unwrap_or_default();
+            let added: Vec<&String> = entries.keys().filter(|k| !before.contains_key(*k)).collect();
             if !added.is_empty() {
-                tracing::info!(zone = zone_id, added = ?added, total = next.len(), "automatic firewall: banning");
+                tracing::info!(zone = zone_id, managed_by, added = ?added, total = entries.len(), "automatic firewall");
             }
             let body = json!({
-                "expression": expression(&next),
+                "expression": expression,
                 "action": action,
-                "description": format!("自动封禁 · Auto-banned from security events ({} addresses)", next.len()),
+                "description": description,
                 "enabled": true,
-                "priority": 1000,
-                "managed_by": MANAGED_BY,
-                "auto_bans": next,
+                "priority": priority,
+                "managed_by": managed_by,
+                "auto_bans": entries,
             });
             store.save_item_async::<FirewallRule>(zone_id, mine.map(|r| r.meta.id.as_str()), body, true).await?;
         }
     }
-    Ok(next.len())
+    Ok(())
+}
+
+/// Bring one zone's automatic rules up to date: the addresses, the networks,
+/// and the security level during a surge. Returns how many addresses are banned.
+pub async fn update_zone(store: &Store, waf: &Waf, zone_id: &str, settings: &Settings, now: u64, spared: &HashSet<IpAddr>) -> Result<usize, crate::store::StoreError> {
+    let rules = store.items::<FirewallRule>(zone_id)?;
+    let events = if settings.auto_firewall { waf.events(zone_id, usize::MAX) } else { Vec::new() };
+    let on = settings.auto_firewall;
+
+    let ip_rule = rules.iter().find(|r| r.managed_by == MANAGED_BY);
+    let ips = if on { bans(&events, now, settings, &ip_rule.map(|r| r.auto_bans.clone()).unwrap_or_default(), spared) } else { BTreeMap::new() };
+    let what = format!("自动封禁 · Auto-banned from security events ({} addresses)", ips.len());
+    keep(store, zone_id, ip_rule, MANAGED_BY, &ips, expression(&ips), &settings.auto_firewall_action, what, 1000).await?;
+
+    let net_rule = rules.iter().find(|r| r.managed_by == MANAGED_BY_NETWORKS);
+    let nets = if on && settings.auto_firewall_networks {
+        networks(&events, now, settings, &net_rule.map(|r| r.auto_bans.clone()).unwrap_or_default(), spared)
+    } else {
+        BTreeMap::new()
+    };
+    let what = format!("自动人机验证 · Networks attacking from many addresses ({} networks)", nets.len());
+    keep(store, zone_id, net_rule, MANAGED_BY_NETWORKS, &nets, network_expression(&nets, spared), "managed_challenge", what, 1001).await?;
+
+    // a surge of attackers: under attack mode for an hour, then back to what it was
+    let surge = on && settings.auto_firewall_surge > 0 && attackers(&events, now, settings, spared) >= settings.auto_firewall_surge as usize;
+    if surge {
+        // (an under attack mode switched on by hand is left alone)
+        let ours = settings.auto_level_until > 0;
+        if settings.security_level != "under_attack" {
+            tracing::warn!(zone = zone_id, "automatic firewall: a surge of attackers, under attack mode for now");
+            store.update_setting_async(zone_id, "auto_level_restore", json!(settings.security_level)).await?;
+            store.update_setting_async(zone_id, "security_level", json!("under_attack")).await?;
+            store.update_setting_async(zone_id, "auto_level_until", json!(now + SURGE_SECS)).await?;
+        } else if ours && settings.auto_level_until < now + SURGE_SECS - 300 {
+            store.update_setting_async(zone_id, "auto_level_until", json!(now + SURGE_SECS)).await?;
+        }
+    } else if settings.auto_level_until > 0 && (settings.auto_level_until <= now || !on) {
+        if settings.security_level == "under_attack" && !settings.auto_level_restore.is_empty() {
+            tracing::info!(zone = zone_id, "automatic firewall: the surge is over, back to {}", settings.auto_level_restore);
+            store.update_setting_async(zone_id, "security_level", json!(settings.auto_level_restore)).await?;
+        }
+        store.update_setting_async(zone_id, "auto_level_until", json!(0)).await?;
+        store.update_setting_async(zone_id, "auto_level_restore", json!("")).await?;
+    }
+    Ok(ips.len())
 }
 
 /// Keep the automatic rules of all zones up to date (writable nodes only:
 /// they hold the events of the whole fleet).
-pub fn spawn(store: Arc<Store>, waf: Arc<Waf>) {
+pub fn spawn(store: Arc<Store>, waf: Arc<Waf>, reputation: Option<Arc<super::reputation::Reputation>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -156,12 +257,18 @@ pub fn spawn(store: Arc<Store>, waf: Arc<Waf>) {
                 .collect();
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             for zone in store.list_zones() {
-                let has_rule = || store.items::<FirewallRule>(&zone.id).is_ok_and(|r| r.iter().any(|r| r.managed_by == MANAGED_BY));
-                if !zone.settings.auto_firewall && !has_rule() {
+                let has_rule = || store.items::<FirewallRule>(&zone.id).is_ok_and(|r| r.iter().any(|r| r.managed_by.starts_with(MANAGED_BY)));
+                if !zone.settings.auto_firewall && !has_rule() && zone.settings.auto_level_until == 0 {
                     continue;
                 }
                 if let Err(e) = update_zone(&store, &waf, &zone.id, &zone.settings, now, &spared).await {
                     tracing::warn!(zone = %zone.name, "automatic firewall: {e:?}");
+                }
+                // what is banned here counts against an address everywhere (its threat score)
+                if let (Some(rep), Ok(rules)) = (&reputation, store.items::<FirewallRule>(&zone.id)) {
+                    for r in rules.iter().filter(|r| r.managed_by == MANAGED_BY) {
+                        rep.set_banned(r.auto_bans.clone());
+                    }
                 }
             }
         }
@@ -188,6 +295,8 @@ mod tests {
             method: "GET".into(),
             uri: "/".into(),
             user_agent: String::new(),
+            asn: 0,
+            threat: 0,
         }
     }
 
@@ -248,6 +357,51 @@ mod tests {
         // the ban runs out: the rule goes
         assert_eq!(update_zone(&store, &waf, &zone.id, &settings, now + 86_400 + 700, &none).await.unwrap(), 0);
         assert!(store.items::<FirewallRule>(&zone.id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn networks_attacking_from_many_addresses() {
+        let now = 1_800_000_000;
+        let settings = Settings { auto_firewall: true, auto_firewall_network_ips: 3, ..Settings::default() };
+        let mut events = Vec::new();
+        for i in 0..3 {
+            // a hosting network: three addresses, each a data centre one
+            events.push(Event { asn: 64500, threat: 30, ..event(&format!("8.8.8.{i}"), "managed", "block", now) });
+            // a home ISP: as many attackers, but clean addresses
+            events.push(Event { asn: 64501, threat: 0, ..event(&format!("9.9.9.{i}"), "managed", "block", now) });
+        }
+        events.push(Event { asn: 64502, threat: 80, ..event("7.7.7.7", "managed", "block", now) });
+        let spared: HashSet<IpAddr> = ["1.2.3.4".parse().unwrap()].into();
+        let nets = networks(&events, now, &settings, &BTreeMap::new(), &spared);
+        assert_eq!(nets.keys().collect::<Vec<_>>(), vec!["AS64500"]);
+        let e = network_expression(&nets, &spared);
+        assert_eq!(e, "ip.geoip.asnum in {64500} and not ip.src in {1.2.3.4}");
+        assert!(crate::expr::Expr::parse(&e).is_ok());
+        assert_eq!(attackers(&events, now, &settings, &spared), 7);
+    }
+
+    #[tokio::test]
+    async fn a_surge_means_under_attack_for_a_while() {
+        let dir = std::env::temp_dir().join(format!("fucf-autofw-surge-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("store.json"), vec![]).unwrap();
+        let zone = store.create_zone("example.com").unwrap();
+        store.update_setting(&zone.id, "auto_firewall", json!(true)).unwrap();
+        store.update_setting(&zone.id, "auto_firewall_surge", json!(5)).unwrap();
+        let waf = Waf::new();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        waf.absorb("eu", (0..5).map(|i| Event { zone_id: zone.id.clone(), ..event(&format!("8.8.4.{i}"), "managed", "block", now) }).collect());
+        let none = HashSet::new();
+        let settings = store.get_zone(&zone.id).unwrap().settings;
+        update_zone(&store, &waf, &zone.id, &settings, now, &none).await.unwrap();
+        let s = store.get_zone(&zone.id).unwrap().settings;
+        assert_eq!((s.security_level.as_str(), s.auto_level_restore.as_str()), ("under_attack", "medium"));
+        assert!(s.auto_level_until > now);
+        // an hour on, nobody attacking: back to what it was
+        update_zone(&store, &waf, &zone.id, &s, now + SURGE_SECS + 700, &none).await.unwrap();
+        let s = store.get_zone(&zone.id).unwrap().settings;
+        assert_eq!((s.security_level.as_str(), s.auto_level_until), ("medium", 0));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

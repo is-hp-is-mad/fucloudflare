@@ -176,7 +176,7 @@ pub struct Sample<'a> {
     pub zone_id: &'a str,
     pub version: hyper::Version,
     pub status: u16,
-    /// The response's `cf-cache-status`, when the request reached the cache logic.
+    /// The response's `fcf-cache-status`, when the request reached the cache logic.
     pub cache: Option<&'a str>,
     pub threat: bool,
     pub bytes: u64,
@@ -186,7 +186,7 @@ pub struct Sample<'a> {
     pub path: &'a str,
 }
 
-/// Was a response with this `cf-cache-status` served from the cache?
+/// Was a response with this `fcf-cache-status` served from the cache?
 pub fn served_from_cache(label: &str) -> bool {
     matches!(label, "HIT" | "REVALIDATED" | "STALE" | "UPDATING")
 }

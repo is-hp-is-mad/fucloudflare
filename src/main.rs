@@ -256,6 +256,12 @@ struct Args {
     #[arg(long = "ns", env = "FUCF_NS", value_delimiter = ',', default_value = "ns1.fucf.local,ns2.fucf.local")]
     name_servers: Vec<String>,
 
+    /// Score visitors' addresses by public block lists (FireHOL, Tor exits,
+    /// VPNs, data centres; fetched every 12 hours) for the security levels
+    /// and `fcf.threat_score` in rules.
+    #[arg(long, env = "FUCF_IP_REPUTATION", default_value_t = true, action = clap::ArgAction::Set)]
+    ip_reputation: bool,
+
     /// Where this node keeps its backups (default: `<data dir>/backups`).
     #[arg(long, env = "FUCF_BACKUP_DIR")]
     backup_dir: Option<PathBuf>,
@@ -728,6 +734,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let geo = Arc::new(geo::Geo::open(args.geoip_db.as_deref(), args.geoip_asn_db.as_deref())?.with_cn(&args.geoip_cn_db, args.geoip_db.as_deref())?);
     let _ = edge.geo.set(geo.clone());
+    if args.ip_reputation {
+        // threat scores of visitors' addresses (see edge::reputation)
+        let rep = Arc::new(edge::reputation::Reputation::new(Some(args.data_dir.join("reputation"))));
+        let _ = edge.reputation.set(rep.clone());
+        rep.spawn_refresh(edge.clone());
+    }
     tokio::spawn(gfw::run(gfw.clone(), geo.clone(), node_limits.clone(), args.edge_ips.clone()));
     let health = Arc::new(geo::Health::default());
     // Probing with a name of ours gets the check through an SNI-routing proxy.
@@ -909,7 +921,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if !accel {
         // bans from the security events (zones that switched it on)
-        edge::autofw::spawn(store.clone(), waf.clone());
+        edge::autofw::spawn(store.clone(), waf.clone(), edge.reputation.get().cloned());
     }
     let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {

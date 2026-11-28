@@ -178,7 +178,7 @@ jobs:
           api POST /zones/$ZONE/firewall/rules '{"expression":"http.request.uri.path eq \"/guarded-js\"","action":"js_challenge","description":"ci"}' >/dev/null
           api POST /zones/$ZONE/firewall/rules '{"expression":"http.request.uri.path eq \"/guarded-click\"","action":"managed_challenge","description":"ci"}' >/dev/null
           sleep 1
-          curl -s -D- -o /dev/null -H "Host: example.com" http://127.0.0.1:18080/guarded-click | grep -i "cf-mitigated: challenge" || { echo "no challenge"; exit 1; }
+          curl -s -D- -o /dev/null -H "Host: example.com" http://127.0.0.1:18080/guarded-click | grep -i "fcf-mitigated: challenge" || { echo "no challenge"; exit 1; }
           cd scripts/ui && node challenge-check.mjs http://example.com:18080 ../../shots
       - uses: actions/upload-artifact@v4
         if: always()

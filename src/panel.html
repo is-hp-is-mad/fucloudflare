@@ -908,12 +908,18 @@ const ZONE = {
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
       card("托管 WAF 规则集", "", setRow("规则集模式", "检测 SQL 注入、XSS、路径穿越等常见攻击特征。", sel("waf", z.settings.waf, [["block", "拦截"], ["log", "仅记录"], ["off", "关闭"]], "托管 WAF 规则集"))) +
+      card("安全级别", "", setRow("安全级别", "按访客 IP 的威胁分（IP 纯净度库：滥用名单、近期攻击、Tor、VPN、机房）决定谁要先过人机验证；级别越高，验证要做的计算越多、对可疑环境越不宽容。受攻击模式：所有人都要验证。", sel("security_level", z.settings.security_level, [["off", "关闭"], ["low", "简易：威胁分 ≥ 80"], ["medium", "中等：威胁分 ≥ 50"], ["high", "严格：威胁分 ≥ 25（含机房 IP）"], ["under_attack", "受攻击模式：所有人"]], "安全级别")) +
+        (z.settings.auto_level_until ? `<div class="note warn">自动防火墙检测到大量攻击，暂时开启了受攻击模式，到 ${when(new Date(z.settings.auto_level_until * 1000).toISOString())} 恢复为“${esc(z.settings.auto_level_restore)}”。</div>` : "") +
+        setRow("页面内人机验证脚本", "在站点的 HTML 页面里加一行脚本：空闲时在后台悄悄完成验证；页面里的 fetch 请求被要求验证时，就地弹出验证框，通过后自动重发，不用刷新页面。只在这个域名可能要求验证时才加。", sw("challenge_script", z.settings.challenge_script, "页面内人机验证脚本"))) +
       card("自动防火墙", "", setRow("根据安全事件自动封禁", "每 30 秒看一次最近的安全事件（托管规则命中、防火墙拦截、限速），短时间内攻击够多次的 IP 自动加进一条防火墙规则，到期自动解封；期间再攻击会续期。IPv6 按 /64 封。节点自己的 IP 和内网地址不会被封。规则可以在下面的防火墙规则里看到。",
           sw("auto_firewall", z.settings.auto_firewall, "自动防火墙")) +
         (z.settings.auto_firewall ? setRow("触发条件", "多长时间内攻击多少次就封。", nsel("auto_firewall_window", z.settings.auto_firewall_window, [[60, "1 分钟内"], [300, "5 分钟内"], [600, "10 分钟内"], [3600, "1 小时内"], [86400, "1 天内"]], "统计窗口") + " " +
             nsel("auto_firewall_threshold", z.settings.auto_firewall_threshold, [[3, "3 次"], [5, "5 次"], [10, "10 次"], [20, "20 次"], [50, "50 次"], [100, "100 次"]], "次数")) +
           setRow("封禁时长", "", nsel("auto_firewall_ban", z.settings.auto_firewall_ban, [[600, "10 分钟"], [3600, "1 小时"], [21600, "6 小时"], [86400, "1 天"], [604800, "7 天"], [2592000, "30 天"]], "封禁时长")) +
-          setRow("处理方式", "拦截：直接 403。人机验证：真人点一下还能进。", sel("auto_firewall_action", z.settings.auto_firewall_action, [["block", "拦截"], ["managed_challenge", "人机验证（点一下）"]], "处理方式")) : "")) +
+          setRow("处理方式", "拦截：直接 403。人机验证：真人点一下还能进。", sel("auto_firewall_action", z.settings.auto_firewall_action, [["block", "拦截"], ["managed_challenge", "人机验证（点一下）"]], "处理方式")) +
+          setRow("按网络（ASN）验证", "同一个网络里有很多机房 / VPN / 黑名单地址在攻击时，整个网络的访客都要先点一下人机验证（家庭宽带不会被整网处理；节点自己的 IP 除外）。", sw("auto_firewall_networks", z.settings.auto_firewall_networks, "按网络验证") + " " +
+            nsel("auto_firewall_network_ips", z.settings.auto_firewall_network_ips, [[3, "3 个地址"], [5, "5 个地址"], [10, "10 个地址"], [20, "20 个地址"], [50, "50 个地址"]], "地址数")) +
+          setRow("攻击潮时自动进入受攻击模式", "统计窗口内攻击地址数达到这个数，就自动开启受攻击模式一小时，攻击停了再恢复原来的级别。", nsel("auto_firewall_surge", z.settings.auto_firewall_surge, [[0, "不自动"], [20, "20 个地址"], [50, "50 个地址"], [100, "100 个地址"], [500, "500 个地址"]], "攻击潮")) : "")) +
       card("伪装子域", "", setRow("伪装子域", `开启后，${esc(z.name)} 下任何没有记录的子域都能解析（指向没有流量限制、其次流量配额最大的节点，不用仅加速节点），但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。已有的记录和通配记录不受影响。`, sw("decoy_subdomains", z.settings.decoy_subdomains, "伪装子域"))) +
       `<div class="note">按地区或运营商屏蔽：<code>ip.geoip.country in {"RU" "KP"}</code>　<code>ip.geoip.asnum eq 4134</code>　<code>ip.geoip.as_org contains "telecom"</code><span class="hint">要在 DNS 层面拒绝解析，使用账户主页的 <a href="#/steering">调度与 DNS 屏蔽</a>。</span></div>` +
       await ruleSection(z.id, "firewall") + await ruleSection(z.id, "rate") };
@@ -1845,7 +1851,11 @@ const A = {
       const rule = r.rule ? (r.rule.action === "block" ? `命中屏蔽规则 <b>${esc(r.rule.name)}</b>` : `命中规则 <b>${esc(r.rule.name)}</b>（优先级 ${r.rule.priority}）→ ${r.rule.nodes.map(n => `<span class="tag pri">${esc(n)}</span>`).join(" ")}`)
         : `没有命中任何规则 → 按大洲分配：${(r.continent_nodes || []).map(n => `<span class="tag">${esc(n)}</span>`).join(" ") || '<span class="hint">全部节点</span>'}`;
       const dbs = r.databases || {};
-      out.innerHTML = `<div>${chips(place)}</div><div style="margin-top:6px">${rule}</div>${dbs.cn_provinces ? "" : '<div class="hint" style="margin-top:6px">本节点没有加载 ip2region 省份库：中国大陆多数地址查不到省份，按省份的规则多半不会命中。</div>'}`;
+      const rep = r.reputation, asr = rep && rep.assessment;
+      const REP = { abuser: "滥用名单", attacker: "近期攻击", tor: "Tor 出口", vpn: "VPN", datacenter: "机房 / 云", banned_here: "本机群封禁过", verified_crawler: "已验证爬虫" };
+      const repLine = rep ? `<div style="margin-top:6px">威胁分 <b class="${asr.score >= 50 ? "st bad" : asr.score >= 25 ? "st warn" : "st ok"}">${asr.score}</b> / 100 ${asr.reasons.map(x => `<span class="tag">${esc(REP[x] || x)}</span>`).join(" ")}
+        <span class="hint">（纯净度库：${rep.lists.map(l => `${esc(l.name)} ${l.networks}`).join("，")}）</span></div>` : '<div class="hint" style="margin-top:6px">本节点没有开启 IP 纯净度库。</div>';
+      out.innerHTML = `<div>${chips(place)}</div><div style="margin-top:6px">${rule}</div>${repLine}${dbs.cn_provinces ? "" : '<div class="hint" style="margin-top:6px">本节点没有加载 ip2region 省份库：中国大陆多数地址查不到省份，按省份的规则多半不会命中。</div>'}`;
     } catch (ex) { out.innerHTML = `<span class="st bad">${esc(ex.message)}</span>`; }
   },
   workerEdit: async d => {

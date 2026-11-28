@@ -33,16 +33,114 @@ use std::net::IpAddr;
 
 /// Where the page sends its answer.
 pub const VERIFY_PATH: &str = "/cdn-cgi/challenge-platform/verify";
-/// Work for a browser: 2^17 hashes on average, a fraction of a second.
-const BITS: u8 = 17;
 /// How long a ticket may be answered.
 const TICKET_SECS: u64 = 600;
-/// Doubt at or above which a browser is taken for automation.
-const FAIL_SCORE: u32 = 5;
+
+/// The zone's security level (Cloudflare's names): who is challenged at all
+/// (by the threat score of their address, see super::reputation), how much
+/// work the browser does, and how much doubt it may leave before it has to
+/// click or fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Off,
+    Low,
+    Medium,
+    High,
+    UnderAttack,
+}
+
+impl Level {
+    pub fn of(setting: &str) -> Level {
+        match setting {
+            "off" | "essentially_off" => Level::Off,
+            "low" => Level::Low,
+            "high" => Level::High,
+            "under_attack" => Level::UnderAttack,
+            _ => Level::Medium,
+        }
+    }
+
+    fn code(self) -> char {
+        match self {
+            Level::Off => 'o',
+            Level::Low => 'l',
+            Level::Medium => 'm',
+            Level::High => 'h',
+            Level::UnderAttack => 'u',
+        }
+    }
+
+    fn from_code(c: &str) -> Option<Level> {
+        Some(match c {
+            "o" => Level::Off,
+            "l" => Level::Low,
+            "m" => Level::Medium,
+            "h" => Level::High,
+            "u" => Level::UnderAttack,
+            _ => return None,
+        })
+    }
+
+    /// Work for a browser: 2^17 hashes on average is a fraction of a second.
+    pub fn bits(self) -> u8 {
+        match self {
+            Level::High => 18,
+            Level::UnderAttack => 19,
+            _ => 17,
+        }
+    }
+
+    /// Doubt at or above which a browser is taken for automation.
+    fn fail_score(self) -> u32 {
+        match self {
+            Level::Off | Level::Low => 8,
+            Level::Medium => 5,
+            Level::High | Level::UnderAttack => 4,
+        }
+    }
+
+    /// Doubt above which a click is asked for.
+    fn click_above(self) -> u32 {
+        match self {
+            Level::Off | Level::Low => 2,
+            _ => 0,
+        }
+    }
+
+    /// Is a visitor with this threat score challenged, and must they click?
+    /// (`None`: let through.)
+    pub fn challenge(self, threat: i64) -> Option<bool> {
+        match self {
+            Level::Off => None,
+            Level::Low => (threat >= 80).then_some(false),
+            Level::Medium => (threat >= 50).then_some(threat >= 80),
+            Level::High => (threat >= 25).then_some(threat >= 50),
+            Level::UnderAttack => Some(threat >= 50),
+        }
+    }
+}
 /// The answer is small; anything larger is not ours.
 const MAX_ANSWER: usize = 32 * 1024;
 
-const SCRIPT: &str = include_str!("challenge.js");
+/// The challenge page's script: what the page and the injected script share, then the page's own part.
+const SCRIPT: &str = concat!(include_str!("challenge-core.js"), include_str!("challenge-page.js"));
+/// What is put into a site's pages (`/cdn-cgi/challenge-platform/fcf.js`).
+const INJECTED: &str = concat!(include_str!("challenge-core.js"), include_str!("challenge-inject.js"));
+
+/// `/cdn-cgi/challenge-platform/fcf.js`.
+pub fn injected_script() -> Response<Body> {
+    let mut resp = Response::new(full(INJECTED));
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    resp
+}
+
+/// `/cdn-cgi/challenge-platform/ticket`: a ticket for passing quietly (no click asked).
+pub fn ticket_answer(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, level: Level) -> Response<Body> {
+    answer(StatusCode::OK, config(waf, zone_id, ip, ua, false, level))
+}
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -62,16 +160,22 @@ pub struct Ticket {
     pub bits: u8,
     pub click: bool,
     pub nonce: String,
+    pub level: Level,
 }
 
 impl Ticket {
+    #[cfg(test)]
     pub fn new(zone: &str, ip: IpAddr, ua: &str, click: bool) -> Ticket {
+        Ticket::at(zone, ip, ua, click, Level::Medium)
+    }
+
+    pub fn at(zone: &str, ip: IpAddr, ua: &str, click: bool, level: Level) -> Ticket {
         let nonce = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-        Ticket { zone: zone.to_string(), ip, ua: ua_digest(ua), issued: now(), bits: BITS, click, nonce }
+        Ticket { zone: zone.to_string(), ip, ua: ua_digest(ua), issued: now(), bits: level.bits(), click, nonce, level }
     }
 
     fn payload(&self) -> String {
-        format!("1|{}|{}|{}|{}|{}|{}|{}", self.zone, self.ip, self.ua, self.issued, self.bits, self.click as u8, self.nonce)
+        format!("2|{}|{}|{}|{}|{}|{}|{}|{}", self.zone, self.ip, self.ua, self.issued, self.bits, self.click as u8, self.nonce, self.level.code())
     }
 
     pub fn seal(&self, waf: &Waf) -> String {
@@ -87,9 +191,11 @@ impl Ticket {
             return None;
         }
         let f: Vec<&str> = payload.split('|').collect();
-        if f.len() != 8 || f[0] != "1" {
-            return None;
-        }
+        let level = match (f.len(), f.first().copied()) {
+            (8, Some("1")) => Level::Medium,
+            (9, Some("2")) => Level::from_code(f[8])?,
+            _ => return None,
+        };
         Some(Ticket {
             zone: f[1].to_string(),
             ip: f[2].parse().ok()?,
@@ -98,6 +204,7 @@ impl Ticket {
             bits: f[5].parse().ok()?,
             click: f[6] == "1",
             nonce: f[7].to_string(),
+            level,
         })
     }
 }
@@ -115,10 +222,52 @@ pub fn work_done(sealed: &str, n: u64, bits: u8) -> bool {
     zeros >= bits as u32
 }
 
+/// What the page (or the script injected into a site's pages) is told: the
+/// sealed ticket, the work, whether to ask for a click, where to answer.
+pub fn config(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, click: bool, level: Level) -> Value {
+    let ticket = Ticket::at(zone_id, ip, ua, click, level);
+    json!({ "t": ticket.seal(waf), "b": ticket.bits, "c": click, "v": VERIFY_PATH })
+}
+
+/// The answer to a request that is not a page load (fetch, XHR, an API
+/// client): JSON instead of a page, with `fcf-mitigated: challenge` and what
+/// the injected script needs to settle it without leaving the page.
+pub fn for_script(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, click: bool, level: Level, ray: &str) -> Response<Body> {
+    let body = json!({
+        "success": false,
+        "errors": [{ "code": 1020, "message": "a human check is needed: load the page in a browser, or pass the challenge" }],
+        "challenge": config(waf, zone_id, ip, ua, click, level),
+        "ray": ray,
+    });
+    let mut resp = answer(StatusCode::FORBIDDEN, body);
+    resp.headers_mut().insert("fcf-mitigated", HeaderValue::from_static("challenge"));
+    resp.headers_mut().insert("fcf-challenge", HeaderValue::from_static(VERIFY_PATH));
+    resp
+}
+
+/// Is this request a page load (rather than fetch / XHR / an API client)?
+pub fn is_navigation(headers: &HeaderMap) -> bool {
+    let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    if !h("x-requested-with").is_empty() {
+        return false;
+    }
+    match h("sec-fetch-mode") {
+        // older browsers and plain clients: by what they accept
+        "" => h("accept").is_empty() || h("accept").contains("text/html"),
+        mode => mode == "navigate",
+    }
+}
+
 /// The challenge page for a visitor of `zone_id`.
+#[cfg(test)]
 pub fn page(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, click: bool, ray: &str, lang: Lang, colo: &str) -> Response<Body> {
-    let ticket = Ticket::new(zone_id, ip, ua, click).seal(waf);
-    let config = json!({ "t": ticket, "b": BITS, "c": click, "v": VERIFY_PATH }).to_string();
+    page_at(waf, zone_id, ip, ua, click, ray, lang, colo, Level::Medium)
+}
+
+/// The challenge page, at a security level.
+#[allow(clippy::too_many_arguments)]
+pub fn page_at(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, click: bool, ray: &str, lang: Lang, colo: &str, level: Level) -> Response<Body> {
+    let config = config(waf, zone_id, ip, ua, click, level).to_string();
     let (html_lang, lang) = match lang {
         Lang::En => ("en", "en"),
         Lang::Zh => ("zh-CN", "zh"),
@@ -166,7 +315,7 @@ pub fn page(waf: &Waf, zone_id: &str, ip: IpAddr, ua: &str, click: bool, ray: &s
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-store, max-age=0"));
     h.insert(header::VARY, HeaderValue::from_static("Accept-Language"));
     // what Cloudflare sends with a challenge: clients that cannot run it can tell
-    h.insert("cf-mitigated", HeaderValue::from_static("challenge"));
+    h.insert("fcf-mitigated", HeaderValue::from_static("challenge"));
     resp
 }
 
@@ -202,7 +351,44 @@ pub enum Outcome {
 /// Judge what a browser sent (`answer`: the page's report) together with the
 /// headers of its request. `clicked`: the report comes with a click.
 /// Returns the outcome, the doubt score and what added to it.
+#[cfg(test)]
 pub fn assess(answer: &Value, headers: &HeaderMap, ssl: bool, clicked: bool) -> (Outcome, u32, Vec<&'static str>) {
+    assess_at(answer, headers, ssl, clicked, Level::Medium)
+}
+
+/// The JavaScript engine a User-Agent claims: `v8`, `sm` (Firefox) or `jsc` (Safari, and everything on iOS).
+fn claimed_engine(ua: &str) -> Option<&'static str> {
+    if ua.contains("iPhone") || ua.contains("iPad") || ua.contains("iPod") {
+        return Some("jsc");
+    }
+    if ua.contains("Firefox/") {
+        Some("sm")
+    } else if ua.contains("Chrome/") || ua.contains("Chromium/") || ua.contains("Edg/") {
+        Some("v8")
+    } else if ua.contains("Safari/") && ua.contains("Version/") {
+        Some("jsc")
+    } else {
+        None
+    }
+}
+
+/// The platform `navigator.platform` should name for a User-Agent, as a test.
+fn platform_fits(ua: &str, platform: &str) -> bool {
+    let p = platform.to_ascii_lowercase();
+    if ua.contains("Windows") {
+        p.starts_with("win")
+    } else if ua.contains("iPhone") || ua.contains("iPad") {
+        p.starts_with("iphone") || p.starts_with("ipad") || p.starts_with("macintel")
+    } else if ua.contains("Macintosh") {
+        p.starts_with("mac")
+    } else if ua.contains("Android") || ua.contains("Linux") || ua.contains("CrOS") {
+        p.contains("linux") || p.contains("android") || p.starts_with("arm") || p.contains("cros")
+    } else {
+        true
+    }
+}
+
+pub fn assess_at(answer: &Value, headers: &HeaderMap, ssl: bool, clicked: bool, level: Level) -> (Outcome, u32, Vec<&'static str>) {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default();
     let ua = header("user-agent");
     let s = &answer["s"];
@@ -224,6 +410,13 @@ pub fn assess(answer: &Value, headers: &HeaderMap, ssl: bool, clicked: bool) -> 
     }
     if s["ua"].as_str() != Some(ua) {
         return fail("user_agent_mismatch", why);
+    }
+    // what a page's frames and workers say must be what the page says (spoofing only the top is common)
+    if s["ifr"].as_str().is_some_and(|f| f != ua) || s["wk"].as_str().is_some_and(|w| w != ua) {
+        return fail("user_agent_spoofed", why);
+    }
+    if s["ifwd"] == true {
+        return fail("webdriver", why);
     }
     if clicked {
         let c = &answer["c"];
@@ -297,10 +490,63 @@ pub fn assess(answer: &Value, headers: &HeaderMap, ssl: bool, clicked: bool) -> 
     if clicked && answer["c"]["pt"] == "mouse" && answer["ev"]["moves"].as_u64() == Some(0) {
         doubt(2, "click_without_moving");
     }
+    // the engine behind the page, from how it words errors and prints functions
+    if let (Some(claimed), Some(seen)) = (claimed_engine(ua), s["eng"].as_str()) {
+        if claimed != seen {
+            doubt(4, "engine_mismatch");
+        }
+    }
+    if let Some(len) = s["evl"].as_i64() {
+        let expected = match claimed_engine(ua) {
+            Some("sm") => Some(37),
+            Some("v8") | Some("jsc") => Some(33),
+            _ => None,
+        };
+        if expected.is_some_and(|e| e != len) {
+            doubt(2, "native_code_mismatch");
+        }
+    }
+    if s["plat"].as_str().is_some_and(|p| !platform_fits(ua, p)) {
+        doubt(3, "platform_mismatch");
+    }
+    let mobile = ua.contains("Mobile") || ua.contains("Android") || ua.contains("iPhone");
+    if mobile && s["touch"].as_i64() == Some(0) {
+        doubt(2, "mobile_without_touch");
+    }
+    if s["cnv"] == false {
+        // the same drawing twice, two different pictures: canvas noise of an anti-detect browser
+        doubt(2, "canvas_noise");
+    }
+    if !mobile && desktop_chromium && win(0).is_some() && win(0) == win(2) && win(1) == win(3) && win(1).unwrap_or(0) > 0 {
+        // a desktop browser window has toolbars: outer taller than inner
+        doubt(1, "window_without_toolbars");
+    }
+    if desktop_chromium && ssl && headers.get("sec-fetch-site").is_none() && headers.get("sec-fetch-mode").is_none() {
+        doubt(2, "no_fetch_metadata");
+    }
+    if s["dev"].as_i64() == Some(0) && desktop_chromium {
+        doubt(1, "no_media_devices");
+    }
+    if let (Some(n), Some(ms)) = (answer["n"].as_u64(), answer["ms"].as_u64()) {
+        // a page's script does well under a few million hashes a second: faster work was done elsewhere
+        if n > 20_000 && ms * 5_000 < n {
+            doubt(3, "work_off_page");
+        }
+    }
+    if answer["ev"]["lin"] == true {
+        doubt(2, "linear_pointer");
+    }
+    let first_lang = header("accept-language").split([',', ';']).next().unwrap_or("").trim().to_ascii_lowercase();
+    if let Some(l0) = s["l0"].as_str() {
+        let l0 = l0.to_ascii_lowercase();
+        if !first_lang.is_empty() && !l0.is_empty() && first_lang.split('-').next() != l0.split('-').next() {
+            doubt(1, "language_mismatch");
+        }
+    }
 
-    let outcome = if score >= FAIL_SCORE {
+    let outcome = if score >= level.fail_score() {
         Outcome::Fail("automated")
-    } else if score > 0 && !clicked {
+    } else if score > level.click_above() && !clicked {
         Outcome::NeedClick
     } else {
         Outcome::Pass
@@ -371,7 +617,7 @@ fn judge(waf: &Waf, ip: IpAddr, ssl: bool, headers: &HeaderMap, report: &Value, 
     if ticket.click && !clicked {
         return answer(StatusCode::OK, json!({ "ok": false, "need": "click" }));
     }
-    let (outcome, score, why) = assess(report, headers, ssl, clicked);
+    let (outcome, score, why) = assess_at(report, headers, ssl, clicked, ticket.level);
     tracing::info!(%ray, client = %ip, score, clicked, signals = ?why, "challenge answer: {outcome:?}");
     match outcome {
         Outcome::Pass => {
@@ -403,6 +649,8 @@ mod tests {
         h.insert(header::USER_AGENT, HeaderValue::from_static(CHROME));
         h.insert("sec-ch-ua", HeaderValue::from_static("\"Chromium\";v=\"131\", \"Google Chrome\";v=\"131\""));
         h.insert(header::ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"));
+        h.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
         h
     }
 
@@ -457,6 +705,50 @@ mod tests {
     }
 
     #[test]
+    fn spoofed_browsers_give_themselves_away() {
+        let h = chrome_headers();
+        let with = |k: &str, v: Value| {
+            let mut a = person();
+            a["s"][k] = v;
+            a
+        };
+        assert_eq!(assess(&with("eng", json!("v8")), &h, true, false).0, Outcome::Pass);
+        assert_eq!(assess(&with("eng", json!("sm")), &h, true, false), (Outcome::NeedClick, 4, vec!["engine_mismatch"]));
+        assert_eq!(assess(&with("plat", json!("Linux x86_64")), &h, true, false).2, vec!["platform_mismatch"]);
+        assert_eq!(assess(&with("plat", json!("Win32")), &h, true, false).0, Outcome::Pass);
+        assert_eq!(assess(&with("ifr", json!("Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/131")), &h, true, false).0, Outcome::Fail("user_agent_spoofed"));
+        assert_eq!(assess(&with("cnv", json!(false)), &h, true, false).2, vec!["canvas_noise"]);
+        let mut fast = person();
+        fast["n"] = json!(400_000);
+        fast["ms"] = json!(3);
+        assert_eq!(assess(&fast, &h, true, false).2, vec!["work_off_page"]);
+        // the level decides how much doubt is too much
+        let doubtful = with("eng", json!("sm"));
+        assert_eq!(assess_at(&doubtful, &h, true, false, Level::High).0, Outcome::Fail("automated"));
+        assert_eq!(assess_at(&with("plat", json!("Linux x86_64")), &h, true, false, Level::Low).0, Outcome::NeedClick);
+        assert_eq!(assess_at(&with("cnv", json!(false)), &h, true, false, Level::Low).0, Outcome::Pass);
+        assert_eq!(Level::Medium.challenge(30), None);
+        assert_eq!(Level::High.challenge(30), Some(false));
+        assert_eq!(Level::Medium.challenge(85), Some(true));
+        assert_eq!(Level::UnderAttack.challenge(0), Some(false));
+        assert_eq!(Level::Off.challenge(100), None);
+        let waf = Waf::new();
+        let t = Ticket::at("z", "198.51.100.7".parse().unwrap(), CHROME, false, Level::High);
+        let opened = Ticket::open(&waf, &t.seal(&waf)).unwrap();
+        assert_eq!((opened.level, opened.bits), (Level::High, 18));
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+        assert!(is_navigation(&nav));
+        nav.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+        assert!(!is_navigation(&nav));
+        let mut old = HeaderMap::new();
+        old.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        assert!(!is_navigation(&old));
+        let r = for_script(&waf, "z", "198.51.100.7".parse().unwrap(), CHROME, true, Level::Medium, "ray");
+        assert_eq!((r.status(), r.headers().get("fcf-mitigated").unwrap().to_str().unwrap()), (StatusCode::FORBIDDEN, "challenge"));
+    }
+
+    #[test]
     fn a_click_settles_doubt_when_it_is_a_real_one() {
         let h = chrome_headers();
         let mut a = person();
@@ -498,6 +790,6 @@ mod tests {
         let waf = Waf::new();
         let r = page(&waf, "z", "198.51.100.7".parse().unwrap(), CHROME, true, "ray1", Lang::Zh, "SIN");
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        assert_eq!(r.headers().get("cf-mitigated").unwrap(), "challenge");
+        assert_eq!(r.headers().get("fcf-mitigated").unwrap(), "challenge");
     }
 }

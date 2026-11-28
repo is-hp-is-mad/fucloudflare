@@ -69,6 +69,16 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
                 return (axum::http::StatusCode::from_u16(status).unwrap(), [("etag", "\"v1\""), ("cache-control", "public, max-age=1")], body)
                     .into_response();
             }
+            if path.contains("page.html") {
+                let html = "<!doctype html><html><HEAD><title>t</title></HEAD><body>hello</body></html>";
+                if path.contains("gz") {
+                    use std::io::Write;
+                    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    gz.write_all(html.as_bytes()).unwrap();
+                    return ([("content-type", "text/html; charset=utf-8"), ("content-encoding", "gzip"), ("cf-ray", "abc-SIN")], gz.finish().unwrap()).into_response();
+                }
+                return ([("content-type", "text/html; charset=utf-8"), ("cf-ray", "abc-SIN")], html).into_response();
+            }
             if path.contains("big") {
                 return ([("content-type", "text/plain; charset=utf-8")], "compress me ".repeat(500)).into_response();
             }
@@ -184,7 +194,7 @@ async fn proxies_to_origin() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("origin=main GET /hello?a=1 host=example.com xff=127.0.0.1 ip=127.0.0.1 proto=http"), "{}", r.body);
     assert_eq!(r.header("server"), Some("fucf"));
-    assert_eq!(r.header("cf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(r.header("fcf-cache-status"), Some("DYNAMIC"));
     assert_eq!(r.header("fucf-ray").map(str::len), Some(16));
 
     // request bodies and an existing X-Forwarded-For chain are passed on
@@ -283,42 +293,42 @@ async fn records_carry_their_own_origin_options() {
 async fn caches_static_content() {
     let env = setup().await;
     let first = get(&env, "example.com", "/assets/app.js?v=1").await;
-    assert_eq!((first.status, first.header("cf-cache-status")), (200, Some("MISS")));
+    assert_eq!((first.status, first.header("fcf-cache-status")), (200, Some("MISS")));
     let second = get(&env, "example.com", "/assets/app.js?v=1").await;
-    assert_eq!(second.header("cf-cache-status"), Some("HIT"));
+    assert_eq!(second.header("fcf-cache-status"), Some("HIT"));
     assert!(second.header("age").is_some());
     // every response tells whether it came from the cache
     assert!(first.header("x-cache").is_some_and(|v| v.starts_with("MISS from ")), "{}", first.head);
     assert!(second.header("x-cache").is_some_and(|v| v.starts_with("HIT from ")), "{}", second.head);
     let own = get(&env, "nowhere.test", "/").await;
-    assert_eq!((own.status, own.header("cf-cache-status")), (404, Some("NONE")));
+    assert_eq!((own.status, own.header("fcf-cache-status")), (404, Some("NONE")));
     assert!(own.header("x-cache").is_some_and(|v| v.starts_with("MISS from ")));
     assert_eq!(first.body, second.body);
     assert_eq!(env.hits.load(Ordering::SeqCst), 1);
 
     // different query string / host = different object; HEAD is served from cache without a body
-    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("cf-cache-status"), Some("MISS"));
-    assert_eq!(get(&env, "www.example.com", "/assets/app.js?v=1").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("fcf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "www.example.com", "/assets/app.js?v=1").await.header("fcf-cache-status"), Some("MISS"));
     let head = send(&env, "HEAD", "example.com", "/assets/app.js?v=1", "", "").await;
-    assert_eq!((head.header("cf-cache-status"), head.body.as_str()), (Some("HIT"), ""));
+    assert_eq!((head.header("fcf-cache-status"), head.body.as_str()), (Some("HIT"), ""));
 
     // not cached: dynamic paths, private responses, authorized requests, non-GET
-    assert_eq!(get(&env, "example.com", "/api/data").await.header("cf-cache-status"), Some("DYNAMIC"));
-    assert_eq!(get(&env, "example.com", "/private/a.css").await.header("cf-cache-status"), Some("BYPASS"));
-    assert_eq!(get(&env, "example.com", "/private/a.css").await.header("cf-cache-status"), Some("BYPASS"));
+    assert_eq!(get(&env, "example.com", "/api/data").await.header("fcf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(get(&env, "example.com", "/private/a.css").await.header("fcf-cache-status"), Some("BYPASS"));
+    assert_eq!(get(&env, "example.com", "/private/a.css").await.header("fcf-cache-status"), Some("BYPASS"));
     let auth = send(&env, "GET", "example.com", "/assets/app.js?v=1", "Authorization: Bearer x\r\n", "").await;
-    assert_eq!(auth.header("cf-cache-status"), Some("DYNAMIC"));
-    assert_eq!(send(&env, "POST", "example.com", "/assets/app.js?v=1", "", "").await.header("cf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(auth.header("fcf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(send(&env, "POST", "example.com", "/assets/app.js?v=1", "", "").await.header("fcf-cache-status"), Some("DYNAMIC"));
 
     // purge by URL, then everything
     assert_eq!(env.edge.cache.purge_urls(&env.zone, &["https://example.com/assets/app.js?v=1".into()], false), 1);
-    assert_eq!(get(&env, "example.com", "/assets/app.js?v=1").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/assets/app.js?v=1").await.header("fcf-cache-status"), Some("MISS"));
     assert_eq!(env.edge.cache.purge_zone(&env.zone), 3);
-    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("fcf-cache-status"), Some("MISS"));
 
     // development mode bypasses the cache entirely
     env.store.update_setting(&env.zone, "development_mode", json!("on")).unwrap();
-    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("cf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(get(&env, "example.com", "/assets/app.js?v=2").await.header("fcf-cache-status"), Some("DYNAMIC"));
 }
 
 #[tokio::test]
@@ -386,7 +396,7 @@ async fn rate_limits_and_challenges() {
         .unwrap();
     let page = get(&env, "example.com", "/shop").await;
     assert!(page.status == 403 && page.body.contains("Checking your browser"));
-    assert_eq!(page.header("cf-mitigated"), Some("challenge"));
+    assert_eq!(page.header("fcf-mitigated"), Some("challenge"));
     assert!(!page.body.contains("fucf_clearance="), "the clearance is never in the page");
     let forged = send(&env, "GET", "example.com", "/shop", "Cookie: fucf_clearance=9999999999.abcd\r\n", "").await;
     assert_eq!(forged.status, 403);
@@ -679,7 +689,7 @@ async fn serves_http2() {
     let (a, b) = tokio::join!(sender.clone().send_request(req("GET", "/h2/a.js", "")), sender.send_request(req("POST", "/h2/form", "k=v")));
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!((a.version(), a.status()), (hyper::Version::HTTP_2, StatusCode::OK));
-    assert_eq!(a.headers()["cf-cache-status"], "MISS");
+    assert_eq!(a.headers()["fcf-cache-status"], "MISS");
     assert!(a.headers()["alt-svc"].to_str().unwrap().starts_with("h3=\":"), "HTTPS responses advertise HTTP/3");
     let text = |r: Response<Incoming>| async { String::from_utf8(r.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap() };
     assert!(text(a).await.contains("GET /h2/a.js host=example.com") );
@@ -723,8 +733,8 @@ async fn serves_http3() {
     // request bodies, the cache and the WAF all work over HTTP/3
     let (_, body) = call("POST", "/h3/submit", "payload-over-quic").await;
     assert!(body.ends_with("body=payload-over-quic"), "{body}");
-    assert_eq!(call("GET", "/h3/app.css", "").await.0.headers()["cf-cache-status"], "MISS");
-    assert_eq!(call("GET", "/h3/app.css", "").await.0.headers()["cf-cache-status"], "HIT");
+    assert_eq!(call("GET", "/h3/app.css", "").await.0.headers()["fcf-cache-status"], "MISS");
+    assert_eq!(call("GET", "/h3/app.css", "").await.0.headers()["fcf-cache-status"], "HIT");
     let (resp, body) = call("GET", "/h3/?q=%3Cscript%3Ealert(1)%3C/script%3E", "").await;
     assert!(resp.status() == StatusCode::FORBIDDEN && body.contains("Access denied"));
 }
@@ -765,25 +775,25 @@ async fn redirect_transform_and_cache_rules() {
     let cache = |v| env.store.save_item::<CacheRule>(&env.zone, None, v, true).unwrap();
     cache(json!({ "expression": "starts_with(http.request.uri.path, \"/pages/\")", "cache": true, "edge_ttl": 300 }));
     cache(json!({ "expression": "starts_with(http.request.uri.path, \"/assets/live/\")", "cache": false }));
-    assert_eq!(get(&env, "example.com", "/pages/home").await.header("cf-cache-status"), Some("MISS"));
-    assert_eq!(get(&env, "example.com", "/pages/home").await.header("cf-cache-status"), Some("HIT"));
+    assert_eq!(get(&env, "example.com", "/pages/home").await.header("fcf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/pages/home").await.header("fcf-cache-status"), Some("HIT"));
     // edge_ttl overrides an origin that says "private"
-    assert_eq!(get(&env, "example.com", "/pages/private").await.header("cf-cache-status"), Some("MISS"));
-    assert_eq!(get(&env, "example.com", "/pages/private").await.header("cf-cache-status"), Some("HIT"));
-    assert_eq!(get(&env, "example.com", "/assets/live/feed.js").await.header("cf-cache-status"), Some("BYPASS"));
-    assert_eq!(get(&env, "example.com", "/assets/live/feed.js").await.header("cf-cache-status"), Some("BYPASS"));
-    assert_eq!(get(&env, "example.com", "/assets/other.js").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/pages/private").await.header("fcf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/pages/private").await.header("fcf-cache-status"), Some("HIT"));
+    assert_eq!(get(&env, "example.com", "/assets/live/feed.js").await.header("fcf-cache-status"), Some("BYPASS"));
+    assert_eq!(get(&env, "example.com", "/assets/live/feed.js").await.header("fcf-cache-status"), Some("BYPASS"));
+    assert_eq!(get(&env, "example.com", "/assets/other.js").await.header("fcf-cache-status"), Some("MISS"));
 }
 
 #[tokio::test]
 async fn revalidates_and_answers_conditional_requests() {
     let env = setup().await;
     let first = get(&env, "example.com", "/etag/doc").await;
-    assert_eq!((first.status, first.header("cf-cache-status"), first.body.as_str()), (200, Some("MISS"), "etag-body hit=1"));
+    assert_eq!((first.status, first.header("fcf-cache-status"), first.body.as_str()), (200, Some("MISS"), "etag-body hit=1"));
 
     // a client that already has the object gets 304 straight from the cache
     let cond = send(&env, "GET", "example.com", "/etag/doc", "If-None-Match: W/\"v1\"\r\n", "").await;
-    assert_eq!((cond.status, cond.header("cf-cache-status"), cond.body.as_str()), (304, Some("HIT"), ""));
+    assert_eq!((cond.status, cond.header("fcf-cache-status"), cond.body.as_str()), (304, Some("HIT"), ""));
     let other = send(&env, "GET", "example.com", "/etag/doc", "If-None-Match: \"v0\"\r\n", "").await;
     assert_eq!((other.status, other.body.as_str()), (200, "etag-body hit=1"));
     assert_eq!(env.hits.load(Ordering::SeqCst), 1);
@@ -791,9 +801,9 @@ async fn revalidates_and_answers_conditional_requests() {
     // once stale, the edge revalidates with the origin (a 304 without body) and keeps serving its copy
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let again = get(&env, "example.com", "/etag/doc").await;
-    assert_eq!((again.status, again.header("cf-cache-status"), again.body.as_str()), (200, Some("REVALIDATED"), "etag-body hit=1"));
+    assert_eq!((again.status, again.header("fcf-cache-status"), again.body.as_str()), (200, Some("REVALIDATED"), "etag-body hit=1"));
     assert_eq!(env.hits.load(Ordering::SeqCst), 2);
-    assert_eq!(get(&env, "example.com", "/etag/doc").await.header("cf-cache-status"), Some("HIT"));
+    assert_eq!(get(&env, "example.com", "/etag/doc").await.header("fcf-cache-status"), Some("HIT"));
     assert_eq!(env.hits.load(Ordering::SeqCst), 2);
 }
 
@@ -874,9 +884,9 @@ async fn serves_ranges_unsized_objects_and_stale_copies() {
     // parts are cut from a cached object
     let whole = get(&env, "example.com", "/r/app.js").await;
     let len = whole.body.len();
-    assert_eq!((whole.header("cf-cache-status"), hits()), (Some("MISS"), 1));
+    assert_eq!((whole.header("fcf-cache-status"), hits()), (Some("MISS"), 1));
     let part = ranged("/r/app.js", "bytes=7-11").await;
-    assert_eq!((part.status, part.header("cf-cache-status")), (206, Some("HIT")));
+    assert_eq!((part.status, part.header("fcf-cache-status")), (206, Some("HIT")));
     assert_eq!(part.header("content-range"), Some(format!("bytes 7-11/{len}").as_str()));
     assert_eq!((part.header("content-length"), part.body.as_str()), (Some("5"), &whole.body[7..=11]));
     assert_eq!(ranged("/r/app.js", "bytes=-4").await.body, whole.body[len - 4..]);
@@ -893,11 +903,11 @@ async fn serves_ranges_unsized_objects_and_stale_copies() {
     assert_eq!((head.status, head.header("content-length"), head.body.as_str()), (206, Some("2"), ""));
     assert_eq!(hits(), 1, "all of that came from the cache");
     // without a cached copy the request goes to the origin as it is, and its answer is not kept
-    assert_eq!(ranged("/r/cold.js", "bytes=0-3").await.header("cf-cache-status"), Some("DYNAMIC"));
-    assert_eq!(get(&env, "example.com", "/r/cold.js").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(ranged("/r/cold.js", "bytes=0-3").await.header("fcf-cache-status"), Some("DYNAMIC"));
+    assert_eq!(get(&env, "example.com", "/r/cold.js").await.header("fcf-cache-status"), Some("MISS"));
 
     // If-Modified-Since is a date comparison
-    assert_eq!(get(&env, "example.com", "/lm/lastmod.css").await.header("cf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "example.com", "/lm/lastmod.css").await.header("fcf-cache-status"), Some("MISS"));
     let since = |date: &'static str| {
         let extra = format!("If-Modified-Since: {date}\r\n");
         let env = &env;
@@ -911,10 +921,10 @@ async fn serves_ranges_unsized_objects_and_stale_copies() {
     // a response without Content-Length is stored once it was read
     let before = hits();
     let first = get(&env, "example.com", "/c/chunked.js").await;
-    assert_eq!((first.header("cf-cache-status"), first.body.as_str()), (Some("MISS"), "chunk-0;chunk-1;chunk-2;"));
+    assert_eq!((first.header("fcf-cache-status"), first.body.as_str()), (Some("MISS"), "chunk-0;chunk-1;chunk-2;"));
     assert_eq!(first.header("content-length"), Some("24"));
     let second = get(&env, "example.com", "/c/chunked.js").await;
-    assert_eq!((second.header("cf-cache-status"), second.body.as_str(), hits()), (Some("HIT"), "chunk-0;chunk-1;chunk-2;", before + 1));
+    assert_eq!((second.header("fcf-cache-status"), second.body.as_str(), hits()), (Some("HIT"), "chunk-0;chunk-1;chunk-2;", before + 1));
     // ... unless it is too long for that: then it is passed on as it comes
     for _ in 0..2 {
         let huge = get(&env, "example.com", "/c/huge-chunked.js").await;
@@ -924,17 +934,17 @@ async fn serves_ranges_unsized_objects_and_stale_copies() {
 
     // an expired copy is served while the origin fails
     let fresh = get(&env, "example.com", "/f/flaky.css").await;
-    assert_eq!((fresh.status, fresh.header("cf-cache-status")), (200, Some("MISS")));
+    assert_eq!((fresh.status, fresh.header("fcf-cache-status")), (200, Some("MISS")));
     tokio::time::sleep(Duration::from_millis(1100)).await;
     FLAKY_DOWN.store(true, Ordering::SeqCst);
     let stale = get(&env, "example.com", "/f/flaky.css").await;
-    assert_eq!((stale.status, stale.header("cf-cache-status"), &stale.body), (200, Some("STALE"), &fresh.body));
+    assert_eq!((stale.status, stale.header("fcf-cache-status"), &stale.body), (200, Some("STALE"), &fresh.body));
     // ... or cannot be reached at all
     let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
     let rule = json!({ "expression": "http.request.uri.path contains \"flaky\"", "origin_port": closed, "priority": 1 });
     env.store.save_item::<OriginRule>(&env.zone, None, rule, true).unwrap();
     let stale = get(&env, "example.com", "/f/flaky.css").await;
-    assert_eq!((stale.status, stale.header("cf-cache-status"), &stale.body), (200, Some("STALE"), &fresh.body));
+    assert_eq!((stale.status, stale.header("fcf-cache-status"), &stale.body), (200, Some("STALE"), &fresh.body));
     // without a copy the error is what the visitor gets
     assert_eq!(get(&env, "example.com", "/f/flaky-too.css").await.status, 521);
     FLAKY_DOWN.store(false, Ordering::SeqCst);
@@ -979,7 +989,7 @@ async fn the_human_check_lets_a_person_through_and_keeps_automation_out() {
     let browser = format!("User-Agent: {UA}\r\nAccept-Language: zh-CN,zh;q=0.9\r\n");
 
     let r = send(&env, "GET", "example.com", "/guarded", &browser, "").await;
-    assert_eq!((r.status, r.header("cf-mitigated")), (403, Some("challenge")));
+    assert_eq!((r.status, r.header("fcf-mitigated")), (403, Some("challenge")));
     assert!(r.body.contains("Verify you are human") && r.body.contains("challenge-platform/verify"), "{}", r.body);
     assert_eq!(env.hits.load(Ordering::SeqCst), 0);
     let config: serde_json::Value = {
@@ -1056,7 +1066,7 @@ async fn zone_settings_shape_requests_and_responses() {
     set("browser_cache_ttl", json!(3600)).unwrap();
     for expected in ["MISS", "HIT"] {
         let r = get(&env, "example.com", "/s/site.css").await;
-        assert_eq!((r.header("cf-cache-status"), r.header("cache-control")), (Some(expected), Some("public, max-age=3600")));
+        assert_eq!((r.header("fcf-cache-status"), r.header("cache-control")), (Some(expected), Some("public, max-age=3600")));
     }
     assert_eq!(get(&env, "example.com", "/page").await.header("cache-control"), Some("max-age=60"));
     set("browser_cache_ttl", json!(30)).unwrap();
@@ -1162,7 +1172,7 @@ async fn node_limits_stop_and_slow_the_node() {
         async move {
             let started = Instant::now();
             let reply = get(env, "example.com", uri).await;
-            (reply.header("cf-cache-status").map(String::from), reply.body.len(), started.elapsed())
+            (reply.header("fcf-cache-status").map(String::from), reply.body.len(), started.elapsed())
         }
     };
     let (_, len, unlimited) = timed("/dl/blob-a.bin").await;
@@ -1217,7 +1227,7 @@ async fn http3_front_hands_over_its_visitors() {
     // only what works here is on offer
     for expected in ["MISS", "HIT"] {
         let r = get(&env, "www.example.com", "/altsvc/app.js").await;
-        assert_eq!((r.header("cf-cache-status"), r.header("alt-svc"), r.body.as_str()), (Some(expected), None, "behind another CDN"));
+        assert_eq!((r.header("fcf-cache-status"), r.header("alt-svc"), r.body.as_str()), (Some(expected), None, "behind another CDN"));
     }
     let r = via_front("www.example.com", "/altsvc/app.js", "X-Forwarded-For: 198.51.100.9\r\n").await;
     assert_eq!((r.body.as_str(), r.header("alt-svc").map(String::from)), ("behind another CDN", Some(format!("h3=\":{}\"; ma=86400", env.tls_port))));
@@ -2055,4 +2065,39 @@ fn panel_origin_is_an_address_reached_under_the_panel_name() {
     let t = panel_origin("https://[2001:db8::1]:8443/", "dashboard.example.com").unwrap();
     assert_eq!((t.host.as_str(), t.port), ("2001:db8::1", 8443));
     assert!(panel_origin("dashboard.example.com", "dashboard.example.com").is_err(), "an address, not a name to resolve");
+}
+
+#[tokio::test]
+async fn pages_get_the_script_and_scripts_get_json() {
+    let env = setup().await;
+    let r = get(&env, "example.com", "/page.html").await;
+    assert_eq!(r.status, 200);
+    assert!(r.body.contains(&format!("<title>t</title>{}</HEAD>", super::SCRIPT_TAG)), "{}", r.body);
+    assert!(r.header("cf-ray").is_none(), "nothing cf- goes out");
+    assert!(r.header("fcf-cache-status").is_some() && r.header("cf-cache-status").is_none());
+    let r = get(&env, "example.com", "/gz/page.html").await;
+    assert!(r.body.contains(super::SCRIPT_TAG) && r.body.contains("hello"), "{}", r.body);
+    let r = get(&env, "example.com", "/cdn-cgi/challenge-platform/fcf.js").await;
+    assert!(r.status == 200 && r.body.contains("fcf-mitigated") && r.header("content-type").unwrap().contains("javascript"));
+    let r = get(&env, "example.com", "/cdn-cgi/challenge-platform/ticket").await;
+    let cfg: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert!(cfg["t"].as_str().is_some_and(|t| t.contains('.')) && cfg["c"] == false, "{}", r.body);
+
+    // off: the pages stay as they are
+    env.store.update_setting(&env.zone, "challenge_script", json!(false)).unwrap();
+    let r = get(&env, "example.com", "/page.html").await;
+    assert!(!r.body.contains("fcf.js"), "{}", r.body);
+
+    // a challenged fetch gets JSON the script can settle
+    let rule = json!({ "expression": "http.request.uri.path eq \"/api/x\"", "action": "js_challenge" });
+    env.store.save_item::<FirewallRule>(&env.zone, None, rule, true).unwrap();
+    let r = send(&env, "GET", "example.com", "/api/x", "Sec-Fetch-Mode: cors\r\nAccept: application/json\r\n", "").await;
+    assert_eq!((r.status, r.header("fcf-mitigated")), (403, Some("challenge")));
+    let j: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+    assert!(j["challenge"]["t"].is_string() && j["challenge"]["v"] == "/cdn-cgi/challenge-platform/verify", "{}", r.body);
+    let r = send(&env, "GET", "example.com", "/api/x", "Sec-Fetch-Mode: navigate\r\n", "").await;
+    assert!(r.status == 403 && r.body.contains("<!doctype html>"));
+    // the levels: high challenges a data centre address, medium does not
+    env.store.update_setting(&env.zone, "security_level", json!("high")).unwrap();
+    assert!(env.store.update_setting(&env.zone, "security_level", json!("bogus")).is_err());
 }

@@ -26,6 +26,8 @@ pub struct ReqInfo {
     pub continent: String,
     pub asn: i64,
     pub as_org: String,
+    /// How bad the visitor's address looks, 0 (clean) to 100 (see crate::edge::reputation).
+    pub threat: i64,
 }
 
 impl ReqInfo {
@@ -60,6 +62,7 @@ enum Val {
     Continent,
     Asn,
     AsOrg,
+    Threat,
     Lower(Box<Val>),
     Upper(Box<Val>),
     UrlDecode(Box<Val>),
@@ -187,7 +190,7 @@ impl Val {
         match self {
             Val::IpSrc => Ty::Ip,
             Val::Ssl | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
-            Val::Len(_) | Val::Asn => Ty::Int,
+            Val::Len(_) | Val::Asn | Val::Threat => Ty::Int,
             _ => Ty::Str,
         }
     }
@@ -349,6 +352,7 @@ impl Parser {
             "ip.geoip.continent" | "ip.src.continent" => Val::Continent,
             "ip.geoip.asnum" | "ip.src.asnum" => Val::Asn,
             "ip.geoip.as_org" => Val::AsOrg,
+            "fcf.threat_score" | "cf.threat_score" | "ip.threat_score" => Val::Threat,
             "ssl" => Val::Ssl,
             _ => return Err(format!("unknown field '{word}'")),
         })
@@ -426,6 +430,7 @@ impl Val {
             Val::Country => V::S(Cow::Borrowed(&r.country)),
             Val::Continent => V::S(Cow::Borrowed(&r.continent)),
             Val::Asn => V::I(r.asn),
+            Val::Threat => V::I(r.threat),
             Val::AsOrg => V::S(Cow::Borrowed(&r.as_org)),
             Val::Ssl => V::B(r.ssl),
             Val::Lower(v) => V::S(Cow::Owned(s(v).to_lowercase())),

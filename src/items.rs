@@ -122,9 +122,16 @@ pub struct Settings {
     pub http2: bool,
     /// Offer HTTP/3 (QUIC): advertised through Alt-Svc and HTTPS DNS records.
     pub http3: bool,
-    /// `medium`, or `under_attack`: every visitor has to pass a JavaScript
-    /// challenge before anything else happens (firewall `skip` rules exempt).
+    /// Who has to pass the human check before anything else happens
+    /// (firewall `skip` rules exempt), by the threat score of their address
+    /// (crate::edge::reputation): `off`, `low` (80 and up), `medium` (50 and
+    /// up), `high` (25 and up: data centres too), `under_attack` (everybody).
+    /// Higher levels also ask for more work and tolerate less doubt.
     pub security_level: String,
+    /// Put the fucf script into the site's HTML pages (when the zone can
+    /// challenge at all): it passes the check quietly in the background, and
+    /// settles challenges of fetch / XHR requests without reloading the page.
+    pub challenge_script: bool,
     /// Seconds browsers may keep what the edge caches; raises a shorter
     /// lifetime given by the origin. 0 leaves the origin's headers alone.
     pub browser_cache_ttl: u32,
@@ -153,6 +160,17 @@ pub struct Settings {
     pub auto_firewall_window: u32,
     pub auto_firewall_ban: u32,
     pub auto_firewall_action: String,
+    /// Also challenge whole networks (ASNs) from which at least
+    /// `auto_firewall_network_ips` data centre / VPN / listed addresses attacked.
+    pub auto_firewall_networks: bool,
+    pub auto_firewall_network_ips: u32,
+    /// So many different attackers within the window put the zone into
+    /// under attack mode for an hour (0: never).
+    pub auto_firewall_surge: u32,
+    /// Kept by the automatic firewall while it holds the zone in under attack
+    /// mode: the level to go back to, and until when (unix seconds).
+    pub auto_level_restore: String,
+    pub auto_level_until: u64,
 }
 
 impl Default for Settings {
@@ -166,6 +184,7 @@ impl Default for Settings {
             http2: true,
             http3: true,
             security_level: "medium".into(),
+            challenge_script: true,
             browser_cache_ttl: 0,
             hsts_max_age: 0,
             hsts_include_subdomains: false,
@@ -177,6 +196,11 @@ impl Default for Settings {
             auto_firewall_window: 600,
             auto_firewall_ban: 86400,
             auto_firewall_action: "block".into(),
+            auto_firewall_networks: true,
+            auto_firewall_network_ips: 10,
+            auto_firewall_surge: 50,
+            auto_level_restore: String::new(),
+            auto_level_until: 0,
         }
     }
 }
@@ -185,13 +209,19 @@ impl Settings {
     pub fn validate(&self) -> Result<(), StoreError> {
         one_of("ssl", &self.ssl, &["flexible", "full", "strict"])?;
         one_of("waf", &self.waf, &["off", "log", "block"])?;
-        one_of("security_level", &self.security_level, &["medium", "under_attack"])?;
+        one_of("security_level", &self.security_level, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
         one_of("auto_firewall_action", &self.auto_firewall_action, &["block", "managed_challenge", "js_challenge"])?;
         if !(1..=100_000).contains(&self.auto_firewall_threshold)
             || !(60..=86_400).contains(&self.auto_firewall_window)
             || !(60..=30 * 86_400).contains(&self.auto_firewall_ban)
         {
             return invalid("auto_firewall_threshold is 1 to 100000, auto_firewall_window 60 to 86400 and auto_firewall_ban 60 to 2592000 seconds");
+        }
+        if !(2..=100_000).contains(&self.auto_firewall_network_ips) || (self.auto_firewall_surge != 0 && !(5..=1_000_000).contains(&self.auto_firewall_surge)) {
+            return invalid("auto_firewall_network_ips is 2 to 100000, auto_firewall_surge 0 (off) or 5 to 1000000");
+        }
+        if !self.auto_level_restore.is_empty() {
+            one_of("auto_level_restore", &self.auto_level_restore, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
         }
         if self.browser_cache_ttl > 31_536_000 || self.hsts_max_age > 63_072_000 {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");

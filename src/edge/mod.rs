@@ -6,6 +6,7 @@ pub mod certdir;
 pub mod cgi;
 pub mod autofw;
 pub mod challenge;
+pub mod reputation;
 pub mod files;
 pub mod compress;
 pub mod front;
@@ -109,15 +110,21 @@ impl std::fmt::Display for Reason {
 /// The title of every error page about the origin.
 pub const ORIGIN_ERROR: &str = "回源错误 Origin error";
 
-/// Every response says whether it came from the cache: `cf-cache-status`
-/// (Cloudflare's labels; `NONE` for what the edge answered by itself:
+/// Every response says whether it came from the cache: `fcf-cache-status`
+/// (Cloudflare's labels, under a name of our own -- nothing the edge sends
+/// starts with `cf-`, and what an origin behind Cloudflare sends that does
+/// is dropped; `NONE` for what the edge answered by itself:
 /// error pages, challenges, the panel, `/cdn-cgi`), and `x-cache`
 /// (`HIT from <colo>` or `MISS from <colo>`), the short form most tools read.
 fn mark_cache(resp: &mut Response<Body>, colo: &str) {
-    let label = match resp.headers().get("cf-cache-status").and_then(|v| v.to_str().ok()) {
+    let foreign: Vec<HeaderName> = resp.headers().keys().filter(|k| k.as_str().starts_with("cf-")).cloned().collect();
+    for name in foreign {
+        resp.headers_mut().remove(name);
+    }
+    let label = match resp.headers().get("fcf-cache-status").and_then(|v| v.to_str().ok()) {
         Some(label) => label.to_string(),
         None => {
-            resp.headers_mut().insert("cf-cache-status", HeaderValue::from_static("NONE"));
+            resp.headers_mut().insert("fcf-cache-status", HeaderValue::from_static("NONE"));
             "NONE".to_string()
         }
     };
@@ -928,7 +935,7 @@ fn cached_response(entry: &cache::Entry, method: &Method, cond: &Conditional, la
     *resp.status_mut() = status;
     *resp.headers_mut() = headers;
     resp.headers_mut().insert(header::AGE, HeaderValue::from(entry.stored.elapsed().as_secs()));
-    resp.headers_mut().insert("cf-cache-status", HeaderValue::from_static(label));
+    resp.headers_mut().insert("fcf-cache-status", HeaderValue::from_static(label));
     resp
 }
 
@@ -994,6 +1001,8 @@ pub struct Edge {
     pub internal_listeners: std::sync::OnceLock<Vec<SocketAddr>>,
     /// Visitor geolocation for the `ip.geoip.*` rule fields.
     pub geo: std::sync::OnceLock<Arc<crate::geo::Geo>>,
+    /// How bad visitors' addresses look (threat scores).
+    pub reputation: std::sync::OnceLock<Arc<reputation::Reputation>>,
     pub stats: Arc<stats::Stats>,
     /// This node's traffic allowance and speed limit.
     pub limits: Arc<crate::limits::Limits>,
@@ -1268,6 +1277,7 @@ impl Edge {
             panel_seal: Default::default(),
             internal_listeners: Default::default(),
             geo: Default::default(),
+            reputation: Default::default(),
             stats: Default::default(),
             limits: Default::default(),
             gfw: Default::default(),
@@ -1528,7 +1538,8 @@ impl Edge {
                 Some(prev) => format!("{prev}, {ip}"),
                 None => ip.clone(),
             };
-            for (name, value) in [("x-forwarded-for", xff), ("cf-connecting-ip", ip)] {
+            // fcf-*: our own name; cf-*: for origins written for Cloudflare
+            for (name, value) in [("x-forwarded-for", xff), ("fcf-connecting-ip", ip.clone()), ("cf-connecting-ip", ip)] {
                 if let Ok(v) = HeaderValue::from_str(&value) {
                     headers.insert(name, v);
                 }
@@ -1544,7 +1555,9 @@ impl Edge {
         }
         // The visitor's country as the edge sees it, never as the client claims.
         headers.remove("cf-ipcountry");
+        headers.remove("fcf-ipcountry");
         if let Some(country) = HeaderValue::from_str(&info.country).ok().filter(|v| !v.is_empty()) {
+            headers.insert("fcf-ipcountry", country.clone());
             headers.insert("cf-ipcountry", country);
         }
         headers.insert("x-forwarded-proto", HeaderValue::from_static(if info.ssl { "https" } else { "http" }));
@@ -1697,7 +1710,7 @@ impl Edge {
             Decision::Dynamic => status_label_for_uncached(status_label),
         };
         let mut out = Response::from_parts(parts, body);
-        out.headers_mut().insert("cf-cache-status", HeaderValue::from_static(label));
+        out.headers_mut().insert("fcf-cache-status", HeaderValue::from_static(label));
         Ok(out)
     }
 
@@ -2049,6 +2062,9 @@ impl Edge {
             info.asn = loc.asn.unwrap_or(0) as i64;
             info.as_org = loc.as_org.unwrap_or_default();
         }
+        if let Some(rep) = self.reputation.get() {
+            info.threat = rep.assess(ip, info.asn, &info.as_org, info.header("user-agent")).score as i64;
+        }
         *seen = Some(Seen {
             zone_id: zone.zone.id.clone(),
             http3: settings.http3,
@@ -2097,6 +2113,10 @@ impl Edge {
             _ => (ReqBody::Stream(incoming), None),
         };
 
+        // the fcf script goes into the site's pages where the zone can challenge at all
+        let can_challenge = challenge::Level::of(&settings.security_level) != challenge::Level::Off
+            || zone.firewall.iter().any(|(r, _)| r.action == "js_challenge" || r.action == "managed_challenge");
+        let wants_script = settings.challenge_script && can_challenge && parts.method == Method::GET && !zone.zone.paused;
         let mut headers = parts.headers;
         let mut response_rules = Vec::new();
         let mut worker = None;
@@ -2122,7 +2142,13 @@ impl Edge {
                 Verdict::Challenge { click } => {
                     let ip = info.ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
                     let (ua, colo, ray) = (info.header("user-agent").to_string(), self.here().colo, ray.to_string());
-                    let page = challenge::page(&self.waf, &zone.zone.id, ip, &ua, click, &ray, page_lang, &colo);
+                    let level = challenge::Level::of(&settings.security_level);
+                    // a page load gets the page; fetch / XHR / API clients a JSON answer the injected script settles
+                    let page = if challenge::is_navigation(&headers) {
+                        challenge::page_at(&self.waf, &zone.zone.id, ip, &ua, click, &ray, page_lang, &colo, level)
+                    } else {
+                        challenge::for_script(&self.waf, &zone.zone.id, ip, &ua, click, level, &ray)
+                    };
                     Some(page)
                 }
             };
@@ -2207,7 +2233,7 @@ impl Edge {
             }
         }
         let browser_ttl = u64::from(settings.browser_cache_ttl);
-        let cacheable = resp.headers().get("cf-cache-status").is_some_and(|label| label != "DYNAMIC" && label != "BYPASS")
+        let cacheable = resp.headers().get("fcf-cache-status").is_some_and(|label| label != "DYNAMIC" && label != "BYPASS")
             && matches!(resp.status().as_u16(), 200 | 206 | 304);
         if browser_ttl > 0 && cacheable && cache::max_age(resp.headers()).is_none_or(|given| given < browser_ttl) {
             if let Ok(v) = HeaderValue::from_str(&format!("public, max-age={browser_ttl}")) {
@@ -2221,8 +2247,78 @@ impl Edge {
             }
             set_headers(resp.headers_mut(), &rule.set_response_headers);
         }
+        if wants_script {
+            resp = inject_script(resp).await;
+        }
         Ok(resp)
     }
+}
+
+/// The tag that brings the fcf script into a page.
+pub const SCRIPT_TAG: &str = "<script src=\"/cdn-cgi/challenge-platform/fcf.js\" async></script>";
+/// Pages larger than this are passed on as they are.
+const INJECT_LIMIT: usize = 4 << 20;
+
+/// Put [`SCRIPT_TAG`] into an HTML page (before `</head>`, else after
+/// `<body ...>`): plain or gzip / deflate / brotli bodies of 200 answers.
+async fn inject_script(resp: Response<Body>) -> Response<Body> {
+    let html = resp.status() == StatusCode::OK
+        && resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html"));
+    let encoding = resp.headers().get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()).map(|e| e.trim().to_ascii_lowercase()).unwrap_or_default();
+    if !html || !matches!(encoding.as_str(), "" | "identity" | "gzip" | "x-gzip" | "deflate" | "br") {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let chunks = match read_up_to(body, INJECT_LIMIT).await {
+        Ok((chunks, None)) => chunks,
+        Ok((chunks, Some(rest))) => return Response::from_parts(parts, Prefixed { head: chunks.into(), rest }.boxed()),
+        Err(e) => {
+            tracing::debug!("reading a page to put the script in: {e}");
+            return Response::from_parts(parts, full(Bytes::new()));
+        }
+    };
+    let raw: Vec<u8> = chunks.concat();
+    let decoded = match encoding.as_str() {
+        "gzip" | "x-gzip" => decode(flate2::read::MultiGzDecoder::new(&raw[..])),
+        "deflate" => decode(flate2::read::ZlibDecoder::new(&raw[..])),
+        "br" => decode(brotli::Decompressor::new(&raw[..], 4096)),
+        _ => Some(raw.clone()),
+    };
+    let Some(page) = decoded.and_then(|d| with_script(&d)) else {
+        return Response::from_parts(parts, full(Bytes::from(raw)));
+    };
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    // the page is not the origin's byte for byte any more
+    if let Some(tag) = parts.headers.get(header::ETAG).and_then(|v| v.to_str().ok()).filter(|t| !t.starts_with("W/")).map(|t| format!("W/{t}")) {
+        if let Ok(v) = HeaderValue::from_str(&tag) {
+            parts.headers.insert(header::ETAG, v);
+        }
+    }
+    Response::from_parts(parts, full(Bytes::from(page)))
+}
+
+fn decode(mut r: impl std::io::Read) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    r.by_ref().take(INJECT_LIMIT as u64 * 4).read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// The page with the script tag in it; nothing if it already has it or has
+/// no place for it.
+pub fn with_script(page: &[u8]) -> Option<Vec<u8>> {
+    let lower: Vec<u8> = page[..page.len().min(512 * 1024)].iter().map(u8::to_ascii_lowercase).collect();
+    let find = |needle: &[u8], from: usize| lower.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from);
+    if find(b"/cdn-cgi/challenge-platform/fcf.js", 0).is_some() {
+        return None;
+    }
+    let at = find(b"</head>", 0).or_else(|| find(b"<body", 0).and_then(|b| find(b">", b).map(|e| e + 1)))?;
+    let mut out = Vec::with_capacity(page.len() + SCRIPT_TAG.len());
+    out.extend_from_slice(&page[..at]);
+    out.extend_from_slice(SCRIPT_TAG.as_bytes());
+    out.extend_from_slice(&page[at..]);
+    Some(out)
 }
 
 /// Run the pipeline and stamp the edge's own response headers.
@@ -2303,7 +2399,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
             zone_id: &seen.zone_id,
             version,
             status: resp.status().as_u16(),
-            cache: resp.headers().get("cf-cache-status").and_then(|v| v.to_str().ok()),
+            cache: resp.headers().get("fcf-cache-status").and_then(|v| v.to_str().ok()),
             threat: resp.extensions().get::<WafHit>().is_some(),
             bytes: 0, // booked by `Metered` as the body is actually sent
             country: &seen.country,

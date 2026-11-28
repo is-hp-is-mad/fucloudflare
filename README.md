@@ -57,7 +57,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 ## 管理 API
 
 基址 `http://127.0.0.1:8787/client/v4`，认证头 `Authorization: Bearer <token>`，响应信封与 Cloudflare v4 一致。
-用户自己的 API 令牌和 Global API Key 见下面的“开放 API”。
+用户自己的 API 令牌和 Global API Key 见下面的“开放 API”。完整的接口文档：[docs/api.md](docs/api.md)。
 zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是简化的自有结构。
 
 ```
@@ -384,6 +384,39 @@ DNS 记录的 Cloudflare 兼容补充：
 （`managed_by: auto_firewall`，表达式 `ip.src in {...}`，优先级 1000，动作 `auto_firewall_action`：block 或 managed_challenge），
 封 `auto_firewall_ban` 秒（默认 86400）；期间继续攻击会续期，到期自动移出，空了规则就删掉。IPv6 按 /64 封；机群节点自己的地址和内网地址从不封；
 最多 1000 个地址（保留最晚到期的）。在主节点上运行（它有全机群的安全事件），规则随配置同步到所有节点。
+
+另外两条自动维护的规则：
+- 按网络：同一个 ASN 里有 `auto_firewall_network_ips`（默认 10）个机房 / VPN / 黑名单地址在攻击时，整个 ASN 的访客先点一下人机验证
+  （`managed_by: auto_firewall_networks`；家庭宽带不会被整网处理；机群节点自己的地址除外）。`auto_firewall_networks=false` 关闭。
+- 攻击潮：窗口内攻击地址数达到 `auto_firewall_surge`（默认 50，0 关闭）时自动进入受攻击模式，攻击停止一小时后恢复原来的级别。
+
+## 安全级别、IP 纯净度与页面内人机验证
+
+- `security_level`：`off` / `low`（简易：威胁分 ≥ 80 要验证）/ `medium`（中等：≥ 50）/ `high`（严格：≥ 25，含机房 IP）/ `under_attack`（受攻击模式：所有人）。
+  级别越高，验证要做的计算越多（17 / 18 / 19 位），对可疑环境越不宽容。`/.well-known/acme-challenge/` 和 `/cdn-cgi/` 永远不验证。
+- 威胁分（0–100，规则里写 `cf.threat_score` 或 `fcf.threat_score`）：每个节点每 12 小时拉一次 FireHOL level1/level2、Tor 出口、VPN 与机房网段
+  （存在 `<数据目录>/reputation`，`FUCF_IP_REPUTATION=false` 关闭），加上按 AS 名称识别的云厂商、本机群自动封禁过的地址；内网、机群自己的地址、
+  来自自家网络的搜索引擎爬虫为 0。面板“调度 → 定位测试”能看到某个 IP 的威胁分和原因。
+- 人机验证检测：webdriver 与各类自动化框架痕迹、调试协议、被改写的原生函数、UA 与 Client Hints / iframe / Worker 里的 UA 是否一致、
+  JS 引擎特征（报错措辞、`eval` 的打印长度）与 UA 声称的是否一致、`navigator.platform`、触摸、Canvas 噪声（反检测浏览器）、软件 WebGL、
+  媒体设备、窗口工具栏、Fetch Metadata 请求头、语言、鼠标轨迹是否像尺子画的、计算是否在页面外完成。
+- `challenge_script`（默认开，只在域名可能要求验证时生效）：在 HTML 页面里插入 `/cdn-cgi/challenge-platform/fcf.js`。空闲时后台悄悄通过验证；
+  页面里的 `fetch` 被要求验证时就地弹出验证框，通过后自动重发（XHR 无法重发，通过后下一次请求即可）。
+- 被要求验证的非页面请求（`Sec-Fetch-Mode` 不是 `navigate`，或 `Accept` 不含 `text/html`）得到 JSON，响应头 `fcf-mitigated: challenge`。
+- 响应头一律用 `fcf-` 前缀（`fcf-cache-status`、`fcf-mitigated`、`fcf-ray`），不发任何 `cf-` 开头的头；源站在 Cloudflare 后面时它发的 `cf-*` 会被去掉。
+  回源请求带 `fcf-connecting-ip` / `fcf-ipcountry`（以及给为 Cloudflare 写的程序用的 `cf-connecting-ip` / `cf-ipcountry`）。
+
+## 备份与恢复
+
+复制的数据（配置、账户、Workers KV、D1）在每个 `peer` 节点上都有完整一份；`accelerate` 节点只在内存里有。为了 AWS 账号整体出事也不丢：
+
+- 每个节点（包括 accelerate 节点）每 6 小时把手里的副本写成一份备份到 `<数据目录>/backups`，保留最近 28 份
+  （`FUCF_BACKUP_DIR`、`FUCF_BACKUP_EVERY_HOURS`、`FUCF_BACKUP_KEEP`）。不在同一家云的节点上的备份就是异地备份。
+- `GET /client/v4/backup`：现拿一份（管理员，或只有 “Backup Read” 权限的令牌）。
+- `.github/workflows/backup.yml`：每天从面板拉一份，用 age 公钥加密后存为 workflow artifact（90 天）。仓库是公开的，所以只存加密后的；
+  需要 secret `FUCF_BACKUP_URL`、`FUCF_BACKUP_TOKEN` 和变量 `FUCF_BACKUP_AGE_RECIPIENT`，私钥自己离线保管。
+- 恢复：拿任意一份备份（`age -d -i key.txt x.json.gz.age > x.json.gz`），在一台新机器（或幸存的节点上改成 `FUCF_ROLE=peer`）
+  用 `FUCF_RESTORE_FROM=/path/x.json.gz` 启动一次，再把注册商那里的 NS 记录指向还活着的节点。
 
 ## 伪装子域
 

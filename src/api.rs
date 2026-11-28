@@ -2892,6 +2892,10 @@ async fn test_steering(State(st): St, Query(q): Params) -> ApiResult {
         "databases": { "country": geo.has_country_db(), "cn_provinces": geo.has_cn_db() },
         "rule": rule.map(|r| json!({ "id": r.id, "name": r.name, "action": r.action, "nodes": r.nodes, "priority": r.priority })),
         "continent_nodes": continent,
+        "reputation": st.edge.reputation.get().map(|r| json!({
+            "assessment": r.assess(ip, loc.asn.unwrap_or(0) as i64, loc.as_org.as_deref().unwrap_or(""), q.get("ua").map(String::as_str).unwrap_or("")),
+            "lists": r.loaded().into_iter().map(|(name, n)| json!({ "name": name, "networks": n })).collect::<Vec<_>>(),
+        })),
     }))
 }
 

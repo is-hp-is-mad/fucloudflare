@@ -51,6 +51,18 @@ impl Edge {
             let (waf, ray) = (self.waf.clone(), ray.to_string());
             return super::challenge::verify(waf, ip, ssl, req, ray).await;
         }
+        if endpoint == "challenge-platform/fcf.js" {
+            // the script put into the site's pages (see `super::inject_script`)
+            return Ok(super::challenge::injected_script());
+        }
+        if endpoint == "challenge-platform/ticket" {
+            // a ticket for the injected script to pass the check in the background
+            let snap = self.store.snapshot();
+            let Some(zone) = snap.find_zone(host).filter(|z| Self::serves(z, host)) else { return Err(not_found()) };
+            let ua = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default();
+            let level = super::challenge::Level::of(&zone.zone.settings.security_level);
+            return Ok(super::challenge::ticket_answer(&self.waf, &zone.zone.id, ip, ua, level));
+        }
         let (name, below) = endpoint.split_once('/').map_or((endpoint, None), |(name, below)| (name, Some(below)));
         let internal = is_fucf_node(ip, &self.store.snapshot().nodes);
         let resp = match (name, below) {
@@ -108,6 +120,7 @@ impl Edge {
             ("asn", location.asn.map(|n| n.to_string()).unwrap_or_default()),
             ("zone", zone.to_string()),
             ("limit", limit.as_str().to_string()),
+            ("threat", self.reputation.get().map(|r| r.assess(ip, location.asn.unwrap_or(0) as i64, location.as_org.as_deref().unwrap_or(""), req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("")).score).unwrap_or(0).to_string()),
             ("region", location.region.unwrap_or_default()),
         ];
         let body: String = lines.iter().map(|(key, value)| format!("{key}={value}\n")).collect();

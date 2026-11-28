@@ -41,6 +41,12 @@ pub struct Event {
     pub method: String,
     pub uri: String,
     pub user_agent: String,
+    /// The client's network (0 when unknown).
+    #[serde(default)]
+    pub asn: i64,
+    /// The threat score of the client's address (see super::reputation).
+    #[serde(default)]
+    pub threat: i64,
 }
 
 /// What the edge should do with a request.
@@ -295,6 +301,8 @@ impl Waf {
             method: info.method.clone(),
             uri: info.uri().chars().take(2048).collect(),
             user_agent: info.header("user-agent").chars().take(512).collect(),
+            asn: info.asn,
+            threat: info.threat,
         };
         self.record(event);
     }
@@ -350,6 +358,8 @@ impl Waf {
             method: method.to_string(),
             uri: uri.chars().take(2048).collect(),
             user_agent: String::new(),
+            asn: 0,
+            threat: 0,
         });
     }
 
@@ -479,13 +489,20 @@ impl Waf {
             }
         }
 
-        // 2. under attack: nobody gets further without having passed the challenge
-        if zone.zone.settings.security_level == "under_attack" && !self.has_clearance(&zone.zone.id, info) {
-            self.log(zone, info, ray, "security_level", ("under_attack", "Under attack mode"), "js_challenge");
-            return match info.ip {
-                Some(_) => Verdict::Challenge { click: false },
-                None => Verdict::Block { rule_id: "under_attack".into() },
-            };
+        // 2. the security level: by the threat score of the visitor's address
+        // (under attack: everybody), a challenge unless already passed
+        let level = super::challenge::Level::of(&zone.zone.settings.security_level);
+        let exempt = info.path.starts_with("/.well-known/acme-challenge/") || info.path.starts_with("/cdn-cgi/");
+        if let Some(click) = level.challenge(info.threat).filter(|_| !exempt) {
+            if !self.has_clearance(&zone.zone.id, info) {
+                let setting = zone.zone.settings.security_level.as_str();
+                let what = if setting == "under_attack" { "Under attack mode".to_string() } else { format!("Security level {setting}: threat score {}", info.threat) };
+                self.log(zone, info, ray, "security_level", (setting, &what), if click { "managed_challenge" } else { "js_challenge" });
+                return match info.ip {
+                    Some(_) => Verdict::Challenge { click },
+                    None => Verdict::Block { rule_id: setting.to_string() },
+                };
+            }
         }
 
         // 3. rate limits
