@@ -199,6 +199,10 @@ pub struct Settings {
     /// Visitors' client certificates (crate::edge::mtls): `on` refuses (403)
     /// every request that did not come with a certificate `--mtls-ca` verified.
     pub mtls: String,
+    /// `Link` headers (preload / preconnect hints) added to the zone's HTML
+    /// pages, in the narrow form crate::edge::earlyhints takes. They stand in
+    /// for Early Hints: no `103` is sent.
+    pub early_hints_links: Vec<String>,
 }
 
 impl Default for Settings {
@@ -237,6 +241,7 @@ impl Default for Settings {
             cache_tier_node: String::new(),
             cache_chunking: 0,
             mtls: "off".into(),
+            early_hints_links: Vec::new(),
         }
     }
 }
@@ -280,6 +285,7 @@ impl Settings {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");
         }
         self.error_pages.validate()?;
+        crate::edge::earlyhints::validate(&self.early_hints_links).map_err(StoreError::Invalid)?;
         Ok(())
     }
 }

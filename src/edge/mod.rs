@@ -15,6 +15,7 @@ pub mod origins;
 pub mod reputation;
 pub mod files;
 pub mod compress;
+pub mod earlyhints;
 pub mod front;
 pub mod h3;
 pub mod ja4;
@@ -2413,6 +2414,7 @@ impl Edge {
                 resp.headers_mut().remove(header::EXPIRES);
             }
         }
+        earlyhints::apply(&mut resp, &settings.early_hints_links);
         for rule in response_rules {
             for name in &rule.remove_response_headers {
                 resp.headers_mut().remove(name.as_str());

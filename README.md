@@ -153,6 +153,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `origin_check_path` / `origin_check_interval` | 路径（默认空，最长 256 字节）/ 秒（默认 30，10–3600） | 源站主动健康检查：每个节点按这个间隔向区域里已代理的 A/AAAA 记录的每个地址发 GET 请求这个路径（按访客访问该名字的方式连过去，5 秒超时，User-Agent `fucf-health/<版本>`；回源规则改送别处的地址、通配符名字和暂停的区域不查）。2xx/3xx 算通过，连续两次失败（无应答或别的状态码）的地址排到最后，通过一次就恢复；`GET /zones/{id}/origins/health` 查看本节点的检查结果（`name`、`address`、`healthy`、`failures`、`checked_at`、`detail`；面板：域名 → SSL/TLS → 源站健康） |
 | `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点。保存时不检查节点是否存在：写的不是机群里的节点、在它自己身上、或请求已被回源规则或记录的 `origin.node` 送去别处时，不分层（面板：域名 → 缓存 → 分层缓存） |
 | `cache_chunking` | 字节（默认 0） | 大文件分片缓存：不小于这个大小的对象按 512 KiB 一片存进边缘缓存，Range 请求只读涉及的片；0 为关闭，否则 524288 到 33554432（见"缓存"里的"大文件分片"；面板：域名 → 缓存 → 大文件分片） |
+| `early_hints_links` | 字符串数组（默认空，最多 16 条） | 预加载提示：给这个域名的 HTML 页面（200 应答）加上 `Link` 头，见"预加载提示（代替 Early Hints）"（面板：域名 → 缓存 → 预加载提示） |
 | `session_affinity` | bool（默认关） | 会话保持：同一个访客地址总是从同一个源站地址开始（同名的地址不变时）；该地址检查失败或刚拒绝过连接时照常换下一个。各地址分到的比例由记录的 `origin.weight` 决定（见"高级回源"） |
 | `dns_transfer_to` | 地址或网段数组（默认空，最多 16 个） | 允许做区域传送（AXFR）的辅助名称服务器，如 `["192.0.2.53", "2001:db8:53::/48"]`，见"DNS：更多记录类型、辅助名称服务器、查询统计"（面板：域名 → DNS 记录 → 区域传送） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
@@ -267,6 +268,20 @@ CA 有效期 20 年，名称约束在本区域，只签服务器证书（扩展�
 每条 TLS 连接的 ClientHello 会算出 JA4 指纹（协议版本、加密套件、扩展、签名算法的组合）：浏览器、命令行工具和攻击工具的指纹各不相同，与它们自称的 User-Agent 无关。
 规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
 明文 HTTP、经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
+
+### 预加载提示（代替 Early Hints）
+
+不发 103 Early Hints：hyper 1.x 的服务端发不出 1xx 中间应答（HTTP/1 编码器会把它换成 500，一个请求也只能回一个应答）。
+替代办法是区域设置 `early_hints_links`：每条是一个 `Link` 头的写法，边缘把它们合成一个 `Link` 头，加在这个域名内容类型为 HTML 的 200 应答上（源站自己的 `Link` 头保留，资源、重定向、错误页、边缘自己的页面都不加）。
+提示和页面的响应头一起到，在页面主体还在路上时起作用，源站还没出页面时帮不上忙。
+
+```json
+["</app.css>; rel=preload; as=style", "</fonts/a.woff2>; rel=preload; as=font; crossorigin", "<https://cdn.example.com>; rel=preconnect"]
+```
+
+只接受两种写法：`<URL>; rel=preload; as=类型` 和 `<URL>; rel=preconnect`，都可再加 `crossorigin`（或 `crossorigin=anonymous` / `use-credentials`）；参数不加引号，顺序、大小写随意，保存后按统一写法发出。
+`URL` 是站内路径（`/app.css`，不能以 `//` 开头）或 `https://` 地址，只能是可见 ASCII，不能含空格、引号、逗号、分号、尖括号、反斜杠；`as` 取 `audio`、`document`、`embed`、`fetch`、`font`、`image`、`object`、`script`、`style`、`track`、`video`、`worker`。
+最多 16 条，每条不超过 512 字节，合起来的头不超过 4096 字节，不合格的整个设置 400 并指出第几条。
 
 ### 后量子密钥交换
 

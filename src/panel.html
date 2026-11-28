@@ -1043,7 +1043,9 @@ const ZONE = {
         `<input data-set="cache_tier_node" value="${esc(tier)}" list="tierNodes" placeholder="节点名" spellcheck="false" aria-label="分层缓存的上层节点"${ro}><datalist id="tierNodes">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>` +
         (unknown ? '<span class="hint">没有这个名字的节点：各节点照常直接回源。</span>' : ""))) +
       card("大文件分片", "", setRow("分片缓存", "达到这个大小的对象按 512 KiB 一片缓存：Range 请求（视频拖动、断点续传）只读涉及的片，缓存按片淘汰，大文件不必整份放进内存；缺了的片只向源站补那几片（源站不支持 Range 时整份重取）。只对声明了长度、未压缩的 200 应答生效，单个对象仍以 32 MiB 为上限。",
-        nsel("cache_chunking", chunking, sizes, "分片缓存的起始大小"))) };
+        nsel("cache_chunking", chunking, sizes, "分片缓存的起始大小"))) +
+      card("预加载提示", "", setRow("Link 头", "每行一条，加在这个域名的 HTML 页面（200 应答）上，浏览器读到响应头就开始预取样式、脚本、字体，或提前连上别的源站。只接受 <code>&lt;/app.css&gt;; rel=preload; as=style</code> 和 <code>&lt;https://cdn.example.com&gt;; rel=preconnect</code> 两种写法（可加 <code>crossorigin</code>），最多 16 条。不会发送 103 Early Hints，提示随页面自己的响应头一起到。",
+        `<textarea data-set="early_hints_links" data-lines placeholder="&lt;/app.css&gt;; rel=preload; as=style" spellcheck="false" aria-label="预加载提示"${ro}>${esc((Array.isArray(z.settings.early_hints_links) ? z.settings.early_hints_links : []).join("\n"))}</textarea>`, "stack")) };
   },
   async workers(z) {
     return { sub: "把匹配的请求交给 Worker 脚本处理。脚本本身在账户主页的 Workers 里管理。", acts: '<a class="btn" href="#/workers">管理脚本</a>', body: await ruleSection(z.id, "route") };
@@ -2321,7 +2323,7 @@ document.addEventListener("change", e => {
   const key = el.dataset && el.dataset.set;
   if (!key) return;
   const value = "multi" in el.dataset ? [...document.querySelectorAll(`[data-set="${key}"]:checked`)].map(x => x.value) : el.type === "checkbox" ? el.checked : "num" in el.dataset ? Number(el.value)
-    : "list" in el.dataset ? el.value.split(/[,\s]+/).filter(Boolean) : el.value;
+    : "list" in el.dataset ? el.value.split(/[,\s]+/).filter(Boolean) : "lines" in el.dataset ? el.value.split("\n").map(l => l.trim()).filter(Boolean) : el.value;
   run(async () => {
     try { await api("PATCH", `/zones/${S.zone}/settings/${key}`, { value }); toast("已保存"); }
     finally { render(); }

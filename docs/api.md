@@ -388,11 +388,42 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `session_affinity` | `false`, `true`: requests from one visitor address start with the same origin address |
 | `cache_tier_node` | `""`, or the name of a node (at most 64 bytes): tiered cache, see [Cache](#cache) |
 | `cache_chunking` | `0` (off), or `524288` to `33554432` bytes: objects of at least this size are cached in 512 KiB chunks, see [Cache](#large-objects-in-chunks) |
+| `early_hints_links` | `[]`, or at most 16 `Link` header entries added to the zone's HTML pages: see [Preload hints](#preload-hints-instead-of-early-hints) |
 | `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
 
 ```sh
 curl -s -X PATCH $BASE/zones/$ZONE/settings/security_level -H "Authorization: Bearer $TOKEN" -d '{"value": "high"}'
 ```
+
+#### Preload hints (instead of Early Hints)
+
+No `103 Early Hints` answer is ever sent: hyper 1.x, which serves the visitors, has no way to send
+an informational answer before the final one (its HTTP/1 encoder turns a 1xx into a 500, and a
+request gets exactly one answer). In its place, `early_hints_links` lists `Link` header entries that
+the edge joins into one `Link` header on the zone's `200` answers whose `Content-Type` is HTML. A
+`Link` header from the origin is kept next to it; other answers (assets, redirects, errors, the
+edge's own pages) get nothing. The hints arrive with the page's headers, so they help while the body
+is on its way, not while the origin is still working on the page.
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/settings/early_hints_links -H "Authorization: Bearer $TOKEN" -d '{"value": [
+  "</app.css>; rel=preload; as=style",
+  "</fonts/a.woff2>; rel=preload; as=font; crossorigin",
+  "<https://cdn.example.com>; rel=preconnect"
+]}'
+```
+
+- Two forms only: `<URL>; rel=preload; as=TYPE` and `<URL>; rel=preconnect`, each optionally with
+  `crossorigin` (bare, `=anonymous` or `=use-credentials`). Parameters are unquoted, in any order and
+  case; they are sent written one way (`</app.css>; rel=preload; as=style`).
+- `URL` is a path of the site (`/app.css`, not `//…`) or an `https://` URL, in printable ASCII
+  without spaces, quotes, commas, semicolons, angle brackets or backslashes.
+- `TYPE` is one of `audio`, `document`, `embed`, `fetch`, `font`, `image`, `object`, `script`,
+  `style`, `track`, `video`, `worker`; `as` is refused on a preconnect.
+- At most 16 entries of at most 512 bytes each, and at most 4096 bytes for the header they make.
+  Anything else (another `rel`, an unknown parameter, a second link in one entry) refuses the whole
+  value with `400`, naming the entry (`early_hints_links[1]: …`).
+- Response header rules (transform rules) run after it and can remove or replace the header.
 
 #### Custom error pages
 

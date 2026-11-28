@@ -2381,6 +2381,29 @@ fn panel_origin_is_an_address_reached_under_the_panel_name() {
 }
 
 #[tokio::test]
+async fn a_zone_can_add_preload_hints_to_its_pages_and_only_to_them() {
+    let env = setup().await;
+    assert!(get(&env, "example.com", "/page.html").await.header("link").is_none(), "none by default");
+    let hints = json!(["</app.css>; rel=preload; as=style", "<https://cdn.example.net>; rel=preconnect; crossorigin"]);
+    env.store.update_setting(&env.zone, "early_hints_links", hints).unwrap();
+    let r = get(&env, "example.com", "/page.html").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("link"), Some("</app.css>; rel=preload; as=style, <https://cdn.example.net>; rel=preconnect; crossorigin"), "{}", r.head);
+    assert!(!r.head.starts_with("HTTP/1.1 103"), "no informational answer is sent");
+    for uri in ["/hello", "/big/file.txt"] {
+        assert!(get(&env, "example.com", uri).await.header("link").is_none(), "{uri} is not a page");
+    }
+    // the edge's own pages are not the zone's: an unknown host gets none
+    assert!(get(&env, "nope.example.com", "/page.html").await.header("link").is_none());
+
+    for bad in [json!(["</a.css>; rel=stylesheet"]), json!(["</a.css>; rel=preload; as=style\r\nX-Evil: 1"]), json!("</a.css>; rel=preload; as=style"), json!([1])] {
+        assert!(env.store.update_setting(&env.zone, "early_hints_links", bad.clone()).is_err(), "{bad}");
+    }
+    env.store.update_setting(&env.zone, "early_hints_links", json!([])).unwrap();
+    assert!(get(&env, "example.com", "/page.html").await.header("link").is_none(), "cleared");
+}
+
+#[tokio::test]
 async fn pages_get_the_script_and_scripts_get_json() {
     let env = setup().await;
     let r = get(&env, "example.com", "/page.html").await;
