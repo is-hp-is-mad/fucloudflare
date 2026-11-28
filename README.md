@@ -193,6 +193,12 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
 - `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
 
+### TLS 指纹（JA4）
+
+每条 TLS 连接的 ClientHello 会算出 JA4 指纹（协议版本、加密套件、扩展、签名算法的组合）：浏览器、命令行工具和攻击工具的指纹各不相同，与它们自称的 User-Agent 无关。
+规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
+经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
+
 ### DNS 响应限速与内核层封禁
 
 - `--dns-rrl`（`FUCF_DNS_RRL`，默认 100，0 为关闭）：UDP 上对同一网络（/24、/56）同一名字每秒最多应答这么多次；超出的部分一半以截断（TC）应答，

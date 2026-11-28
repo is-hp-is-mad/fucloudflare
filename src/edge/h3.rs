@@ -113,7 +113,7 @@ async fn serve_request(
     let body: Body = ChannelBody(rx).boxed();
     let mut req = req.map(|_| body);
     // QUIC is always TLS 1.3, and has no handshake without a server name to speak of
-    req.extensions_mut().insert(super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new() });
+    req.extensions_mut().insert(super::TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new() });
     req.extensions_mut().insert(super::proxy::ListenerInfo { port, is_proxy, is_front: false });
     let resp = respond(edge, peer, true, req).await;
 

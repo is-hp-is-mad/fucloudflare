@@ -13,6 +13,7 @@ pub mod files;
 pub mod compress;
 pub mod front;
 pub mod h3;
+pub mod ja4;
 pub mod proxy;
 pub mod quic_mux;
 pub mod stats;
@@ -620,6 +621,8 @@ pub struct TlsInfo {
     pub sni: bool,
     /// Key exchange group, as far as known.
     pub kex: String,
+    /// The JA4 fingerprint of the ClientHello (see [`ja4`]), as far as known.
+    pub ja4: String,
 }
 
 /// Is this a gRPC request? (gRPC-Web is not: that one is plain HTTP.)
@@ -2117,6 +2120,7 @@ impl Edge {
             path,
             query,
             headers: header_pairs(req.headers()),
+            ja4: req.extensions().get::<TlsInfo>().map(|t| t.ja4.clone()).unwrap_or_default(),
             ..Default::default()
         };
 
@@ -2858,6 +2862,7 @@ async fn serve_with_options(
             match acceptor {
                 None => serve_conn(stream, peer, None, false, linfo, edge).await,
                 Some((both, h1_only, acme, resolver)) => {
+                    let fingerprint = ja4::peek(&stream).await;
                     let hello = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
                     let Ok(Ok(start)) = tokio::time::timeout(Duration::from_secs(10), hello).await else { return };
                     if start.client_hello().alpn().is_some_and(|mut offered| offered.any(|p| p == tls::ACME_TLS_ALPN)) {
@@ -2891,6 +2896,7 @@ async fn serve_with_options(
                             },
                             sni: session.server_name().is_some(),
                             kex: session.negotiated_key_exchange_group().map(|group| format!("{:?}", group.name())).unwrap_or_default(),
+                            ja4: fingerprint,
                         };
                         serve_conn(tls, peer, Some(info), alpn_h2, linfo, edge).await;
                     }
