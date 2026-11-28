@@ -89,7 +89,7 @@ by `id` or by `name`:
 | Workers Routes Read / Write | zone | `/zones/{id}/workers/routes` |
 | Email Routing Rules Read / Write | zone | `/zones/{id}/email…` |
 | Zone Spectrum Read / Write | zone | `/zones/{id}/spectrum/apps` |
-| Analytics Read | zone | `/zones/{id}/analytics` |
+| Analytics Read | zone | `/zones/{id}/analytics`, `/zones/{id}/dns_analytics`, `/zones/{id}/origins/health` |
 | Logs Read / Logs Write | zone | `/zones/{id}/logs/requests` (visitor addresses included), `/zones/{id}/logpush/jobs` (Write: change jobs) |
 | Waiting Rooms Read / Write | zone | `/zones/{id}/waiting_rooms` |
 | Workers Scripts, Workers KV Storage, D1 Read / Write | account | `/workers/scripts…`, `/kv/…`, `/d1/…` |
@@ -129,9 +129,26 @@ curl -s -X POST $BASE/zones/$ZONE/dns_records -H "Authorization: Bearer $TOKEN" 
 ```
 
 `origin` fields (all optional): `port`, `scheme` (`http` / `https`, whatever the zone's SSL mode),
-`sni`, `host_header`, `node` (route to that edge node's local port). An empty object removes them.
+`sni`, `host_header`, `node` (route to that edge node's local port), `weight` (1 to 100, 1 when not
+given: this address's share of the requests among the name's addresses, see
+[Origins](#origins-health-checks-weights-and-session-affinity)). An empty object removes them.
 
-SRV and CAA can be written as `data`, the way Cloudflare takes them:
+Record types: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `SRV`, `CAA`, `PTR`, and these, written in
+`content` as in a zone file (a word in double quotes may hold spaces; the content is kept as written):
+
+| Type | `content` |
+| --- | --- |
+| `HTTPS`, `SVCB` | `priority target [key=value ...]`, such as `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1` (`.`: the record's own name). Keys: `alpn`, `no-default-alpn`, `port`, `ipv4hint`, `ipv6hint`, `ech` (base64), each at most once; priority 0 (the alias form) takes none |
+| `TLSA` | `usage selector matching-type data`, the data in hexadecimal |
+| `SSHFP` | `algorithm type fingerprint`, the fingerprint in hexadecimal |
+| `DS` | `key-tag algorithm digest-type digest`, the digest in hexadecimal: the DS of a name the zone delegates with NS records, answered for that name |
+| `NAPTR` | `order preference "flags" "services" "regexp" replacement` (`.` for no replacement) |
+| `URI` | `priority weight "target"` |
+
+Only `A`, `AAAA` and `CNAME` can be proxied. At a proxied name the edge answers `HTTPS` queries with
+its own record (HTTP/3 and HTTP/2), not with the zone's.
+
+SRV and CAA (and only they) can be written as `data`, the way Cloudflare takes them:
 
 ```json
 { "type": "SRV", "name": "_sip._tcp", "data": { "priority": 10, "weight": 5, "port": 5060, "target": "sip.example.com" } }
@@ -155,7 +172,8 @@ mark back.
 GET    /zones/{id}/settings                         every setting
 PATCH  /zones/{id}/settings/{name}                  {"value": …}
 CRUD   /zones/{id}/firewall/rules                   {"expression", "action", "priority", "enabled", "description"}
-CRUD   /zones/{id}/rate_limits                      {"expression", "threshold", "period", "mitigation_timeout", "action"}
+CRUD   /zones/{id}/rate_limits                      {"expression", "threshold", "period", "mitigation_timeout", "action",
+                                                     "characteristics", "status_codes"}
 GET    /zones/{id}/security/events?limit=
 GET    /steering/test?ip=&ua=                       where an address is placed, and its threat score
 ```
@@ -165,7 +183,9 @@ doubtful), `managed_challenge` (always one click), `log`, `skip`. Expressions us
 language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.user_agent`,
 `http.request.headers["x"]`, `ip.src`, `ip.geoip.country`, `ip.geoip.continent`, `ip.geoip.asnum`,
 `ip.geoip.as_org`, `cf.threat_score` (also `fcf.threat_score`), `cf.bot_management.score` (also
-`fcf.bot_score`), `cf.bot_management.ja4` (also `fcf.ja4`), with `eq ne lt le gt ge contains
+`fcf.bot_score`), `fcf.ja4` (also
+`cf.bot_management.ja4`: the JA4 fingerprint of the visitor's TLS ClientHello, empty over plain HTTP
+and HTTP/3; `/cdn-cgi/fucf-trace` shows it as `ja4=`), with `eq ne lt le gt ge contains
 matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
@@ -209,8 +229,8 @@ content-type: application/json
 ```
 
 Every response says whether it came from the cache: `fcf-cache-status` (Cloudflare's labels: `HIT`,
-`MISS`, `EXPIRED`, `STALE`, `REVALIDATED`, `BYPASS`, `DYNAMIC`, `NONE` for what the edge answered
-itself) and `x-cache: HIT|MISS from <colo>`. Nothing the edge sends starts with `cf-`; what an origin
+`MISS`, `EXPIRED`, `STALE`, `UPDATING`, `REVALIDATED`, `BYPASS`, `DYNAMIC`, `NONE` for what the edge
+answered itself) and `x-cache: HIT|MISS from <colo>`. Nothing the edge sends starts with `cf-`; what an origin
 behind Cloudflare sends that does is dropped. Origins receive `fcf-connecting-ip` and `fcf-ipcountry`
 (and, for software written for Cloudflare, `cf-connecting-ip` and `cf-ipcountry`).
 
@@ -226,6 +246,13 @@ firewall blocks, rate limit hits) are counted, and the zone's own rules are kept
 | security level | `auto_firewall_surge` (50; 0 off) different attackers within the window | `under_attack` for an hour after the surge was last seen, then back to the level before |
 
 Banned addresses also count against their threat score on every zone.
+
+A node started with `--ban-export <file>` (`FUCF_BAN_EXPORT`) writes the addresses banned by rules
+with the action `block` (not `managed_challenge`) into that file as an nftables script: the sets
+`banned4` and `banned6` of the table `inet fucf`, each element with the time its ban has left. It
+is checked every 30 seconds and written again when the addresses change. The host loads it (`nft -f`)
+and drops those addresses itself, with rules of its own choosing. IPv6 bans, which are by /64, are
+not written yet: `banned6` stays empty.
 
 ## Backups
 
@@ -353,6 +380,11 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `decoy_subdomains` | `false`, `true` |
 | `auto_firewall` | `false`, `true`, with `auto_firewall_threshold` (10), `auto_firewall_window` (600), `auto_firewall_ban` (86400), `auto_firewall_action` (`block`, `managed_challenge`, `js_challenge`), `auto_firewall_networks` (`true`), `auto_firewall_network_ips` (10), `auto_firewall_surge` (50; 0 off) |
 | `error_pages` | `{}`, or HTML templates by key: see "Custom error pages" below |
+| `origin_check_path` | `""` (no checks), or a path such as `/healthz` (at most 256 bytes): see [Origins](#origins-health-checks-weights-and-session-affinity) |
+| `origin_check_interval` | `30`: 10 to 3600 seconds between two checks of an address |
+| `session_affinity` | `false`, `true`: requests from one visitor address start with the same origin address |
+| `cache_tier_node` | `""`, or the name of a node (at most 64 bytes): tiered cache, see [Cache](#cache) |
+| `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
 
 ```sh
 curl -s -X PATCH $BASE/zones/$ZONE/settings/security_level -H "Authorization: Bearer $TOKEN" -d '{"value": "high"}'
@@ -406,14 +438,112 @@ PATCH  /zones/{id}/dnssec                 {"status": "active|disabled"}
 
 Records are signed online (ECDSA P-256, algorithm 13) with minimal NSEC answers.
 
+### Zone transfers (AXFR)
+
+A secondary name server at another provider keeps the zone resolving when the whole fleet is gone.
+The zone setting `dns_transfer_to` lists who may transfer it: addresses, or networks written as
+`address/prefix`, at most 16.
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/settings/dns_transfer_to -H "Authorization: Bearer $TOKEN" \
+  -d '{"value": ["192.0.2.53", "2001:db8:53::/48"]}'
+# from 192.0.2.53, against any node's DNS listener:
+dig @ns1.example.net example.com AXFR
+```
+
+- Transfers are AXFR over TCP, on the DNS listener of every node (`--dns-listen`). A query from an
+  address not listed, for a zone with DNSSEC on (it is signed per query, there is nothing to hand
+  over) or of a class other than IN is answered `REFUSED`. There is no IXFR and no TSIG: the address
+  is the only check, so list the secondaries' own addresses rather than wide networks.
+- What is sent: the SOA, the zone's NS records, every record, and the SOA again. A proxied name
+  (of a zone that is not paused) is sent as the addresses of every edge node that is not an
+  accelerate node (TTL 300) in place of its A, AAAA and CNAME records: the origin stays hidden, and
+  a secondary cannot steer visitors, so it answers with all the nodes.
+- NOTIFY: about 2 seconds after the zone's serial changes, each node that is not an accelerate node
+  sends a NOTIFY (UDP, port 53) to every single address in `dns_transfer_to` (networks get none),
+  once, without waiting for an answer; the secondary then transfers the zone at once instead of at
+  its next refresh. It is always on: there is no flag for it.
+
+### DNS query counts
+
+```
+GET    /zones/{id}/dns_analytics          the queries the node answering this call answered for the zone
+```
+
+```json
+{ "total": 1520, "by_type": { "A": 900, "AAAA": 400, "HTTPS": 200, "MX": 20 }, "by_rcode": { "NOERROR": 1500, "NXDOMAIN": 20 } }
+```
+
+Every standard query of class IN for a name in the zone is counted, over UDP and TCP, by the type
+asked (`TYPE<n>` for types without a name here) and by the answer (`NOERROR`, `NXDOMAIN`, `REFUSED`,
+otherwise `RCODE<n>`; a name that does not exist counts as `NXDOMAIN` even where DNSSEC answers it
+with a minimal NSEC). Zone transfers are not counted. The counts are kept in this node's memory
+since it started, so they start again at zero after a restart and other nodes have their own; a zone
+nobody asked about answers `{"total": 0, "by_type": {}, "by_rcode": {}}`.
+
 ### Cache
 
 ```
 POST   /zones/{id}/purge_cache            {"purge_everything": true} | {"files": [url, …]} | {"prefixes": [url prefix, …]}
+                                          | {"hosts": [host, …]} | {"tags": [tag, …]}
 POST   /warp/purge_cache                  the same, for the edge's own /cdn-cgi/fucf-warp cache
 ```
 
+- `files`, `prefixes`, `hosts` and `tags` can be given together; everything any of them names goes.
+  A body that names nothing (and no `purge_everything`) is refused. The answer is
+  `{"id": "<zone id>", "purged": <objects removed on this node>}`.
+- `files` are whole URLs with their query (`https://www.example.com/app.js?v=2`), `prefixes` the
+  start of URLs (`https://www.example.com/images/`); the scheme is ignored, so both the HTTP and the
+  HTTPS copy go.
+- `hosts`: everything of these host names (`www.example.com`; the zone's other names stay).
+- `tags`: what the origin tagged with one of these in a `Cache-Tag` response header (comma
+  separated, `Cache-Tag: product-1, listing`). Tags are compared exactly, case included. The header
+  is kept with the copy and never sent to visitors.
+
 A purge reaches every node through the configuration.
+
+More of the cache:
+
+- `stale-while-revalidate=N` in the origin's `Cache-Control` (N at most a day): for N seconds past
+  its freshness an expired copy is answered at once (`fcf-cache-status: UPDATING`) while one
+  background request fetches a new one. Range requests, and requests made while the background queue
+  is full, go to the origin as usual.
+- Cache rules decide what is cached (see [Rules](#rules)); their `ignore_query` keeps one copy per path.
+- Tiered cache: with the zone setting `cache_tier_node` naming a node, every other node fetches the
+  zone's GET and HEAD requests through that node (over HTTPS, the way a visitor would ask it), so
+  its cache serves the whole fleet and only it asks the origin; pick one close to the origin. While
+  that node has just failed, the origin is asked directly. The setting does nothing on the node it
+  names, nor when it names no node of the fleet (it is not checked when saved), nor for requests
+  that an origin rule or the record's `origin.node` already sends somewhere.
+
+### Origins: health checks, weights and session affinity
+
+```
+GET    /zones/{id}/origins/health         what this node's checks say about the zone's origins
+```
+
+```json
+[{ "name": "app.example.com", "address": "192.0.2.10", "healthy": false, "failures": 2,
+   "checked_at": "2026-11-28T12:00:00.000000Z", "detail": "HTTP 503" }]
+```
+
+- With `origin_check_path` set, every node asks each address of the zone's proxied A and AAAA
+  records (wildcard names aside) for that path every `origin_check_interval` seconds: a GET for that
+  name, reaching the address the way a request for the name would (the record's origin options, the
+  zone's origin rules and SSL mode), with a 5 second timeout and the User-Agent
+  `fucf-health/<version>`. Addresses an origin rule sends elsewhere, and paused zones, are not asked.
+- A 2xx or 3xx status passes. After two failures in a row (no answer in time, an error, any other
+  status) the address goes last for that name; one pass brings it back. `failures` counts the
+  failures in a row, `detail` says what the last check got (`HTTP 200`, or why there was no answer),
+  `checked_at` is empty until a first check is done. An empty array: nothing is checked.
+- The answer is the checks of the node that answers the call: each node checks for itself, since
+  what it can reach is what it sends requests to.
+- A name with several proxied addresses takes them in turn by their `origin.weight` (1 when not
+  given: weights 3 and 1 give the first address three requests of every four). With the zone
+  setting `session_affinity`, the turn comes from the visitor's address, so the same visitor starts
+  with the same origin address while the name's addresses stay the same. Addresses that fail their
+  check, or refused a connection in the last 10 seconds, go last either way; only addresses reached
+  the same way (the same origin options, the weight aside) stand in for each other.
 
 ### Certificates
 
@@ -438,7 +568,8 @@ and, where it applies, `priority` (lower first).
 
 ```
 CRUD   /zones/{id}/firewall/rules         {"expression", "action", "priority", "enabled", "description"}
-CRUD   /zones/{id}/rate_limits            {"expression", "threshold", "period", "mitigation_timeout", "action", "enabled"}
+CRUD   /zones/{id}/rate_limits            {"expression", "threshold", "period", "mitigation_timeout", "action",
+                                           "characteristics", "status_codes", "enabled"}
 CRUD   /zones/{id}/redirect_rules         {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
 CRUD   /zones/{id}/transform_rules        {"expression", "rewrite_path", "set_request_headers", "remove_request_headers",
                                            "set_response_headers", "remove_response_headers", "priority"}
@@ -451,13 +582,34 @@ CRUD   /zones/{id}/origin_rules           {"expression", "origin_host", "origin_
 | List | Fields |
 | --- | --- |
 | firewall rules | `action`: `block`, `js_challenge`, `managed_challenge`, `log`, `skip`. Rules kept by the automatic firewall carry `managed_by`. |
-| rate limits | `threshold` (≥ 1) requests per client address per `period` (1 to 86400 s); `mitigation_timeout` 0 to 86400 s; `action`: `block` (default), `log` |
+| rate limits | `threshold` (≥ 1) requests per client per `period` (1 to 86400 s); `mitigation_timeout` 0 to 86400 s; `action`: `block` (default), `log`; `characteristics` and `status_codes`: see below |
 | redirect rules | `target_url`: an `http(s)://` URL or a path; `status_code`: 301, 302 (default), 303, 307, 308 |
 | transform rules | at least one action; `rewrite_path` starts with `/` and has no query; `host`, `content-length`, `transfer-encoding`, `connection` and `upgrade` cannot be set or removed. Every matching rule applies. |
-| cache rules | `cache`: `true` caches whatever the file type, `false` never caches; `edge_ttl` 1 to 31536000 s; `ignore_query`: one copy whatever the query string; `cache_key_headers` / `cache_key_cookies`: one copy per value of these request headers / cookies (see below). The first matching rule wins. |
+| cache rules | `cache`: `true` caches whatever the file type, `false` never caches; `edge_ttl` 1 to 31536000 s; `ignore_query`: `true` keys the cache on the path alone, one copy whatever the query string (the origin still gets the query of the request that fetches it); `cache_key_headers` / `cache_key_cookies`: one copy per value of these request headers / cookies (see below). The first matching rule wins. |
 | origin rules | at least one of the overrides; `origin_scheme`: `http`, `https`; `origin_node`: an edge node to go through |
 
+A rate limit's clients:
+
+- `characteristics` (at most 4) say what tells one client from another: `ip` (alone when none is
+  given), `asn`, `country`, `host`, `path`, `header:NAME`, `cookie:NAME` (names of letters, digits,
+  `-` and `_`, at most 64). They are taken case-insensitively and kept in lower case, cookie names
+  with their case. Several make one key: `["ip", "path"]` counts each address on each path apart.
+  A request without the header or cookie counts under an empty value, so all such requests share
+  one count; add `ip` to keep them apart. `asn` and `country` need the GeoIP databases.
+- `status_codes` (at most 20, 100 to 599, as numbers or strings): only requests answered with one of
+  these count (`[401, 403]` against password guessing). They are counted once the answer is there,
+  so the client that goes over is stopped from its next request on. Empty: every matching request.
+- Counting is per node. A client that one node holds back for 10 seconds or more is held back by the
+  other nodes too, once they hear of it with the reports.
+- Through the Rulesets API these are the `characteristics` and `counting_expression` of
+  `http_ratelimit`: see [Rulesets](#rulesets). A cache rule's `ignore_query` is not shown there, and a
+  change of the rule through its phase leaves it as it is.
+
 ```sh
+curl -s -X POST $BASE/zones/$ZONE/rate_limits -H "Authorization: Bearer $TOKEN" -d '{
+  "expression": "http.request.uri.path eq \"/login\"", "threshold": 5, "period": 60,
+  "mitigation_timeout": 600, "characteristics": ["ip"], "status_codes": [401, 403]
+}'
 curl -s -X POST $BASE/zones/$ZONE/firewall/rules -H "Authorization: Bearer $TOKEN" -d '{
   "expression": "http.request.uri.path contains \"/admin\" and not ip.src in {198.51.100.0/24}",
   "action": "managed_challenge", "priority": 10, "description": "admin pages"
@@ -868,9 +1020,10 @@ POST   /nodes                             {"name", "ipv4", "ipv6", "continents",
 GET    /nodes/{id}  PUT  PATCH  DELETE
 GET    /steering
 POST   /steering                          {"name", "priority", "countries", "regions", "continents", "asns", "as_orgs",
-                                           "action": "route|block", "nodes", "enabled"}
+                                           "action": "route|fastest|block", "nodes", "enabled"}
 PUT    /steering/{id}  PATCH  DELETE
 GET    /steering/test?ip=&ua=
+GET    /steering/measured                 the handshake round trips the nodes measured, per network and node
 GET    /proxy/rules                       the nodes' local reverse proxy
 POST   /proxy/rules                       {"name", "nodes", "listen_port", "hosts", "path_prefix", "exact_path", "rewrite_path",
                                            "strip_prefix", "redirect_url", "redirect_status", "upstreams": [{"url", "weight",
@@ -894,6 +1047,40 @@ curl -s -X POST $BASE/nodes -H "Authorization: Bearer $TOKEN" -d '{
   "traffic_dns_gb": 1000, "traffic_throttle_gb": 1250, "traffic_limit_gb": 1400, "rate_limit_mbps": 10
 }'
 ```
+
+#### Steering by measured round trips
+
+A steering rule's `action` is `route` (the first node of `nodes` that can take the visitor; `nodes`
+is required), `block` (the DNS refuses these visitors; `nodes` is dropped) or `fastest`: the node
+that the visitor's network reaches soonest, as the nodes measured it. For `fastest`, `nodes` are the
+candidates (empty: every node).
+
+With the GeoIP database, each node takes the round trip of every visitor's TLS 1.3 handshake over
+TCP and every QUIC handshake, and keeps a running mean per network: the country with the province or
+state and the AS number (`CN-JS/4134`), the country and the AS number (`CN/4134`), the country with
+the province or state (`CN-JS`), and the country (`CN`). TLS 1.2 takes two round trips and is left
+out, and so are the fleet's own nodes and connections through the HTTP/3 front (that round trip is
+not the visitor's). What is new goes to the other nodes with the reports. A rule
+compares the candidates on the most precise of these networks that at least two of them have 5 or
+more handshakes of within the last day, and answers the fastest, for each address family. While
+nothing tells them apart, a candidate is picked at random; and 5 answers in a hundred go to a random
+candidate anyway, so every node keeps being measured.
+
+```
+GET /steering/measured
+```
+
+```json
+{ "CN": { "hkg1": { "ms": 41.3, "samples": 87, "age": 12 }, "nrt1": { "ms": 63.0, "samples": 40, "age": 95 } },
+  "CN/4134": { "hkg1": { "ms": 44.8, "samples": 31, "age": 12 } } }
+```
+
+Network, then node: `ms` is the running mean (a new handshake weighs a fifth), `samples` the
+handshakes in it, `age` the seconds since the last one. Measurements older than a day are left out, so
+a fleet that measured nothing yet answers `{}`; each node keeps at most 4000 networks.
+`GET /steering/test` answers `measured` too: the network a `fastest` rule would go by for that
+address and the nodes fastest first (`{"network", "nodes": [{"name", "ms"}]}`), or `null`. Both need
+Fleet Read.
 
 ### Alerts
 

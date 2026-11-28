@@ -52,7 +52,7 @@
 - 域名设置照抄 `origin_check_path` 的输入框写法：`cache_tier_node`（文本）、`dns_transfer_to`（逗号分隔 IP 列表，放 DNS 页）。空字符串=未设置。
 - 每处做空态处理（接口可能返回空数组/空对象，面板不能报错）。
 
-### [ ] N4 新接口与行为的文档补齐
+### [x] N4 新接口与行为的文档补齐
 
 - `docs/api.md` 补上第 0 节表格里所有接口/字段：`GET /steering/measured`、`GET /zones/{id}/origins/health`、`GET /zones/{id}/dns_analytics`、purge body 的 `hosts`/`tags`、缓存规则全部新字段、限速规则 `characteristics`/`status_codes`、域名设置 `cache_tier_node`/`dns_transfer_to`/`origin_check_path`/`session_affinity`、新 DNS 记录类型与 AXFR 用法（`@dns_transfer` ACL 标签、`--dns-notify`）。
 - 核对 README 已有小节与代码一致，过期就修。
@@ -145,3 +145,9 @@
 - 接口形状以代码为准，和任务单写的不同；三个表都只反映应答面板的那个节点，卡片里写明了。
 - `dns_transfer_to` 用新的 `data-list` 标记，change 处理里按逗号或空白拆成数组发送，留空发 `[]`；只读角色看到的两个输入框是禁用的，表格谁都能看。
 - 每个表都有空态，接口失败、字段缺失、类型不对都不报错（用 node 跑过各种异常输入）。没在浏览器里实际看过；调度页原有的"添加规则"对非管理员仍可见（服务端会拒），未改。
+
+### N4
+- 只改了 `docs/api.md` 和 `README.md`，内容按代码写，不按任务单：`/steering/measured` 是 `{网络: {节点: {ms, samples, age}}}`，`/origins/health` 是 `[{name, address, healthy, failures, checked_at, detail}]`，`/dns_analytics` 是 `{total, by_type, by_rcode}`；缓存规则没有 `swr`（只认源站的 `stale-while-revalidate`），也没有 `@dns_transfer` 标签和 `--dns-notify`（ACL 就是 `dns_transfer_to`，NOTIFY 总是发）。
+- api.md 新增"Zone transfers (AXFR)""DNS query counts""Origins: health checks, weights and session affinity""Steering by measured round trips"四节；限速的 `characteristics` / `status_codes` 写在 Rules 里，Rulesets 的对应关系只链接、不重复。
+- README 修了过期的地方：`--edge-ttl` 说明、`fucf-trace` 字段、已知限制里"没有 AXFR / 没有主动健康检查 / 没有 DNS 查询统计"，并补上 `--dns-rrl`、`--ban-export`、`--origin-client-*` 三个参数。
+- 留给能运行的人：`--ban-export` 写不出 IPv6 封禁（autofw 存的是 /64，banset 只认单个地址），`banned6` 总是空的；`characteristics` 缺头时所有这类请求共用一个计数；`cache_tier_node` 保存时不检查节点是否存在。

@@ -31,7 +31,10 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--http3-listen` | 同 HTTPS 地址 | HTTP/3 的 UDP 监听地址，可与 HTTPS 不同端口（`Alt-Svc` 会通告它）；`off` 关闭 |
 | `--h3-front-listen` | 无 | HTTP/3 前置入口：本机另一个占着 UDP 443 的 QUIC 服务（如带 `proxy` 伪装的 Hysteria 2）把普通 HTTP/3 访客用明文 HTTP 转到这个地址，见"HTTP/3 前置"。只应监听回环地址 |
 | `--h3-front-cert` / `--h3-front-port` | 无 / `443` | 前置服务向访客出示的证书（PEM）和它的 UDP 端口；只对该证书覆盖的主机名通告 HTTP/3 |
-| `--edge-ttl` | `300` | `--cname-base` 下各名字的应答 TTL（秒）。节点故障或流量超限后，最长这么久之后访客才被调度走 |
+| `--edge-ttl` | `300` | 指向边缘的 DNS 应答的 TTL（秒）：`--cname-base` 下的名字用它，代理记录用它但最多 300（记录自己的 TTL 不管用）。节点故障或流量超限后，最长这么久之后访客才被调度走 |
+| `--dns-rrl` | `100` | 权威 DNS 的 UDP 响应限速（每个网络每个名字每秒的应答数），`0` 关闭，见"DNS 响应限速与内核层封禁" |
+| `--ban-export` | 无 | 把自动防火墙封禁的地址写成 nftables 脚本的文件路径，见"DNS 响应限速与内核层封禁" |
+| `--origin-client-cert` / `--origin-client-key` | 无 | 回源时出示的客户端证书和私钥（PEM），两个要一起给，见"回源时出示客户端证书" |
 | `--release-key` | 无 | 发布公钥（见"滚动更新与自动回滚"）。配置后本节点接受机群滚动发布的新版本，新版本不能用时自动退回；不配置则只能手动替换二进制 |
 | `--proxy-protocol` | 关 | 边缘 TCP 连接必须以 PROXY protocol v1 头开始（仅用于只经可信四层代理可达的监听） |
 | `--api-listen` | `127.0.0.1:8787` | 管理 API 与面板 |
@@ -67,24 +70,27 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /warp/purge_cache                        POST             清除预留端点 /cdn-cgi/fucf-warp 的缓存：{"purge_everything":true} | {"files":[键...]} | {"prefixes":[键前缀...]}
 /nodes[/{id}]                            CRUD             {"name", "ipv4", "ipv6", "continents": ["AS","OC"], "enabled", "traffic_dns_gb", "traffic_throttle_gb", "traffic_limit_gb", "traffic_period", "traffic_reset_day", "rate_limit_mbps"}；
                                                           返回值带 healthy、副本状态（配置版本、是否同步、最后上报时间）和 traffic（本周期已用字节数、状态）
-/steering[/{id}]                         CRUD             {"name", "priority", "countries", "regions", "continents", "asns", "as_orgs", "action": "route|block", "nodes": [...]}
-/steering/test?ip=                       GET              这个地址被定位到哪里（国家、省份、大洲、ASN）、命中哪条规则
+/steering[/{id}]                         CRUD             {"name", "priority", "countries", "regions", "continents", "asns", "as_orgs", "action": "route|fastest|block", "nodes": [...]}
+/steering/test?ip=                       GET              这个地址被定位到哪里（国家、省份、大洲、ASN）、命中哪条规则、所在网络的实测排名
+/steering/measured                       GET              各节点实测的访客握手往返时间：{网络: {节点: {"ms", "samples", "age"}}}，见"实测调度与故障切换"
 /email/status                            GET              本节点 SMTP 监听地址、主机名、中继配置与最近转发活动
 /zones                                   GET POST         {"name", "type": "full|partial"}
 /zones/{id}                              GET PATCH DELETE
 /zones/{id}/dns_records[/{id}]           GET POST PUT PATCH DELETE   与 Cloudflare 相同的字段，另有 "origin"：已代理记录的高级回源选项（见下）
 /releases[/{sha256}]                     GET PUT DELETE   滚动发布，见"滚动更新与自动回滚"
 /zones/{id}/settings[/{name}]            GET PATCH        {"value": ...}
-/zones/{id}/purge_cache                  POST             {"purge_everything":true} | {"files":[...]} | {"prefixes":[...]}
+/zones/{id}/purge_cache                  POST             {"purge_everything":true} | {"files":[...]} | {"prefixes":[...]} | {"hosts":[...]} | {"tags":[...]}
 /zones/{id}/custom_certificates[/{id}]   CRUD             {"certificate": PEM, "private_key": PEM, "hosts": [...]}；返回值带 expires_on
 /zones/{id}/ssl/certificate_packs[/{id}] GET POST PATCH DELETE   {"hosts": [...], "validation_method": "auto|dns|tls-alpn|http"}；PATCH 立即重试
 /zones/{id}/firewall/rules[/{id}]        CRUD             {"expression", "action", "priority", "enabled", "description"}
-/zones/{id}/rate_limits[/{id}]           CRUD             {"expression", "threshold", "period", "mitigation_timeout", "action"}
+/zones/{id}/rate_limits[/{id}]           CRUD             {"expression", "threshold", "period", "mitigation_timeout", "action", "characteristics", "status_codes"}，见"限速的计数方式"
 /zones/{id}/security/events              GET
 /zones/{id}/origin_rules[/{id}]          CRUD             {"expression", "origin_host", "origin_port", "origin_scheme", "host_header", "sni", "priority"}
 /zones/{id}/redirect_rules[/{id}]        CRUD             {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
 /zones/{id}/transform_rules[/{id}]       CRUD             {"expression", "rewrite_path", "set_request_headers", "remove_request_headers", "set_response_headers", "remove_response_headers"}
-/zones/{id}/cache_rules[/{id}]           CRUD             {"expression", "cache": true|false, "edge_ttl", "priority"}
+/zones/{id}/cache_rules[/{id}]           CRUD             {"expression", "cache": true|false, "edge_ttl", "ignore_query", "priority"}
+/zones/{id}/origins/health               GET              本节点对这个区域各源站地址的健康检查结果（区域设置 origin_check_path）
+/zones/{id}/dns_analytics                GET              本节点自启动以来为这个区域应答的 DNS 查询数：{"total", "by_type", "by_rcode"}
 /zones/{id}/email                        GET PATCH        区域邮件路由开关、规则、当前 MX/SPF/DKIM 及缺失的建议 DNS 记录；PATCH {"dkim_selector", "dkim_private_key"}
 /zones/{id}/email/rules[/{id}]           CRUD             {"address", "action": "forward|drop", "destinations": [...], "enabled", "description"}
 /zones/{id}/analytics                    GET              ?since=-1440（分钟）| 90m | 24h | 7d（默认 24h，最长 30d），?step= 分钟
@@ -112,15 +118,16 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `host_header` | 访客访问的域名 | 发给源站的 `Host` 请求头 |
 | `port` | HTTPS 443 / HTTP 80 | 源站端口 |
 | `scheme` | 跟随区域的 `ssl` 模式 | `http` 或 `https` |
+| `weight` | 1 | 1–100：同名的多个地址按权重轮流分请求（如 3 和 1：每 4 个请求里前一个地址拿 3 个），见区域设置 `session_affinity` |
 
 典型用途：源站自己也在别的 CDN 后面（例如用了 Cloudflare 自定义主机名，再配一个优选地址）——记录内容填要连的地址，
 `sni` 填握手用的域名，`host_header` 填真正要访问的域名，两者可以不同。证书是否校验仍由区域的 `ssl` 模式决定
 （`strict` 时按 `sni` 校验）。
 
-- 四项都可省略；全部留空等于没有选项。`PATCH` 时不带 `origin` 表示不动，带空对象 `{}` 表示清除。
+- 每一项都可省略；全部留空等于没有选项。`PATCH` 时不带 `origin` 表示不动，带空对象 `{}` 表示清除。
 - 匹配到的回源规则（`origin_rules`）逐字段优先于记录上的选项；回源规则用 `origin_host` 把请求改送别处时，
   记录上的选项不再适用（它们描述的是记录内容那个源站）。
-- 同名的多条地址记录各带各的选项；故障转移只在选项相同的地址之间进行。CNAME 记录的选项对它最终解析到的地址生效。
+- 同名的多条地址记录各带各的选项；故障转移只在选项相同（`weight` 不算）的地址之间进行。CNAME 记录的选项对它最终解析到的地址生效（这些地址的权重都按 1）。
 - 不影响 DNS 应答，也不影响缓存键（仍按访客访问的域名）。
 
 ### 区域设置
@@ -139,9 +146,10 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `browser_cache_ttl` | 秒（默认 0） | 边缘会缓存的内容，浏览器缓存时间不足该值时提到该值；0 表示不改源站的 `Cache-Control` |
 | `hsts_max_age` / `hsts_include_subdomains` | 秒（默认 0）/ bool | HTTPS 响应带 `Strict-Transport-Security`；0 表示不发 |
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
-| `origin_check_path` / `origin_check_interval` | 路径（默认空）/ 秒（默认 30） | 源站主动健康检查：每个节点定期请求每个源站地址的这个路径，连续两次失败（无应答或状态码不是 2xx/3xx）的地址排到最后；`GET /zones/{id}/origins/health` 查看本节点的检查结果（面板：域名 → SSL/TLS → 源站健康） |
-| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点（面板：域名 → 缓存 → 分层缓存） |
-| `session_affinity` | bool（默认关） | 会话保持：同一访客 IP 始终回到同一个源站地址（记录的 `origin.weight`，1–100，决定各地址分到的请求比例） |
+| `origin_check_path` / `origin_check_interval` | 路径（默认空，最长 256 字节）/ 秒（默认 30，10–3600） | 源站主动健康检查：每个节点按这个间隔向区域里已代理的 A/AAAA 记录的每个地址发 GET 请求这个路径（按访客访问该名字的方式连过去，5 秒超时，User-Agent `fucf-health/<版本>`；回源规则改送别处的地址、通配符名字和暂停的区域不查）。2xx/3xx 算通过，连续两次失败（无应答或别的状态码）的地址排到最后，通过一次就恢复；`GET /zones/{id}/origins/health` 查看本节点的检查结果（`name`、`address`、`healthy`、`failures`、`checked_at`、`detail`；面板：域名 → SSL/TLS → 源站健康） |
+| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点。保存时不检查节点是否存在：写的不是机群里的节点、在它自己身上、或请求已被回源规则或记录的 `origin.node` 送去别处时，不分层（面板：域名 → 缓存 → 分层缓存） |
+| `session_affinity` | bool（默认关） | 会话保持：同一个访客地址总是从同一个源站地址开始（同名的地址不变时）；该地址检查失败或刚拒绝过连接时照常换下一个。各地址分到的比例由记录的 `origin.weight` 决定（见"高级回源"） |
+| `dns_transfer_to` | 地址或网段数组（默认空，最多 16 个） | 允许做区域传送（AXFR）的辅助名称服务器，如 `["192.0.2.53", "2001:db8:53::/48"]`，见"DNS：更多记录类型、辅助名称服务器、查询统计"（面板：域名 → DNS 记录 → 区域传送） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
 | `decoy_subdomains` | bool（默认关） | 伪装子域：没有记录的名字也能解析，但边缘不应答（见"伪装子域"） |
 | `auto_firewall` 及 `auto_firewall_*` | 见"自动防火墙" | 按近期安全事件自动封禁地址、网络，或切到受攻击模式 |
@@ -160,6 +168,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   `http.request.method` `http.user_agent` `http.referer` `http.cookie` `http.x_forwarded_for`
   `http.request.headers["name"]` `ip.src` `ssl`
   `ip.geoip.country` `ip.geoip.continent` `ip.geoip.asnum` `ip.geoip.as_org`（需要 GeoIP 库）
+  `cf.threat_score`（或 `fcf.threat_score`，见"安全级别、IP 纯净度与页面内人机验证"）`fcf.ja4`（或 `cf.bot_management.ja4`，见"TLS 指纹（JA4）"）
 - 运算符：`eq ne contains matches in lt le gt ge`（及 `== != ~ < <= > >=`），`and or not`（及 `&& || !`）
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
 - IP 列表：`ip.src in $office`（见下面的"IP 列表"）。
@@ -178,7 +187,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 **节点分配**：每个节点登记 IPv4/IPv6 和它负责的大洲。解析代理记录时按访客位置（优先用 EDNS Client Subnet）选节点：
 
-1. 调度规则按 `priority` 升序匹配访客的国家、大洲、ASN 或运营商名；`route` 规则回答 `nodes` 列表里第一个健康的节点（列表顺序即故障切换顺序）。
+1. 调度规则按 `priority` 升序匹配访客的国家、大洲、ASN 或运营商名；`route` 规则回答 `nodes` 列表里第一个健康的节点（列表顺序即故障切换顺序），`fastest` 规则回答实测最快的节点（见"实测调度与故障切换"）。
 2. 没有规则命中时，回答负责访客所在大洲的节点。
 3. 位置未知或对应节点都不可用时，回答所有健康节点。
 
@@ -196,11 +205,29 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 ### DNS：更多记录类型、辅助名称服务器、查询统计
 
-- 记录类型增加 `HTTPS`、`SVCB`（内容如 `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1`）、`TLSA`、`SSHFP`、`DS`（委派出去的子域的 DS）、`NAPTR`、`URI`。
-- 区域设置 `dns_transfer_to`：允许做区域传送（AXFR，仅 TCP）的辅助名称服务器地址或网段；区域变更时向其中的单个地址发 NOTIFY。面板：域名 → DNS 记录 → 区域传送（逗号分隔，留空为不允许）。
-  传给辅助服务器的内容同样隐藏源站：代理的名字给出全部边缘节点的地址（辅助服务器上没有按访客调度）。开启了 DNSSEC 的区域不传送（签名是按查询在线做的）。
-  把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
-- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分；面板：域名 → DNS 记录 → 查询统计。
+- 记录类型增加 `HTTPS`、`SVCB`、`TLSA`、`SSHFP`、`DS`、`NAPTR`、`URI`，内容按区域文件的写法填在 `content` 里（带空格的部分加双引号，存的是原样）：
+
+  | 类型 | `content` |
+  |------|-----------|
+  | `HTTPS` / `SVCB` | `优先级 目标 [键=值 ...]`，如 `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1`（`.` 表示记录自己的名字）；键有 `alpn`、`no-default-alpn`、`port`、`ipv4hint`、`ipv6hint`、`ech`（base64），每个最多一次；优先级 0（别名形式）不能带键 |
+  | `TLSA` | `用途 选择器 匹配类型 数据`，数据为十六进制 |
+  | `SSHFP` | `算法 类型 指纹`，指纹为十六进制 |
+  | `DS` | `密钥标签 算法 摘要类型 摘要`，摘要为十六进制：委派出去（有 NS 记录）的子域的 DS，在该名字上应答 |
+  | `NAPTR` | `顺序 优先 "标志" "服务" "正则" 替换`（替换为 `.` 表示没有） |
+  | `URI` | `优先级 权重 "目标"` |
+
+  `data` 写法仍只用于 SRV 和 CAA。已代理的名字上，HTTPS 查询由边缘回答自己的记录（通告 HTTP/3、HTTP/2），区域里填的 HTTPS 记录不会出现。
+- 区域设置 `dns_transfer_to`：允许做区域传送的辅助名称服务器地址或网段（`地址/前缀`），最多 16 个；面板：域名 → DNS 记录 → 区域传送（逗号分隔，留空为不允许）。
+  - 只有 TCP 上的 AXFR（每个节点的 `--dns-listen`），没有 IXFR，也没有 TSIG：地址是唯一的凭据，所以尽量写辅助服务器的具体地址，别写大网段。
+    不在列表里的地址、开启了 DNSSEC 的区域（签名是按查询在线做的，没有现成的签名可传）一律回答 `REFUSED`。
+  - 传给辅助服务器的内容同样隐藏源站：代理的名字（区域没暂停时）不给它的 A/AAAA/CNAME，而是给出全部非加速节点的地址（TTL 300），因为辅助服务器上没有按访客调度。
+  - 区域的序列号变了约 2 秒后，每个非加速节点都向列表里的单个地址（网段不发）的 UDP 53 端口发一次 NOTIFY，不重发、不等回复，辅助服务器收到就立即来取。
+    NOTIFY 总是开着，没有开关参数。
+  - 把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。例：`PATCH /zones/{id}/settings/dns_transfer_to {"value": ["192.0.2.53"]}`，
+    再在 192.0.2.53 上用 `dig @ns1.example.net example.com AXFR` 试一次。
+- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，如 `{"total": 1520, "by_type": {"A": 900, "AAAA": 400}, "by_rcode": {"NOERROR": 1500, "NXDOMAIN": 20}}`。
+  UDP 和 TCP 的标准查询（IN 类）都算，按查询的类型（不认识的写成 `TYPE<n>`）和应答码（`NOERROR` / `NXDOMAIN` / `REFUSED`，其他为 `RCODE<n>`）拆分；
+  不存在的名字即使在 DNSSEC 下以最小 NSEC 回答也记为 `NXDOMAIN`；区域传送不算。只在本节点内存里，重启清零，各节点各有一份。面板：域名 → DNS 记录 → 查询统计。
 
 ### 回源时出示客户端证书
 
@@ -211,7 +238,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 每条 TLS 连接的 ClientHello 会算出 JA4 指纹（协议版本、加密套件、扩展、签名算法的组合）：浏览器、命令行工具和攻击工具的指纹各不相同，与它们自称的 User-Agent 无关。
 规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
-经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
+明文 HTTP、经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
 
 ### Bot 分
 
@@ -229,22 +256,28 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 - `--ban-export 文件`（`FUCF_BAN_EXPORT`）：把自动防火墙当前封禁的地址（只含动作为拦截的规则）写成 nftables 脚本，每 30 秒检查、有变化才重写。
   fucf 自己没有改内核表的权限，也不替你决定封禁覆盖哪些端口：由宿主机用 `nft -f 文件` 加载（例如配一个 systemd path 单元），并自己加丢弃规则，如
   `nft add chain inet fucf input '{ type filter hook input priority -10; }'` 和 `nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop`。
-  注意同一台机器上的其他服务是否也该被这条规则覆盖。
+  注意同一台机器上的其他服务是否也该被这条规则覆盖。脚本里是 `inet fucf` 表的 `banned4`、`banned6` 两个集合，每个地址带着封禁剩下的时间（`timeout`）。
+  目前只有 IPv4：自动防火墙对 IPv6 按 /64 封禁，这些网段还没有写进文件，`banned6` 总是空的。
 
 ### 限速的计数方式
 
 - `characteristics`：区分客户端的依据，默认只按 `ip`；可选 `asn`、`country`、`host`、`path`、`header:名称`、`cookie:名称`，最多 4 个，组合成一个计数键（例如 `["header:x-api-key"]` 按 API 密钥限速）。
-- `status_codes`：只统计以这些状态码应答的请求（如 `[401, 403]` 用来挡撞库）。这类规则在应答之后计数，超限的客户端从下一个请求起被拦。
+  大小写不限，存成小写（Cookie 名保留原样）；头名和 Cookie 名只能是字母、数字、`-`、`_`，最长 64。
+  没带这个头或 Cookie 的请求按空值计，也就是这些客户端共用一个计数，并不会退回按 IP 算；要分开就把 `ip` 也写进去（如 `["ip", "header:x-api-key"]`）。`asn`、`country` 要有 GeoIP 库。
+- `status_codes`：只统计以这些状态码应答的请求（如 `[401, 403]` 用来挡撞库；最多 20 个，100–599，写数字或字符串都行）。这类规则在应答之后计数，超限的客户端从下一个请求起被拦。
+- 经 Rulesets API 时这两项是 `http_ratelimit` 阶段的 `characteristics` 和 `counting_expression`，对应关系见"Rulesets API（兼容 Cloudflare）"。
 - 一个客户端在某个节点上被限速（封禁 10 秒以上）后，其他节点随上报得知，也照样拦它；计数本身仍是各节点各算各的。
 
 ### 实测调度与故障切换
 
-- 调度规则的动作除了 `route`（按顺序取第一个可用节点）和 `block`，还有 `fastest`：解析到访客所在网络**实测最快**的节点。
-  每个节点记录访客 TLS 1.3 / QUIC 握手的一次往返时间，按网络（国家、省或州、运营商 AS 号，如 `CN-JS/4134`、`CN/4134`、`CN-JS`、`CN`）
-  取滑动平均，随上报传给其他节点；DNS 用最精确且至少两个候选节点都有足够样本（5 次握手、一天以内）的那一级来比较。
-  `nodes` 是候选节点，留空为全部。数据不足时在候选里轮流分配，另有 5% 的应答随机分给其他候选，以便持续测量。
-  `GET /steering/measured` 返回全部实测数据（网络 → 节点 → 往返毫秒、样本数、多少秒前更新），面板"调度与 DNS 屏蔽"页下方的"实测延迟"表按节点列出；"定位"会显示某个地址所在网络的实测排名。
-  （TLS 1.2 的握手是两次往返，不计入；经 HTTP/3 前置进来的连接量不到访客的往返时间。）
+- 调度规则的动作除了 `route`（按顺序取第一个可用节点，`nodes` 必填）和 `block`，还有 `fastest`：解析到访客所在网络**实测最快**的节点。
+  每个节点记录访客 TLS 1.3 / QUIC 握手的一次往返时间（要有 GeoIP 库），按网络（国家、省或州、运营商 AS 号，如 `CN-JS/4134`、`CN/4134`、`CN-JS`、`CN`）
+  取滑动平均（新的一次占五分之一），随上报传给其他节点；DNS 用最精确且至少两个候选节点都有足够样本（5 次握手、一天以内）的那一级来比较，IPv4、IPv6 各选各的。
+  `nodes` 是候选节点，留空为全部。数据不足时在候选里随机挑一个，有数据时也有 5% 的应答随机分给候选之一，以便持续测量。
+  （TLS 1.2 的握手是两次往返，不计入；机群自己的节点不计；经 HTTP/3 前置进来的连接量不到访客的往返时间。）
+- `GET /steering/measured` 返回全部实测数据，按网络、再按节点：`{"CN": {"hkg1": {"ms": 41.3, "samples": 87, "age": 12}}}`，
+  `ms` 是滑动平均，`samples` 是计入的握手次数，`age` 是距最近一次的秒数；超过一天的不列出，什么都没测到时是 `{}`。每个节点最多记 4000 个网络。
+  `GET /steering/test?ip=` 的 `measured` 是这个地址所在网络的排名（`{"network", "nodes": [{"name", "ms"}]}`，没有时为 `null`），面板的"定位"显示的就是它；"调度与 DNS 屏蔽"页下方的"实测延迟"表按节点列出全部实测数据。
 - 指向边缘的应答的 TTL 由 `--edge-ttl`（`FUCF_EDGE_TTL`，默认 300 秒）决定，代理记录最多 300 秒：调小后节点故障或超量时访客更快换走，代价是解析次数更多。
 - TLS 会话票据的密钥由机群令牌和时间（每 12 小时一换）导出，所有节点相同：访客被 DNS 换到另一个节点、或节点重启后，
   仍可恢复会话而不必完整握手。
@@ -261,10 +294,12 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `/cdn-cgi/limit/page.css`、`mark.svg` | 节点限流提示页的资源（见下一节） |
 | `/cdn-cgi/challenge-platform/widget.js`、`widget/ticket`、`widget/verify`、`siteverify` | 人机验证组件的脚本、出题、答题和后端校验（见“人机验证组件”） |
 
-`fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`fucf-<节点名>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
-`colo`（节点名大写）、`http`（`http/1.1` / `http/2` / `http/3`）、`loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、
-`sni`（`plaintext` / `off`）、`warp`（恒为 `off`）、`kex`；后面是自有的——`ja4`（TLS 指纹）、`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
-`limit`（本节点的限流状态）、`threat`（威胁分）、`bot`（Bot 分）、`region`（省 / 州，未知为空）。
+`fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`<dc>f<进程号>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
+`colo`（节点的 `colo`，没设时取节点名去掉末尾数字后大写）、`dc`（节点的 `dc`，没设时取节点名末尾的数字，默认 1）、`http`（`http/1.0` / `http/1.1` / `http/2` / `http/3`）、
+`loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、`sni`（`plaintext` / `off`）、
+`warp`（访客地址是本机群的节点时为 `fucf`，是 Cloudflare 的地址时为 `cloudflare`，否则 `off`）、`kex`；
+后面是自有的——`ja4`（本连接的 JA4 指纹，见"TLS 指纹（JA4）"）、`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
+`limit`（本节点的限流状态）、`threat`（访客地址的威胁分）、`bot`（Bot 分，见"Bot 分"）、`region`（省或州，未知为空）。
 
 ```bash
 curl https://<任意接入的主机名>/cdn-cgi/fucf-trace      # 看请求落在哪个节点、节点看到的 IP / 协议 / 地区
@@ -334,18 +369,24 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 - gRPC：区域设置 `grpc` 开启时（默认），gRPC 请求以 HTTP/2 回源（源站用 TLS 时须支持 ALPN `h2`，明文时须支持 h2c），
   请求和响应都按消息流式透传（含双向流），响应 trailers（`grpc-status`）原样送达；一次调用没有时长上限，连接靠 HTTP/2 ping 保活。
   边缘自己拒绝或失败的请求（WAF、限流、源站不可达）以 gRPC 状态码返回而不是错误页。gRPC-Web 是普通 HTTP，不走这条路径。
-- 故障转移：一个主机名有多条代理 A/AAAA 记录时轮询；连接被拒的地址 10 秒内排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
-- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份）。首条匹配生效。
+- 故障转移：一个主机名有多条代理 A/AAAA 记录时按记录的 `origin.weight` 轮流（区域设置 `session_affinity` 开启时同一访客从同一个地址开始）；
+  健康检查失败的地址（区域设置 `origin_check_path`）和 10 秒内拒绝过连接的地址排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
+- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份，回源时仍带着那次请求的查询串）。首条匹配生效。
+  `ignore_query` 在 Rulesets API 里不显示，经它修改规则时保持原样。
 - 自定义缓存键：缓存规则的 `cache_key_headers`（请求头名）和 `cache_key_cookies`（Cookie 名）让这些值也进缓存键，每个取值各存一份，
   适合按语言、设备或 Cookie 里的实验分组返回不同内容的源站。各最多 8 个名字；请求头名不区分大小写（存成小写），Cookie 名区分大小写；
   请求里没有的按空值算，同名 Cookie 取第一个，值里的控制字符会被去掉。加了这些值后键超过 2048 字节的请求不查也不存缓存（`BYPASS`），
   防止超长头把缓存撑爆；没配这两个字段的规则缓存键和以前完全一样。源站的 `Vary` 可以指向这些请求头（其他 `Vary` 照旧不缓存）。
   按 URL 或前缀清除时，同一 URL 的各个取值一起清掉。
-- 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象；或给 `tags`：清掉源站用 `Cache-Tag` 响应头（逗号分隔）标记过的对象，该响应头不会发给访客。
-- `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本。
+- 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象（同区域的其他主机名不动）；或给 `tags`：清掉源站用 `Cache-Tag` 响应头（逗号分隔）标记过的对象，
+  标签区分大小写、整个比较，该响应头随副本保存但不会发给访客。几种可以写在同一个请求里，命中任何一种的都清掉；`files` 和 `prefixes` 不看协议，HTTP 和 HTTPS 的副本一起清。
+  返回 `{"id": 区域 id, "purged": 本节点清掉的对象数}`，其他节点随配置同步清除。
+- `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本（同一个对象同时只取一次）；
+  Range 请求和后台队列已满时照常回源。
+- 分层缓存：区域设置 `cache_tier_node`（见"区域设置"），其他节点的 GET/HEAD 都经那个节点回源。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
-  遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `fcf-cache-status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`（边缘自己应答的为 `NONE`）。
+  遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `fcf-cache-status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / UPDATING / BYPASS / DYNAMIC`（边缘自己应答的为 `NONE`）。
 - HTTPS：优先使用上传的证书，其次是自动签发的托管证书，都没有则为托管域名即时生成自签名证书（见"证书"一节）。
 - DNS：根域名可以建 CNAME（CNAME 拉平）：应答时不返回 CNAME，而是目标的 A/AAAA；目标在本服务托管的区域内时直接查，
   否则由后台每分钟用系统解析器解析一次。根域名的 CNAME 可以和 MX/TXT 等记录并存，但不能和 A/AAAA 并存。
@@ -886,16 +927,17 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
   发布的二进制在主节点内存里过一遍（上传和下载各一份），小内存机器上注意 `MemoryMax`。
 - HTTP/3 前置：经前置入口进来的 gRPC 不按 gRPC 处理（中间那一跳是 HTTP/1.1，带不了 trailers）；WebSocket 不经过它
   （HTTP/3 没有升级）；请求和响应都多一次本机转发。
-- DNS：没有 AXFR；DNSSEC 只支持在线签名（ECDSA P-256，算法 13，NSEC 用最小否定应答）；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
+- DNS：区域传送只有 TCP 上的 AXFR（没有 IXFR、TSIG，按来源地址放行），开启 DNSSEC 的区域不能传送；查询统计只在各节点内存里，重启清零；DNSSEC 只支持在线签名（ECDSA P-256，算法 13，NSEC 用最小否定应答）；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
 - 缓存：单个对象上限 32 MiB（未声明长度的 8 MiB）；Range 请求只在缓存里已有完整对象时由缓存应答，不会为它去源站拉完整对象；多段 Range 返回整个对象。
 - HTTP/3：不支持 0-RTT。回源除 gRPC 用 HTTP/2 外主要为 HTTP/1.1。
 - gRPC：经 Worker 路由的请求不走 gRPC 路径；请求侧的 trailers 不转发；WAF 不检查 gRPC 请求体。
 - 节点限流：只计响应体字节（不含请求体、响应头、TLS 开销），WebSocket 升级后的数据和 Spectrum 不计量也不限速；
   没有手动清零用量的接口（调高上限即可解除）；改 `traffic_reset_day` 使周期起点后移时用量清零；
-  DNS 避让受解析缓存 TTL 影响（代理记录 300 秒），不是立刻生效；主节点不可用时，副本的超限状态传不到其他节点的 DNS。
+  DNS 避让受解析缓存 TTL 影响（`--edge-ttl`，默认 300 秒），不是立刻生效；主节点不可用时，副本的超限状态传不到其他节点的 DNS。
 - 压缩：未知长度（流式）的响应不压缩。
-- 源站故障转移是被动的（没有对源站的主动健康检查），超时不会重发请求。
-- 分析：按国家 / 主机名 / 路径的拆分只保留 7 天，每小时每个维度只留排名靠前的若干项（其余并入"(other)"）；没有 DNS 查询量统计。
+- 源站：主动健康检查要给区域设了 `origin_check_path` 才有，各节点各查各的，只查已代理的 A/AAAA 地址（CNAME 指向的地址不查）；超时不会重发请求。
+- 分析：按国家 / 主机名 / 路径的拆分只保留 7 天，每小时每个维度只留排名靠前的若干项（其余并入"(other)"）；DNS 查询数（`dns_analytics`）不进时间序列，也不在节点之间汇总。
+- 封禁导出（`--ban-export`）：只写 IPv4 的封禁，按 /64 封的 IPv6 还没有写进文件。
 - WAF：托管规则是一组正则，不是完整的 OWASP CRS；请求体只检查不超过 1 MiB 的。
 - Workers：每个请求新建 JS 上下文（无全局状态复用）；只支持单文件脚本；请求体/响应体只能以文本读取
   （未读取的二进制体可原样透传）；不支持流式 API；单请求最多 50 个子请求，体积上限 16 MiB。
