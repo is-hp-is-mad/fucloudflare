@@ -171,6 +171,13 @@ pub struct Settings {
     /// mode: the level to go back to, and until when (unix seconds).
     pub auto_level_restore: String,
     pub auto_level_until: u64,
+    /// Path every node asks of each origin address of the zone's proxied names
+    /// (see crate::edge::origins); empty: no health checks.
+    pub origin_check_path: String,
+    /// Seconds between two checks of an address.
+    pub origin_check_interval: u32,
+    /// A visitor keeps going to the same origin address of a name with several.
+    pub session_affinity: bool,
 }
 
 impl Default for Settings {
@@ -201,6 +208,9 @@ impl Default for Settings {
             auto_firewall_surge: 50,
             auto_level_restore: String::new(),
             auto_level_until: 0,
+            origin_check_path: String::new(),
+            origin_check_interval: 30,
+            session_affinity: false,
         }
     }
 }
@@ -222,6 +232,13 @@ impl Settings {
         }
         if !self.auto_level_restore.is_empty() {
             one_of("auto_level_restore", &self.auto_level_restore, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
+        }
+        let path = &self.origin_check_path;
+        if !path.is_empty() && (!path.starts_with('/') || path.len() > 256 || path.bytes().any(|b| b <= b' ' || b == 0x7f)) {
+            return invalid("origin_check_path is a path like /healthz (at most 256 bytes), or empty for no checks");
+        }
+        if !(10..=3600).contains(&self.origin_check_interval) {
+            return invalid("origin_check_interval is 10 to 3600 seconds");
         }
         if self.browser_cache_ttl > 31_536_000 || self.hsts_max_age > 63_072_000 {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");

@@ -6,6 +6,7 @@ pub mod certdir;
 pub mod cgi;
 pub mod autofw;
 pub mod challenge;
+pub mod origins;
 pub mod reputation;
 pub mod files;
 pub mod compress;
@@ -1014,6 +1015,8 @@ pub struct Edge {
     pub node_name: std::sync::OnceLock<String>,
     /// How long the visitors' handshakes with this node take, per network (see crate::rtt).
     pub rtt: Arc<crate::rtt::Rtt>,
+    /// Which origin addresses pass this node's health checks.
+    pub origins: Arc<origins::Health>,
     /// True when this node runs in `--role accelerate` mode.
     pub accelerate: std::sync::atomic::AtomicBool,
     /// Explicitly trust `X-Forwarded-Host` from the local HTTP/3 front.
@@ -1286,6 +1289,7 @@ impl Edge {
             d1: Default::default(),
             node_name: Default::default(),
             rtt: Default::default(),
+            origins: Default::default(),
             accelerate: std::sync::atomic::AtomicBool::new(false),
             trust_forwarded_host: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1354,14 +1358,22 @@ impl Edge {
             }
         }
 
-        // Rotate through the addresses; ones that failed recently go last.
-        let order = |addrs: Vec<&str>| -> Vec<String> {
-            let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        // Rotate through the addresses by their weights (with session affinity, the same visitor
+        // starts with the same one); ones that fail their health check or failed recently go last.
+        let order = |addrs: Vec<(&str, u32)>| -> Vec<String> {
+            let turn = match info.ip.filter(|_| zone.zone.settings.session_affinity) {
+                Some(ip) => origins::turn_of(ip),
+                None => self.rr.fetch_add(1, Ordering::Relaxed),
+            };
+            let start = origins::pick(&addrs.iter().map(|(_, weight)| *weight).collect::<Vec<_>>(), turn);
             let (down, now) = (self.down.lock().unwrap(), Instant::now());
-            let mut list: Vec<String> = (0..addrs.len()).map(|i| addrs[(start + i) % addrs.len()].to_string()).collect();
-            list.sort_by_key(|h| down.get(h).is_some_and(|until| *until > now));
+            let mut list: Vec<String> = (0..addrs.len()).map(|i| addrs[(start + i) % addrs.len()].0.to_string()).collect();
+            list.sort_by_key(|h| (self.origins.is_down(&zone.zone.id, &info.host, h), down.get(h).is_some_and(|until| *until > now)));
             list
         };
+        fn weighed<'a>(r: &&'a crate::store::Record) -> (&'a str, u32) {
+            (r.content.as_str(), r.origin.as_ref().and_then(|o| o.weight).unwrap_or(1))
+        }
         let records: Vec<&crate::store::Record> = zone.records_for(&info.host).iter().filter(|r| r.proxied).collect();
         // The origin options of the record the origin is taken from. A rule
         // that names another origin leaves them behind: they describe how to
@@ -1403,14 +1415,14 @@ impl Edge {
             let mut candidates = match origin_host {
                 Some(h) => vec![h],
                 None => {
-                    let addrs: Vec<&str> =
-                        records.iter().filter(|r| is_addr(&r.rtype)).map(|r| r.content.as_str()).collect();
+                    let addrs: Vec<(&str, u32)> = records.iter().filter(|r| is_addr(&r.rtype)).map(weighed).collect();
                     if !addrs.is_empty() {
                         let mut list = order(addrs);
                         let of = |addr: &str| records.iter().find(|r| is_addr(&r.rtype) && r.content == addr).and_then(|r| r.origin.as_ref());
                         options = of(&list[0]);
                         // an address that is reached differently is no stand-in for this one
-                        list.retain(|addr| of(addr) == options);
+                        let way = crate::store::RecordOrigin::way(options);
+                        list.retain(|addr| crate::store::RecordOrigin::way(of(addr)) == way);
                         list
                     } else {
                         // CNAME: follow it through zones we host, else leave it to system DNS.
@@ -1424,8 +1436,7 @@ impl Edge {
                         for _ in 0..8 {
                             let Some(z) = snap.find_zone(&name) else { break };
                             let recs = z.records_for(&name);
-                            let addrs: Vec<&str> =
-                                recs.iter().filter(|r| is_addr(&r.rtype)).map(|r| r.content.as_str()).collect();
+                            let addrs: Vec<(&str, u32)> = recs.iter().filter(|r| is_addr(&r.rtype)).map(|r| (r.content.as_str(), 1)).collect();
                             if !addrs.is_empty() {
                                 resolved = Some(order(addrs));
                                 break;

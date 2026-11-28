@@ -957,6 +957,8 @@ async fn main() -> anyhow::Result<()> {
         // only, one writer for the rules (every peer has the events)
         edge::autofw::spawn(store.clone(), waf.clone(), edge.reputation.get().cloned());
     }
+    // every node checks the origins itself: what it can reach is what it sends requests to
+    tokio::spawn(edge::origins::run(edge.clone()));
     let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {
         store,

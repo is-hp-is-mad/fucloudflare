@@ -199,6 +199,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<CacheRule>("/zones/{zone_id}/cache_rules"))
         .route("/zones/{zone_id}/email", get(email_zone))
         .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
+        .route("/zones/{zone_id}/origins/health", get(origin_health))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -2885,6 +2886,12 @@ async fn list_nodes(State(st): St) -> ApiResult {
         v
     });
     ok(Value::Array(nodes.collect()))
+}
+
+/// What this node's health checks say about the zone's origins (see crate::edge::origins).
+async fn origin_health(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    ok(st.edge.origins.report(&zone_id))
 }
 
 async fn list_steering(State(st): St) -> ApiResult {

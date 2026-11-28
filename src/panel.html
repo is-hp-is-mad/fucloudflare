@@ -903,7 +903,9 @@ const ZONE = {
     return { sub: "边缘与源站之间的加密方式，以及访客看到的证书。", body:
       card("加密", "", setRow("回源加密", "flexible：HTTP 回源。full：HTTPS 回源，不验证源站证书。strict：HTTPS 回源并验证证书。",
         sel("ssl", s.ssl, [["flexible", "flexible：HTTP 回源"], ["full", "full：HTTPS，不验证"], ["strict", "strict：HTTPS，验证证书"]], "回源加密")) +
-        setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS"))) + await ruleSection(z.id, "cert") };
+        setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS")) +
+        setRow("源站健康检查", "一个主机名有多条代理 A/AAAA 记录时，每个节点定期用这个路径请求每个源站地址；连续两次失败（无应答或 4xx/5xx）的地址排到最后，恢复后自动回来。留空为不检查。", `<input data-set="origin_check_path" value="${esc(s.origin_check_path || "")}" placeholder="/healthz" spellcheck="false" aria-label="源站健康检查路径">`) +
+        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) + await ruleSection(z.id, "cert") };
   },
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:

@@ -102,11 +102,20 @@ pub struct RecordOrigin {
     /// http or https, whatever the zone's ssl mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
+    /// Share of the requests among the addresses of the name (1 to 100; 1 when not given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 impl RecordOrigin {
     pub fn is_empty(&self) -> bool {
         *self == RecordOrigin::default()
+    }
+
+    /// How the origin is reached, whatever its share of the requests: two
+    /// addresses reached the same way can stand in for each other.
+    pub fn way(origin: Option<&RecordOrigin>) -> Option<RecordOrigin> {
+        origin.map(|o| RecordOrigin { weight: None, ..o.clone() }).filter(|o| !o.is_empty())
     }
 
     /// Normalized and checked; nothing if no option is set.
@@ -121,7 +130,11 @@ impl RecordOrigin {
             port: self.port,
             node: self.node.map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()),
             scheme: self.scheme.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()),
+            weight: self.weight,
         };
+        if origin.weight.is_some_and(|w| !(1..=100).contains(&w)) {
+            return invalid("origin.weight must be between 1 and 100");
+        }
         if origin.port == Some(0) {
             return invalid("origin.port must be between 1 and 65535");
         }
