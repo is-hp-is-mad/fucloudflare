@@ -681,6 +681,16 @@ without it gets `X25519`; nothing to configure. Origin pulls offer the hybrid fi
 `/cdn-cgi/fucf-trace` names the group of the connection as `kex=` (for example
 `kex=X25519MLKEM768`); it is empty over plain HTTP and HTTP/3.
 
+#### 0-RTT (early data)
+
+Not offered, on HTTPS nor HTTP/3, and there is no switch for it. Session tickets are the fleet's
+stateless ones (a visitor resumes on any node), and rustls only accepts early data with stateful,
+single-use resumption, as a guard against replays. Over TCP the TLS layer also hands the connection
+to HTTP only once the whole handshake is done and never reads early data out, so accepting it would
+lose the request, and reading it after the handshake would save no round trip. Doing it soundly
+means driving the handshake ourselves. Until then the tickets the edge hands out do not allow early
+data, so clients resume with a normal 1-RTT handshake.
+
 ### Rules
 
 All rule lists take an `expression` (empty matches every request), `description`, `enabled` (true)

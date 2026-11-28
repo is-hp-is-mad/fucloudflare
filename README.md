@@ -976,7 +976,9 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 - DNS：区域传送只有 TCP 上的 AXFR（没有 IXFR、TSIG，按来源地址放行），开启 DNSSEC 的区域不能传送；查询统计只在各节点内存里，重启清零；DNSSEC 只支持在线签名（ECDSA P-256，算法 13，NSEC 用最小否定应答）；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
 - 缓存：单个对象上限 32 MiB（未声明长度的 8 MiB），分片存放（`cache_chunking`）也一样；Range 请求只在缓存里已有这个对象时由缓存应答，不会为它去源站拉完整对象；多段 Range 返回整个对象；
   要入缓存的应答整份读完才开始发给访客，分片存放也还不是边收边发。
-- HTTP/3：不支持 0-RTT。回源除 gRPC 用 HTTP/2 外主要为 HTTP/1.1。
+- 0-RTT（TLS 1.3 early data）：HTTPS 和 HTTP/3 都不支持，也没有开关。会话票据是全机群通用的无状态票据，rustls 只在有状态的会话恢复下才接受 early data（防重放）；
+  而 TCP 上的 TLS 库（tokio-rustls）总是握手全部完成后才把数据交给 HTTP 层，从不读出 early data，硬开的话被接受的 early data 会被丢掉、请求挂住，即使改成握手后再读也省不下任何往返。要做得自己驱动握手，留待以后。
+- 回源除 gRPC 用 HTTP/2 外主要为 HTTP/1.1。
 - gRPC：经 Worker 路由的请求不走 gRPC 路径；请求侧的 trailers 不转发；WAF 不检查 gRPC 请求体。
 - 节点限流：只计响应体字节（不含请求体、响应头、TLS 开销），WebSocket 升级后的数据和 Spectrum 不计量也不限速；
   没有手动清零用量的接口（调高上限即可解除）；改 `traffic_reset_day` 使周期起点后移时用量清零；
