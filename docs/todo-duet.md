@@ -229,3 +229,65 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - `docs/api.md` 新增"Reference"一节，覆盖 `src/api.rs` 里全部 `.route(` 和 `crud::<`，含字段、取值范围和示例；节点之间用的 `/replication/*` 单列。
 - 没把握所以没改：README 里"证书""滚动更新""节点限流""三节点部署"几节仍按主节点 / 副本描述（发布由哪个节点协调、限流状态由谁写入配置，需要看 `src/release.rs`、`src/fleet.rs` 的人确认）；`src/auth.rs` 顶部注释也还写着账户不同步给副本。
 
+### 部署准备
+
+- 按第 5 节加了 `.github/workflows/release.yml` 和 `scripts/deploy/node-upgrade.sh`（照原文，LF，可执行）。
+- `ci` 的产物 `fucf-linux-x86_64` 只保留 30 天（`retention-days: 30`），超过 30 天的提交 `release` 取不到二进制，要先重跑一次 `ci`。
+
+## 5. 部署（通过 Komari）
+
+本节覆盖第 0 节"不能运行测试"的说法中与上线有关的部分：代码仍然由 CI 编译和测试，你通过 Komari 的远程执行把
+**CI 测过的那个二进制**换到节点上。除本节写明的两条命令外，不在节点上执行任何其他命令。
+
+### 5.1 什么可以部署
+
+- 只部署 `master` 上、`ci` 工作流全部作业（check / test、musl 构建、UI、gitleaks）都通过的提交。`duet`、`next` 上的提交不部署。
+- `duet` 的内容进 `master` 走 PR：PR 上的 `ci` 就是你的编译器，失败就读日志修，直到全绿。这一步可以等 CI。
+  合并要所有者同意。只改文档的提交不触发 `ci`，部署时取最近一个有绿色 `ci` 的提交。
+- 每一轮部署前，先向所有者说明要部署哪个提交、哪些节点，得到同意后再开始。一次同意只管这一轮。
+- 部署记录、节点地址、Komari 的地址和令牌一律不写进仓库。
+
+### 5.2 发布产物
+
+新增 `.github/workflows/release.yml`（手动触发，把 `ci` 测过的二进制原样发布成 Release，节点才能不带令牌下载），内容见该文件。
+
+### 5.3 节点上的脚本
+
+新增 `scripts/deploy/node-upgrade.sh`（第 1.4 节里 `scripts/deploy/` 的唯一例外；LF 换行），内容见该文件。
+
+### 5.4 一轮部署的步骤
+
+1. 取要部署的提交 `SHA`（完整 40 位）。手动触发 `release` 工作流，得到标签 `build-<SHA 前 12 位>`；
+   从 Release 的 `fucf-linux-x86_64.sha256` 里读出二进制的 `SHA256`（64 位十六进制）。
+2. 顺序固定，**一次只动一个节点**：`my` → `sgp` → `eu` → `us2` → `us` → `jp` → `au`（`au` 运行面板，永远最后）。
+3. 在该节点上用 Komari 远程执行（把三个尖括号换成实际值，整条是一行）：
+
+   ```
+   curl -fsSL -o /tmp/node-upgrade.sh https://raw.githubusercontent.com/is-hp-is-mad/fucloudflare/<SHA>/scripts/deploy/node-upgrade.sh && nohup setsid bash /tmp/node-upgrade.sh deploy build-<SHA前12位> <SHA256> > /tmp/node-upgrade.log 2>&1 < /dev/null &
+   ```
+
+   升级在后台进行，不受远程执行超时影响。约 90 秒后在同一节点执行 `cat /tmp/node-upgrade.log`：
+   最后两行必须是 `OK running <SHA256 前 12 位>` 和 `exit 0`。还没有 `exit` 行就再等。
+4. 出现 `!!!!` 或 `exit` 不是 0：**立即停止，不要继续下一个节点，也不要重试**，把日志原样交给所有者。
+   脚本在不健康时已经自己换回了之前的版本。
+5. 每个节点成功后，在 `au` 上执行 `bash /tmp/node-upgrade.sh status`（`au` 上没有脚本时先用第 3 步的 `curl` 部分下载）：
+   所有节点应为 `online` 和 `in sync`。升级后一分钟内配置版本会变动几次，出现 `DIFFERENT` 时隔 60 秒再看一次，
+   连续两次都是才算有问题。确认无误再做下一个节点。
+6. 全部完成后向所有者报告：部署的提交、每个节点的结果。
+
+### 5.5 回滚
+
+脚本失败时自动回滚。事后需要人工回滚某个节点（要所有者同意）：
+
+```
+install -m 0755 /usr/local/bin/fucf.prev /usr/local/bin/fucf && systemctl restart fucf
+```
+
+`fucf.prev` 只保留上一次升级之前的那个版本。
+
+### 5.6 禁止
+
+- 不修改 `/etc/fucf/fucf.env`、systemd 单元，不运行 `install-node.sh` 和 `fleet.sh`（它们会重写节点配置）。
+- 不动节点上的其他服务（haproxy、hysteria、xray、sing-box、caddy），不安装软件，不重启机器。
+- 不输出 `/etc/fucf/fucf.env` 的内容，不在命令里写令牌。
+- 不同时升级两个节点，不跳过第 5 步的检查。

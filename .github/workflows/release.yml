@@ -1,0 +1,39 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full SHA of a commit on master whose ci run passed"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ inputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: only a commit of master that ci built and tested
+        run: |
+          git merge-base --is-ancestor "$SHA" origin/master
+          RUN=$(gh run list --workflow ci.yml --commit "$SHA" --status success --json databaseId --jq '.[0].databaseId // empty')
+          [ -n "$RUN" ] || { echo "no successful ci run for $SHA"; exit 1; }
+          echo "RUN=$RUN" >> "$GITHUB_ENV"
+      - name: take the very binary of that run
+        run: |
+          gh run download "$RUN" -n fucf-linux-x86_64 -D dist
+          (cd dist && sha256sum -c fucf-linux-x86_64.sha256)
+          [ "$(cat dist/COMMIT)" = "$SHA" ]
+      - name: publish
+        run: |
+          TAG="build-${SHA:0:12}"
+          gh release view "$TAG" >/dev/null 2>&1 && { echo "$TAG is published already"; exit 0; }
+          gh release create "$TAG" dist/fucf-linux-x86_64 dist/fucf-linux-x86_64.sha256 --target "$SHA" --title "$TAG" --notes "The binary built and tested by ci run $RUN."
