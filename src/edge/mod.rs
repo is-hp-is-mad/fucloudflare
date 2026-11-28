@@ -6,6 +6,7 @@ pub mod certdir;
 pub mod cgi;
 pub mod autofw;
 pub mod challenge;
+pub mod errpages;
 pub mod reputation;
 pub mod files;
 pub mod compress;
@@ -2148,11 +2149,11 @@ impl Edge {
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
                     let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: page_lang };
-                    Some(page(403, "Access denied", &detail, ray, &ctx))
+                    Some(errpages::mark(page(403, "Access denied", &detail, ray, &ctx), errpages::Kind::Block))
                 }
                 Verdict::RateLimited { retry_after } => {
                     let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: page_lang };
-                    let mut resp = page(429, "Too many requests", "You are being rate limited.", ray, &ctx);
+                    let mut resp = errpages::mark(page(429, "Too many requests", "You are being rate limited.", ray, &ctx), errpages::Kind::RateLimit);
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
                 }
@@ -2391,6 +2392,8 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     let head = req.method() == Method::HEAD;
     let accept = req.headers().get(header::ACCEPT_ENCODING).and_then(|v| v.to_str().ok()).map(String::from);
     let grpc = req.version() >= hyper::Version::HTTP_2 && is_grpc(req.headers());
+    // only a page load gets the zone's own error pages (see errpages)
+    let browser = !grpc && challenge::is_navigation(req.headers());
     // for the error page: the name the visitor asked for, if it is a sane one
     let asked_host = req
         .uri()
@@ -2435,9 +2438,11 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
             }
             let host = seen.as_ref().map(|s| s.host.clone()).unwrap_or(asked_host);
             let ctx = PageCtx { hop: e.hop(), host, here: edge.here(), reason: e.origin.map(|f| f.reason), lang };
-            (page(e.status, e.title, &public, &ray, &ctx), Some(e.public_line()))
+            (errpages::mark(page(e.status, e.title, &public, &ray, &ctx), errpages::Kind::of(&e)), Some(e.public_line()))
         }
     };
+    let zone_of = seen.as_ref().map(|s| (s.zone_id.as_str(), s.host.as_str()));
+    let resp = errpages::apply(&edge, resp, browser, zone_of, peer.ip().to_canonical(), &ray).await;
     // HTTP/3 is on offer where it works: through the front for the names its
     // certificate covers, else on our own QUIC listener. For the sites of a
     // zone that has it switched on, and for the panel.

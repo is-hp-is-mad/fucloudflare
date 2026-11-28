@@ -313,9 +313,49 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `email_routing` | `false`, `true` |
 | `decoy_subdomains` | `false`, `true` |
 | `auto_firewall` | `false`, `true`, with `auto_firewall_threshold` (10), `auto_firewall_window` (600), `auto_firewall_ban` (86400), `auto_firewall_action` (`block`, `managed_challenge`, `js_challenge`), `auto_firewall_networks` (`true`), `auto_firewall_network_ips` (10), `auto_firewall_surge` (50; 0 off) |
+| `error_pages` | `{}`, or HTML templates by key: see "Custom error pages" below |
 
 ```sh
 curl -s -X PATCH $BASE/zones/$ZONE/settings/security_level -H "Authorization: Bearer $TOKEN" -d '{"value": "high"}'
+```
+
+#### Custom error pages
+
+`error_pages` replaces the pages the edge writes by itself with the zone's own HTML. The value is an
+object with at most these four keys (any other key is refused); each template is at most 64 KiB
+(65536 bytes of UTF-8, longer is refused). An empty string is the same as leaving the key out and is
+not stored. The whole object is replaced on every `PATCH`; `{}` removes every template.
+
+| Key | Replaces |
+| --- | --- |
+| `5xx` | the edge's page for an error in reaching the origin: 502, 521, 522, 525, 530 (a 5xx the origin itself sends is passed on untouched) |
+| `block` | the firewall's block page (403: managed rules and `block` firewall rules) |
+| `ratelimit` | the rate limit page (429) |
+| `1xxx` | any other page the edge writes for a request of the zone: unreadable requests (400), payload too large (413), HTTP/3 not enabled (421), worker failures (500, 503) |
+
+Placeholders, each replaced in a single pass (a value that looks like a placeholder is not expanded
+again). Every value but `::ERROR_BOX::` is HTML-escaped (`& < > " '`), so it is safe in text and in
+quoted attributes.
+
+| Placeholder | Value |
+| --- | --- |
+| `::RAY_ID::` | the request's Ray ID (as in the `fucf-ray` header) |
+| `::STATUS::` | the status code |
+| `::CLIENT_IP::` | the visitor's address |
+| `::HOST::` | the host name the visitor asked for |
+| `::NODE::` | the node's location code, as the default page shows it (`SIN`) |
+| `::ERROR_BOX::` | the main part of the default page: its stylesheet and everything in its `<body>`, as is (what it takes from the request is escaped where the default page is built) |
+
+Only pages meant for a browser are replaced. gRPC requests, requests that are not page loads
+(`Sec-Fetch-Mode` other than `navigate`, an `X-Requested-With` header, or no `text/html` in
+`Accept`) and the human check's pages are answered as before, and so are pages written before the
+request is known to belong to the zone (unknown hosts, `/cdn-cgi/`, loops, the node's traffic limit,
+the "node updating" page). The status code and the headers stay as they are (`Retry-After`,
+`Cache-Control: no-store`, ...); only the body changes, with `Content-Type: text/html; charset=utf-8`.
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/settings/error_pages -H "Authorization: Bearer $TOKEN" \
+  -d '{"value": {"5xx": "<h1>Back soon</h1><p>Error ::STATUS::, Ray ID ::RAY_ID::</p>::ERROR_BOX::", "ratelimit": ""}}'
 ```
 
 ### DNSSEC

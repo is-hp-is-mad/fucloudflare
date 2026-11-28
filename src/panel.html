@@ -787,6 +787,16 @@ function liveStart(zid) {
   liveDraw();
   tick();
 }
+// The zone's own HTML for the pages the edge writes by itself (setting error_pages, see errpages.rs).
+const ERR_PAGES = [["5xx", "回源错误", "边缘连不上源站或源站响应无效时（502、521、522、525、530）"], ["block", "防火墙拦截", "托管规则或防火墙规则拦截时（403）"],
+  ["ratelimit", "限速", "限速规则生效时（429）"], ["1xxx", "节点的其他提示", "请求无效、请求体过大、没开 HTTP/3、Worker 出错等"]];
+const ERR_HINT = "占位符：::RAY_ID:: ::STATUS:: ::CLIENT_IP:: ::HOST:: ::NODE::（都会做 HTML 转义），::ERROR_BOX::（默认页的主体，原样插入）。每个最多 64 KiB，留空用默认页。";
+function errPagesSection(z) {
+  const set = z.settings.error_pages || {};
+  const rows = ERR_PAGES.map(([key, label, note]) => ({ key, label, note, size: (set[key] || "").length }));
+  const cols = [{ k: "label", label: "页面" }, { k: "note", label: "什么时候出现" }, { label: "自定义", fmt: r => (r.size ? `<span class="st ok">已设置</span> <span class="hint">${esc(r.size)} 字符</span>` : '<span class="st">默认页</span>') }];
+  return card("自定义错误页", btn("errPagesEdit", "编辑", {}, "pri sm"), `<p class="hint">用自己的 HTML 替换边缘自己写的错误页。只替换浏览器打开的页面；gRPC、fetch / API 请求和人机验证页保持原样，状态码和响应头不变。</p>` + table(cols, rows));
+}
 
 // ---------------------------------------------------------------- views ----
 const zh = tab => `#/zone/${esc(S.zone)}/${tab}`;
@@ -980,7 +990,7 @@ const ZONE = {
           setRow("按网络（ASN）验证", "同一个网络里有很多机房 / VPN / 黑名单地址在攻击时，整个网络的访客都要先点一下人机验证（家庭宽带不会被整网处理；节点自己的 IP 除外）。", sw("auto_firewall_networks", z.settings.auto_firewall_networks, "按网络验证") + " " +
             nsel("auto_firewall_network_ips", z.settings.auto_firewall_network_ips, [[3, "3 个地址"], [5, "5 个地址"], [10, "10 个地址"], [20, "20 个地址"], [50, "50 个地址"]], "地址数")) +
           setRow("攻击潮时自动进入受攻击模式", "统计窗口内攻击地址数达到这个数，就自动开启受攻击模式一小时，攻击停了再恢复原来的级别。", nsel("auto_firewall_surge", z.settings.auto_firewall_surge, [[0, "不自动"], [20, "20 个地址"], [50, "50 个地址"], [100, "100 个地址"], [500, "500 个地址"]], "攻击潮")) : "")) +
-      card("伪装子域", "", setRow("伪装子域", `开启后，${esc(z.name)} 下任何没有记录的子域都能解析（指向没有流量限制、其次流量配额最大的节点，不用仅加速节点），但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。已有的记录和通配记录不受影响。`, sw("decoy_subdomains", z.settings.decoy_subdomains, "伪装子域"))) +
+      card("伪装子域", "", setRow("伪装子域", `开启后，${esc(z.name)} 下任何没有记录的子域都能解析（指向没有流量限制、其次流量配额最大的节点，不用仅加速节点），但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。已有的记录和通配记录不受影响。`, sw("decoy_subdomains", z.settings.decoy_subdomains, "伪装子域"))) + errPagesSection(z) +
       `<div class="note">按地区或运营商屏蔽：<code>ip.geoip.country in {"RU" "KP"}</code>　<code>ip.geoip.asnum eq 4134</code>　<code>ip.geoip.as_org contains "telecom"</code><span class="hint">要在 DNS 层面拒绝解析，使用账户主页的 <a href="#/steering">调度与 DNS 屏蔽</a>。</span></div>` +
       await ruleSection(z.id, "firewall") + await ruleSection(z.id, "rate") };
   },
@@ -1779,6 +1789,9 @@ const A = {
     { k: "enabled", label: "启用", type: "check", def: true }],
     d.id ? byId("logJobs", d.id) : {}, v => api(d.id ? "PUT" : "POST", `/zones/${S.zone}/logpush/jobs` + (d.id ? "/" + d.id : ""), v)),
   logJobDel: d => del(`/zones/${S.zone}/logpush/jobs/${d.id}`, "这个推送任务"),
+  errPagesEdit: () => openForm("自定义错误页", [{ type: "html", html: `<p class="hint">${esc(ERR_HINT)}</p>` },
+    ...ERR_PAGES.map(([k, label, note]) => ({ k, label: `${label}（${k}）`, type: "textarea", tall: 1, hint: note }))], C.zone.settings.error_pages || {},
+    v => api("PATCH", `/zones/${S.zone}/settings/error_pages`, { value: v }), true),
   emailDns: async () => {
     const e = await api("GET", `/zones/${S.zone}/email`);
     for (const r of e.needed_records || []) await api("POST", `/zones/${S.zone}/dns_records`, r);

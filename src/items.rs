@@ -174,6 +174,9 @@ pub struct Settings {
     /// mode: the level to go back to, and until when (unix seconds).
     pub auto_level_restore: String,
     pub auto_level_until: u64,
+    /// The zone's own HTML for the pages the edge writes by itself, by kind
+    /// (`5xx`, `block`, `ratelimit`, `1xxx`; see crate::edge::errpages).
+    pub error_pages: crate::edge::errpages::ErrorPages,
 }
 
 impl Default for Settings {
@@ -204,6 +207,7 @@ impl Default for Settings {
             auto_firewall_surge: 50,
             auto_level_restore: String::new(),
             auto_level_until: 0,
+            error_pages: Default::default(),
         }
     }
 }
@@ -229,6 +233,7 @@ impl Settings {
         if self.browser_cache_ttl > 31_536_000 || self.hsts_max_age > 63_072_000 {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");
         }
+        self.error_pages.validate()?;
         Ok(())
     }
 }

@@ -131,7 +131,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 权限：新 `Area::Lists`（账户级），读、写两个权限组。
 - 测试：解析与匹配（IPv4、IPv6、CIDR）；列表改了以后规则跟着变；删除被引用的列表被拒绝。
 
-### [ ] T5 自定义错误页
+### [x] T5 自定义错误页
 
 - 目标：域名可以替换边缘自己产生的错误页。
 - 区域设置 `error_pages`：键为 `5xx`、`block`、`ratelimit`、`1xxx`（节点自身的 4xx/5xx 提示）的映射，值是 HTML，每个不超过 64 KiB。
@@ -257,6 +257,14 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 被规则引用（停用的规则也算）的列表，删除或改名都回 409 并列出规则；带主机位的网段、IPv4 映射地址、同一请求里重复的地址一律拒绝。条目写操作照 Cloudflare 返回 `operation_id`，操作状态只在本节点内存里。
 - 权限：账户级 `Area::Lists`（Account Filter Lists Read / Write）；`/accounts/{id}/rules/lists…` 经 `account_path` 映射。`account_path` 现在改写路径后清空 extensions，顺带修好了带 id 的账户路径（之前 KV namespace 这类会拿到 3 个路径参数）；以后在账户路径下加 WebSocket 要另想办法。
 - 拿不准：Cloudflare 是否允许改名、重复追加时是否覆盖备注；权限组 id 不是 Cloudflare 的真实 id；条目没有游标分页。`ip_lists` 进了同步和全量对账：滚动升级时还没升级的节点若做全量对账的来源，可能把列表清掉，建议全部节点升级后再建列表。
+
+### T5
+
+- 新文件 `src/edge/errpages.rs`：区域设置 `error_pages`（键只能是 `5xx` / `block` / `ratelimit` / `1xxx`，每个最多 65536 字节，空字符串读入时丢掉；未知键读入时保留、`validate` 拒绝，免得新旧节点混跑时读不出区域）、`Kind` 标记、一遍扫描的占位符替换（值做 HTML 转义，`::ERROR_BOX::` 原样插入）和 `apply()`。
+- 接线：`src/items.rs` 的 `Settings` 加字段并校验；`src/edge/mod.rs` 在 `process` 的拦截页、429 页上 `errpages::mark`，`respond` 里给 `Err` 页标记、匹配之后调一次 `errpages::apply`。gRPC 和 `challenge::is_navigation` 为假的请求不替换，人机验证页没有标记；没配置时字节和响应头完全不变。
+- 对应关系：带回源故障的 `EdgeError`（502、521、522、525、530）对应 `5xx`，WAF 拦截对应 `block`，限速对应 `ratelimit`，其余认出域名之后写的错误页对应 `1xxx`；认出域名之前的页（未知主机、`/cdn-cgi/`、508、509、节点更新中）不替换。`::NODE::` 是默认页上显示的节点位置代码，不是内部节点名。
+- 拿不准：旧版本节点改写区域设置时会丢掉 `error_pages`；`compress.rs` 里中途读不出源站响应体时的 502 没有接；模板会让 `GET /zones` 和配置快照变大（每个域名最多 256 KiB）。
+- 面板："安全"页最下面的"自定义错误页"卡片。
 
 ### T6
 
