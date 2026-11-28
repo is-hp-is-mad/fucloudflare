@@ -16,6 +16,7 @@ pub mod reputation;
 pub mod files;
 pub mod compress;
 pub mod earlyhints;
+pub mod images;
 pub mod front;
 pub mod h3;
 pub mod ja4;
@@ -2616,8 +2617,20 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     }
     let _busy = Busy::new(edge.clone());
     let mut seen = None;
+    // `/cdn-cgi/image/...` of a zone that resizes: the pipeline runs for the original, whose answer is then transformed
+    let (req, image) = images::take(&edge, req);
+    let processed = match image {
+        Some(Err(e)) => Err(e),
+        image => {
+            let answer = edge.clone().process(peer.ip().to_canonical(), ssl, req, &ray, &mut seen).await;
+            match image {
+                Some(Ok(job)) => images::finish(&edge, job, answer).await,
+                _ => answer,
+            }
+        }
+    };
     // `refusal`: why the edge answered by itself instead of passing on the origin's answer
-    let (resp, refusal) = match edge.clone().process(peer.ip().to_canonical(), ssl, req, &ray, &mut seen).await {
+    let (resp, refusal) = match processed {
         Ok(r) => {
             let by_waf = r.extensions().get::<WafHit>().map(|_| match r.status() {
                 StatusCode::TOO_MANY_REQUESTS => "rate limited by the edge".to_string(),

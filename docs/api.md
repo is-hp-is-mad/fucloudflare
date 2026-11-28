@@ -389,6 +389,7 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `cache_tier_node` | `""`, or the name of a node (at most 64 bytes): tiered cache, see [Cache](#cache) |
 | `cache_chunking` | `0` (off), or `524288` to `33554432` bytes: objects of at least this size are cached in 512 KiB chunks, see [Cache](#large-objects-in-chunks) |
 | `early_hints_links` | `[]`, or at most 16 `Link` header entries added to the zone's HTML pages: see [Preload hints](#preload-hints-instead-of-early-hints) |
+| `image_resizing` | `false`, `true`: `/cdn-cgi/image/<options>/<path>` serves the zone's own images resized, see [Image resizing](#image-resizing) |
 | `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
 
 ```sh
@@ -424,6 +425,51 @@ curl -s -X PATCH $BASE/zones/$ZONE/settings/early_hints_links -H "Authorization:
   Anything else (another `rel`, an unknown parameter, a second link in one entry) refuses the whole
   value with `400`, naming the entry (`early_hints_links[1]: …`).
 - Response header rules (transform rules) run after it and can remove or replace the header.
+
+#### Image resizing
+
+With `image_resizing` on, `https://<host>/cdn-cgi/image/<options>/<path>` answers with the zone's
+own `<path>` (and the request's query), resized and encoded again. Off (the default), such a path
+goes to the origin like any other.
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/settings/image_resizing -H "Authorization: Bearer $TOKEN" -d '{"value": true}'
+curl -sI https://example.com/cdn-cgi/image/width=400,format=webp/photos/a.jpg
+```
+
+- The original is fetched as if the visitor had asked for `<path>` with `GET`: the firewall, rate
+  limits, waiting rooms, rules, Workers and the cache all see that path, not `/cdn-cgi/image/…`
+  (so a rule that blocks `/photos/` also blocks the resized copies). Conditional and `Range` headers
+  are not passed on for the original; they apply to the result.
+- `<path>` is a path of the site, or an `http(s)://` URL of the request's own host. Another host,
+  `//…`, a user name in the URL, a bare `/` and the edge's own `/cdn-cgi/` paths answer `400`; the
+  endpoint is no proxy for other sites. Methods other than `GET` and `HEAD` answer `405`.
+- Options, comma separated; unknown options and unusable values are ignored:
+
+  | Option | Values |
+  | --- | --- |
+  | `width`, `w` / `height`, `h` | pixels; larger values are taken as 4096 |
+  | `fit` | `scale-down` (default: fit in the box, never enlarge), `contain` (fit in the box, enlarging if needed), `cover` (fill the box, cutting off what is over, enlarging if needed), `crop` (as `cover`, but an original smaller than the box is cut to it, not enlarged), `pad` (as `contain`, centred on a canvas of the box's size: white for JPEG, transparent otherwise) |
+  | `quality`, `q` | 1 to 100, JPEG only (default 85) |
+  | `format`, `f` | `jpeg` (or `jpg`), `png`, `webp`; `auto` and anything else keep the original's format |
+
+  With one side given, the other follows the original's ratio. WebP is written lossless (the encoder
+  is pure Rust and has no lossy mode). EXIF rotation is applied and an ICC profile is kept; other
+  metadata is dropped.
+- Only a `200` JPEG, PNG or WebP of at most 16 MiB and 50 megapixels (read from the image header
+  before anything is decoded) is transformed; no side of a result is longer than 4096 pixels. Each
+  node runs two transformations at a time on blocking threads; a request that waits more than
+  10 seconds for its turn gets the original.
+- Anything else goes to the visitor as it came, with `fcf-resized: original; <why>`, where `<why>` is
+  `animated` (APNG, animated WebP), `unsupported` (another type), `unchanged` (no size and no other
+  format or JPEG quality asked), `too-large`, `undecodable` or `busy`. Errors, redirects and other
+  statuses from the original's pipeline pass through untouched, without the header.
+- A result carries `fcf-resized: <width>x<height>`, its own `Content-Type`, `Content-Length` and
+  `ETag` (`If-None-Match` answers `304`), and `fcf-cache-status: MISS` or `HIT`. It is cached under
+  the original's bytes and the options, for as long as the cache may keep the original: an original
+  the cache does not keep (`DYNAMIC`, `BYPASS`) is transformed on every request. The original still
+  goes through the pipeline each time, so once the edge serves a new original (it expired or was
+  purged), its results are made again.
 
 #### Custom error pages
 

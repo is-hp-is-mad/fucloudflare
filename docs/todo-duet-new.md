@@ -91,7 +91,7 @@
 - **已知风险**：aws-lc-rs 编 musl 静态包需要 C 工具链，可能让 musl 构建挂掉——在交接里标注，集成阶段若失败可能整体回退本任务。
 - 这一步改动小但牵连构建，单独一个提交，不和其他任务混。
 
-### [ ] N9 协议三小件：zstd、0-RTT、Early Hints、图片缩放
+### [x] N9 协议三小件：zstd、0-RTT、Early Hints、图片缩放
 
 四个子项各自独立提交，做不了的子项写明原因跳过，不要硬写：
 
@@ -175,3 +175,10 @@
 - `src/edge/tls.rs` 的 `crypto()` 改为全进程唯一的提供者（`OnceLock`），把 `X25519MLKEM768` 排到第一；gfw、各测试里原来的 `crypto::ring` 和 `Config::builder()` 全换成它，进程里不再有第二个提供者，也不依赖 `install_default`。服务端按客户端偏好选组，回源时优先报混合组并带一份 X25519，源站不支持也不多一次往返。
 - 测试：`kex_tests` 用 rcgen 现生成的证书做内存握手（双方都支持则用混合组、只报 X25519 的照样握手、TLS 1.2 回落、没有共同组被拒）；trace 测试断言 `kex=X25519MLKEM768`。
 - 风险：aws-lc-sys 要编 C 代码。本机按 CI 的 musl-gcc 设置实测能编、能静态链接，musl 下测试通过，不需要 cmake；CI 镜像若变或没有 C 编译器就会挂，那时整体回退本任务。HTTP/3 连接的 `kex` 仍为空（quinn 不给出协商的组）。
+
+### N9
+- n9.1 加了 zstd 压缩（=0.14.4，zstd-sys 要 C 编译器，CI 用 musl-gcc），顺序 br > zstd > gzip；缓存键的压缩段按 q 值记 br/gzip/zstd，`Cache::put` 不再存访客没要的编码，修了源站 zstd/deflate 串给别人的老问题（副作用：这类应答不再被缓存）。
+- n9.2 0-RTT 没做：机群票据是无状态的，rustls 只在有状态恢复时收 early data，tokio-rustls 也不读它，只写了文档；QUIC 同样。
+- n9.3 发不了 103（hyper 1.x 服务端不支持 1xx），改成区域设置 `early_hints_links`，给 HTML 200 应答加 `Link` 头，只认 preload / preconnect 两种写法，最多 16 条。
+- n9.4 图片缩放 `/cdn-cgi/image/<参数>/<路径>`（`image_resizing`，默认关，image =0.25.10 只开 jpeg/png/webp，纯 Rust），原图走完整管道、只限本主机名，输入 16 MiB / 5000 万像素 / 输出每边 4096 封顶，每节点同时两张；结果按原图内容和参数缓存；`format=auto` 不按 Accept 协商，WebP 只能无损输出。
+- 留待能跑的人：滚动升级时旧节点会丢新设置字段；缩放结果按原图完整 TTL 缓存；开了缩放后针对 `/cdn-cgi/image/` 路径写的规则看到的是原图路径；单张 5000 万像素约占 200 MB 内存。

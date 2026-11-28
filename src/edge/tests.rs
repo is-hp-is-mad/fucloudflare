@@ -74,6 +74,27 @@ fn video(path: &str, range: Option<&str>, if_range: Option<&str>) -> axum::respo
     }
 }
 
+/// A 400 x 200 PNG, red on the left and blue on the right; under
+/// `/img/anim` it carries an `acTL` chunk, as an animated PNG does, and
+/// under `/img/notes` the origin sends text.
+fn picture(path: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let headers = [("cache-control", "public, max-age=60"), ("content-type", "image/png")];
+    if path.starts_with("/img/notes") {
+        return ([("cache-control", "public, max-age=60"), ("content-type", "text/plain")], "not a picture").into_response();
+    }
+    let img = image::RgbImage::from_fn(400, 200, |x, _| if x < 200 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) });
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let mut png = png.into_inner();
+    if path.starts_with("/img/anim") {
+        let tail = png.split_off(33);
+        png.extend_from_slice(b"\0\0\0\x08acTL\0\0\0\x02\0\0\0\0\0\0\0\0");
+        png.extend_from_slice(&tail);
+    }
+    (headers, png).into_response()
+}
+
 /// A body sent without announcing its length.
 struct Chunks(std::collections::VecDeque<Bytes>);
 
@@ -119,6 +140,9 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
             use axum::response::IntoResponse;
             if path.starts_with("/vid/") {
                 return video(&path, h_range.as_deref(), h_if_range.as_deref());
+            }
+            if path.starts_with("/img/") {
+                return picture(&path);
             }
             if path.contains("etag") {
                 let status = if h_inm.as_deref() == Some("\"v1\"") { 304 } else { 200 };
@@ -2401,6 +2425,83 @@ async fn a_zone_can_add_preload_hints_to_its_pages_and_only_to_them() {
     }
     env.store.update_setting(&env.zone, "early_hints_links", json!([])).unwrap();
     assert!(get(&env, "example.com", "/page.html").await.header("link").is_none(), "cleared");
+}
+
+/// An answer with its body as bytes (a picture is no text).
+async fn fetch(env: &Env, method: &str, host: &str, uri: &str, extra: &str) -> (Reply, Vec<u8>) {
+    let mut s = TcpStream::connect(("127.0.0.1", env.port)).await.unwrap();
+    s.write_all(raw(method, host, uri, extra, "").as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map_or(buf.len(), |i| i + 4);
+    let head = String::from_utf8_lossy(&buf[..end]).trim_end().to_string();
+    let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (Reply { status, head, body: String::new() }, buf[end..].to_vec())
+}
+
+#[tokio::test]
+async fn images_are_resized_for_a_zone_that_turns_it_on_and_only_from_its_own_paths() {
+    let env = setup().await;
+    let url = "/cdn-cgi/image/width=100,format=webp/img/a.png";
+    let (r, _) = fetch(&env, "GET", "example.com", url, "").await;
+    assert!(r.header("fcf-resized").is_none(), "off by default: the path goes to the origin as it is");
+    env.store.update_setting(&env.zone, "image_resizing", json!(true)).unwrap();
+    let before = env.hits.load(Ordering::SeqCst);
+
+    let (r, body) = fetch(&env, "GET", "example.com", url, "").await;
+    assert_eq!(r.status, 200, "{}", r.head);
+    assert_eq!((r.header("content-type"), r.header("fcf-resized"), r.header("fcf-cache-status")), (Some("image/webp"), Some("100x50"), Some("MISS")), "{}", r.head);
+    assert_eq!(r.header("content-length"), Some(body.len().to_string().as_str()));
+    let img = image::load_from_memory(&body).unwrap();
+    assert_eq!((img.width(), img.height()), (100, 50));
+    assert_eq!(img.to_rgb8().get_pixel(10, 25).0, [255, 0, 0]);
+    let etag = r.header("etag").unwrap().to_string();
+
+    let (r, again) = fetch(&env, "GET", "example.com", url, "").await;
+    assert_eq!((r.header("fcf-cache-status"), again.len()), (Some("HIT"), body.len()), "{}", r.head);
+    assert_eq!(env.hits.load(Ordering::SeqCst), before + 1, "the original came from the origin once");
+    let (r, _) = fetch(&env, "GET", "example.com", url, &format!("If-None-Match: {etag}\r\n")).await;
+    assert_eq!(r.status, 304, "{}", r.head);
+    let (r, head_body) = fetch(&env, "HEAD", "example.com", url, "").await;
+    assert_eq!((r.status, r.header("content-type"), head_body.len()), (200, Some("image/webp"), 0), "{}", r.head);
+
+    // other options are another result, and the host may be written in full
+    let (r, body) = fetch(&env, "GET", "example.com", "/cdn-cgi/image/w=50,h=50,fit=cover/https://example.com/img/a.png", "").await;
+    assert_eq!((r.header("content-type"), r.header("fcf-resized")), (Some("image/png"), Some("50x50")), "{}", r.head);
+    assert_eq!(image::guess_format(&body).unwrap(), image::ImageFormat::Png);
+
+    // what is not to be transformed goes as it came
+    for (path, why) in [("/cdn-cgi/image/width=100/img/anim.png", "original; animated"), ("/cdn-cgi/image/width=100/img/notes.txt", "original; unsupported"), ("/cdn-cgi/image/blur=9/img/a.png", "original; unchanged")] {
+        let (r, _) = fetch(&env, "GET", "example.com", path, "").await;
+        assert_eq!((r.status, r.header("fcf-resized")), (200, Some(why)), "{path}: {}", r.head);
+    }
+
+    // no open proxy, and nothing but GET and HEAD
+    for (method, path, status) in [
+        ("GET", "/cdn-cgi/image/width=100/https://other.example.net/img/a.png", 400),
+        ("GET", "/cdn-cgi/image/width=100//other.example.net/img/a.png", 400),
+        ("GET", "/cdn-cgi/image/width=100/https://user@example.com/img/a.png", 400),
+        ("GET", "/cdn-cgi/image/width=100", 400),
+        ("GET", "/cdn-cgi/image/width=100/cdn-cgi/fucf-trace", 400),
+        ("POST", url, 405),
+    ] {
+        let (r, _) = fetch(&env, method, "example.com", path, "").await;
+        assert_eq!(r.status, status, "{method} {path}: {}", r.head);
+    }
+    let hits = env.hits.load(Ordering::SeqCst);
+
+    // the firewall sees the original's path
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "starts_with(http.request.uri.path, \"/img/secret\")", "action": "block" }), true)
+        .unwrap();
+    let (r, _) = fetch(&env, "GET", "example.com", "/cdn-cgi/image/width=10/img/secret.png", "").await;
+    assert_eq!((r.status, r.header("fcf-resized")), (403, None), "{}", r.head);
+    assert_eq!(env.hits.load(Ordering::SeqCst), hits, "a blocked original is never fetched");
+
+    // a host the edge does not serve for a zone gets nothing of it
+    let (r, _) = fetch(&env, "GET", "nope.example.com", url, "").await;
+    assert!(r.header("fcf-resized").is_none() && r.status != 200, "{}", r.head);
+    assert!(env.store.update_setting(&env.zone, "image_resizing", json!("yes")).is_err());
 }
 
 #[tokio::test]

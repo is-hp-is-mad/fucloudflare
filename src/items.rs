@@ -203,6 +203,9 @@ pub struct Settings {
     /// pages, in the narrow form crate::edge::earlyhints takes. They stand in
     /// for Early Hints: no `103` is sent.
     pub early_hints_links: Vec<String>,
+    /// Answer `/cdn-cgi/image/<options>/<path>` with the zone's own image at
+    /// `<path>`, resized (crate::edge::images).
+    pub image_resizing: bool,
 }
 
 impl Default for Settings {
@@ -242,6 +245,7 @@ impl Default for Settings {
             cache_chunking: 0,
             mtls: "off".into(),
             early_hints_links: Vec::new(),
+            image_resizing: false,
         }
     }
 }

@@ -7,7 +7,7 @@
 | DNS | 权威 DNS（UDP/TCP），代理记录解析到边缘 IP；按访客国家 / 大洲 / 运营商（ECS 感知）调度到节点，带健康检查与故障切换，可按地区屏蔽解析 |
 | 面板 | 内嵌的网页控制面板：DNS 记录、机群与节点（含分档限流）、调度规则、区域设置、规则、电子邮件路由、Workers；完全托管与 CNAME 接入两种模式 |
 | 多节点 | 无主对等同步（`--role peer --peers ...`）：每个对等节点都可读写，配置、面板账户、Workers KV / D1 和各节点的上报（流量统计、安全事件）在节点之间双向同步，冲突按混合逻辑时钟后写者胜；`--role accelerate` 节点只拉取配置、内存运行、拒绝写入 |
-| CDN | HTTP/1.1、HTTP/2、HTTP/3 (QUIC) 反向代理，WebSocket，gRPC，SNI 证书，边缘缓存与清除（Range、源站故障时回退到过期副本），brotli/zstd/gzip 压缩，源站故障转移 |
+| CDN | HTTP/1.1、HTTP/2、HTTP/3 (QUIC) 反向代理，WebSocket，gRPC，SNI 证书，边缘缓存与清除（Range、源站故障时回退到过期副本），brotli/zstd/gzip 压缩，图片缩放，源站故障转移 |
 | 节点限流 | 每个节点可设周期流量配额（摘除 DNS / 开始限速 / 硬限流三档）和限速；超限节点自动退出 DNS 应答，硬限流后只返回提示页 |
 | 证书 | 内置 ACME 客户端：向 Let's Encrypt 等 CA 自动签发并续期证书（DNS-01 / TLS-ALPN-01 / HTTP-01），也可上传自有证书 |
 | 规则 | 重定向规则、请求/响应改写规则、缓存规则 |
@@ -154,6 +154,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点。保存时不检查节点是否存在：写的不是机群里的节点、在它自己身上、或请求已被回源规则或记录的 `origin.node` 送去别处时，不分层（面板：域名 → 缓存 → 分层缓存） |
 | `cache_chunking` | 字节（默认 0） | 大文件分片缓存：不小于这个大小的对象按 512 KiB 一片存进边缘缓存，Range 请求只读涉及的片；0 为关闭，否则 524288 到 33554432（见"缓存"里的"大文件分片"；面板：域名 → 缓存 → 大文件分片） |
 | `early_hints_links` | 字符串数组（默认空，最多 16 条） | 预加载提示：给这个域名的 HTML 页面（200 应答）加上 `Link` 头，见"预加载提示（代替 Early Hints）"（面板：域名 → 缓存 → 预加载提示） |
+| `image_resizing` | bool（默认关） | 图片缩放：`/cdn-cgi/image/<参数>/<路径>` 返回本站图片缩放、转换格式后的结果，见"图片缩放"（面板：域名 → 缓存 → 图片缩放） |
 | `session_affinity` | bool（默认关） | 会话保持：同一个访客地址总是从同一个源站地址开始（同名的地址不变时）；该地址检查失败或刚拒绝过连接时照常换下一个。各地址分到的比例由记录的 `origin.weight` 决定（见"高级回源"） |
 | `dns_transfer_to` | 地址或网段数组（默认空，最多 16 个） | 允许做区域传送（AXFR）的辅助名称服务器，如 `["192.0.2.53", "2001:db8:53::/48"]`，见"DNS：更多记录类型、辅助名称服务器、查询统计"（面板：域名 → DNS 记录 → 区域传送） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
@@ -282,6 +283,24 @@ CA 有效期 20 年，名称约束在本区域，只签服务器证书（扩展�
 只接受两种写法：`<URL>; rel=preload; as=类型` 和 `<URL>; rel=preconnect`，都可再加 `crossorigin`（或 `crossorigin=anonymous` / `use-credentials`）；参数不加引号，顺序、大小写随意，保存后按统一写法发出。
 `URL` 是站内路径（`/app.css`，不能以 `//` 开头）或 `https://` 地址，只能是可见 ASCII，不能含空格、引号、逗号、分号、尖括号、反斜杠；`as` 取 `audio`、`document`、`embed`、`fetch`、`font`、`image`、`object`、`script`、`style`、`track`、`video`、`worker`。
 最多 16 条，每条不超过 512 字节，合起来的头不超过 4096 字节，不合格的整个设置 400 并指出第几条。
+
+### 图片缩放
+
+区域设置 `image_resizing` 开启后，`https://<主机名>/cdn-cgi/image/<参数>/<路径>` 返回本站 `<路径>`（带上请求的查询串）的图片，缩放、重新编码后给访客；关闭时（默认）这种路径照常回源。
+
+```sh
+curl -sI https://example.com/cdn-cgi/image/width=400,format=webp/photos/a.jpg
+```
+
+原图按访客直接 GET `<路径>` 的方式取：防火墙、限速、等候室、各种规则、Worker、缓存看到的都是原图路径，不是 `/cdn-cgi/image/…`，所以拦了 `/photos/` 的规则也拦它的缩放图。
+`<路径>` 只能是站内路径，或本主机名的 `http(s)://` 地址；别的主机名、`//…`、带用户名的地址、空路径和边缘自己的 `/cdn-cgi/` 路径返回 400，不能拿来代取别的网站。GET、HEAD 以外的方法返回 405。
+参数用逗号分隔，不认识的参数和用不了的值忽略：`width` / `w`、`height` / `h`（像素，超过 4096 按 4096）；`fit` 取 `scale-down`（默认，放进框里，不放大）、`contain`（放进框里，可放大）、`cover`（铺满框，切掉多出的部分，可放大）、`crop`（同 `cover`，但比框小的原图只切不放大）、`pad`（同 `contain`，再居中放到框大小的画布上，JPEG 补白色，其他补透明）；`quality` / `q`（1 到 100，只对 JPEG，默认 85）；`format` / `f` 取 `jpeg`（或 `jpg`）、`png`、`webp`，`auto` 和其他值保持原图格式。
+只给一边时另一边按原图比例。WebP 输出是无损的（纯 Rust 编码器没有有损模式）。按 EXIF 方向转正，保留 ICC 色彩配置，其余元数据去掉。
+
+只处理 200 应答的 JPEG、PNG、WebP，原图不超过 16 MiB、5000 万像素（解码前从图片头读出，防解压炸弹），输出每边最多 4096 像素；每个节点同时只做两个，在阻塞线程上解码和缩放，排队超过 10 秒的直接给原图。
+其他情况原样返回原图，带 `fcf-resized: original; <原因>`：`animated`（APNG、动图 WebP）、`unsupported`（别的类型）、`unchanged`（既没要尺寸，也没要换格式或 JPEG 质量）、`too-large`、`undecodable`、`busy`。原图路径上的错误、重定向和其他状态码原样传过去，不加这个头。
+缩放结果带 `fcf-resized: <宽>x<高>`、自己的 `Content-Type`、`Content-Length` 和 `ETag`（`If-None-Match` 返回 304），以及 `fcf-cache-status: MISS` 或 `HIT`。
+结果按原图内容和参数缓存，缓存时间跟原图能缓存的时间一样；原图不进缓存（`DYNAMIC`、`BYPASS`）时每次都重新处理。原图每次照样走一遍管道，边缘拿到新的原图（过期或被清除后）时，结果也跟着重新生成。
 
 ### 后量子密钥交换
 
