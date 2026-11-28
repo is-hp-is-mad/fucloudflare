@@ -200,6 +200,8 @@ pub fn need(path: &str) -> Need {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GroupRef {
+    /// Either the id or the name will do.
+    #[serde(default)]
     pub id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
