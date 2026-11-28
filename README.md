@@ -148,6 +148,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
 | `origin_check_path` / `origin_check_interval` | 路径（默认空，最长 256 字节）/ 秒（默认 30，10–3600） | 源站主动健康检查：每个节点按这个间隔向区域里已代理的 A/AAAA 记录的每个地址发 GET 请求这个路径（按访客访问该名字的方式连过去，5 秒超时，User-Agent `fucf-health/<版本>`；回源规则改送别处的地址、通配符名字和暂停的区域不查）。2xx/3xx 算通过，连续两次失败（无应答或别的状态码）的地址排到最后，通过一次就恢复；`GET /zones/{id}/origins/health` 查看本节点的检查结果（`name`、`address`、`healthy`、`failures`、`checked_at`、`detail`；面板：域名 → SSL/TLS → 源站健康） |
 | `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点。保存时不检查节点是否存在：写的不是机群里的节点、在它自己身上、或请求已被回源规则或记录的 `origin.node` 送去别处时，不分层（面板：域名 → 缓存 → 分层缓存） |
+| `cache_chunking` | 字节（默认 0） | 大文件分片缓存：不小于这个大小的对象按 512 KiB 一片存进边缘缓存，Range 请求只读涉及的片；0 为关闭，否则 524288 到 33554432（见"缓存"里的"大文件分片"；面板：域名 → 缓存 → 大文件分片） |
 | `session_affinity` | bool（默认关） | 会话保持：同一个访客地址总是从同一个源站地址开始（同名的地址不变时）；该地址检查失败或刚拒绝过连接时照常换下一个。各地址分到的比例由记录的 `origin.weight` 决定（见"高级回源"） |
 | `dns_transfer_to` | 地址或网段数组（默认空，最多 16 个） | 允许做区域传送（AXFR）的辅助名称服务器，如 `["192.0.2.53", "2001:db8:53::/48"]`，见"DNS：更多记录类型、辅助名称服务器、查询统计"（面板：域名 → DNS 记录 → 区域传送） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
@@ -384,6 +385,16 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 - `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本（同一个对象同时只取一次）；
   Range 请求和后台队列已满时照常回源。
 - 分层缓存：区域设置 `cache_tier_node`（见"区域设置"），其他节点的 GET/HEAD 都经那个节点回源。
+- 大文件分片：区域设置 `cache_chunking` 设为 N 字节时，要入缓存的、声明了 `Content-Length` 且不小于 N、没有 `Content-Encoding` 的 200 应答
+  按 512 KiB 一片存放（一条元数据存响应头、总长、新鲜度和标签，每片一条），访客拿到的应答与整份存放时完全一样（整个对象、单段 Range、`If-Range`、304、HEAD、416），
+  Range 请求只读它涉及的片。内存层和磁盘层按片淘汰，大对象不必整份放得下（磁盘层不收超过其容量八分之一的单个对象）；节点状态里的对象数把片也算上。
+  副本新鲜时缺了片，只向源站要缺的那几片：一个带 `Range`、`If-Range`（副本的强 `ETag`，没有就用 `Last-Modified`）和 `Accept-Encoding: identity` 的请求，
+  只有正好是这段字节、总长和 `ETag`/`Last-Modified` 都对得上的 206 才用（`MISS`）；源站回 200（不支持 Range 或对象已变）就用这份完整应答、这一次整份存放；
+  其他应答丢掉这份副本，请求照不分片的方式回源。没有校验值（或只有弱 `ETag`）的副本缺片时整份重取。每次填充都有自己的标记，片只和它所属的那次填充一起用，
+  不会把两个版本拼在一起。过期副本只在请求要的片都还在时才按 `stale-while-revalidate`（`UPDATING`）或源站故障（`STALE`）返回，不做条件请求续期，而是整份重取。
+  按 URL、前缀、主机名、标签或全部清除时片一起清掉，`purged` 里一个对象只算一次。关闭这个设置后，分片存放的副本按未命中处理，被整份的新副本替换。
+  没变的：单个对象仍以 32 MiB 为上限；源站应答仍是整份读完才开始发给访客（边读边切片，切好的片直接用来应答）；没有 `Content-Length` 的应答整份存放；
+  缓存里没有的对象收到 Range 请求时照旧原样回源、应答不入缓存。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
   遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `fcf-cache-status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / UPDATING / BYPASS / DYNAMIC`（边缘自己应答的为 `NONE`）。
@@ -928,7 +939,8 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 - HTTP/3 前置：经前置入口进来的 gRPC 不按 gRPC 处理（中间那一跳是 HTTP/1.1，带不了 trailers）；WebSocket 不经过它
   （HTTP/3 没有升级）；请求和响应都多一次本机转发。
 - DNS：区域传送只有 TCP 上的 AXFR（没有 IXFR、TSIG，按来源地址放行），开启 DNSSEC 的区域不能传送；查询统计只在各节点内存里，重启清零；DNSSEC 只支持在线签名（ECDSA P-256，算法 13，NSEC 用最小否定应答）；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
-- 缓存：单个对象上限 32 MiB（未声明长度的 8 MiB）；Range 请求只在缓存里已有完整对象时由缓存应答，不会为它去源站拉完整对象；多段 Range 返回整个对象。
+- 缓存：单个对象上限 32 MiB（未声明长度的 8 MiB），分片存放（`cache_chunking`）也一样；Range 请求只在缓存里已有这个对象时由缓存应答，不会为它去源站拉完整对象；多段 Range 返回整个对象；
+  要入缓存的应答整份读完才开始发给访客，分片存放也还不是边收边发。
 - HTTP/3：不支持 0-RTT。回源除 gRPC 用 HTTP/2 外主要为 HTTP/1.1。
 - gRPC：经 Worker 路由的请求不走 gRPC 路径；请求侧的 trailers 不转发；WAF 不检查 gRPC 请求体。
 - 节点限流：只计响应体字节（不含请求体、响应头、TLS 开销），WebSocket 升级后的数据和 Spectrum 不计量也不限速；

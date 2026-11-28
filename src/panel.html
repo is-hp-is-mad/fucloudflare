@@ -1028,13 +1028,19 @@ const ZONE = {
     const tier = String(z.settings.cache_tier_node || ""), ro = me.role === "viewer" ? " disabled" : "";
     const nodes = await api("GET", "/nodes").catch(() => []), names = (Array.isArray(nodes) ? nodes : []).map(n => n && n.name).filter(Boolean);
     const unknown = tier.trim() && names.length && !names.some(n => n.toLowerCase() === tier.trim().toLowerCase());
+    // a value set through the API that is not one of the choices stays shown as it is
+    const chunking = Number(z.settings.cache_chunking) || 0, MiB = 1048576;
+    const sizes = [[0, "关闭"], [MiB / 2, "512 KiB 及以上"], [MiB, "1 MiB 及以上"], [4 * MiB, "4 MiB 及以上"], [8 * MiB, "8 MiB 及以上"], [16 * MiB, "16 MiB 及以上"]];
+    if (!sizes.some(([v]) => v === chunking)) sizes.push([chunking, `${chunking} 字节及以上`]);
     return { sub: "边缘缓存的开关与清除。缓存哪些内容由“规则”里的缓存规则决定。", body:
       card("缓存", "", setRow("开发模式", "临时绕过边缘缓存，所有请求直接回源。", sw("development_mode", z.settings.development_mode, "开发模式")) +
         setRow("清除全部缓存", "清除这个域名在所有节点上的缓存对象；其余节点随配置同步清除。", btn("purge", "清除全部缓存")) +
         setRow("按 URL 清除", "每行一个完整 URL。", `<textarea id="purgeUrls" placeholder="https://${esc(z.name)}/app.js" spellcheck="false" aria-label="要清除的 URL"></textarea>${btn("purgeFiles", "清除这些 URL")}`, "stack")) +
       card("分层缓存", "", setRow("上层节点", "其他节点的 GET / HEAD 请求经这个节点回源（回源规则另指了源站的除外），它的缓存供全机群共用，源站只被它请求；它刚失败过时各节点改为直接回源。建议选离源站近的节点。留空为不分层，每个节点各自回源。",
         `<input data-set="cache_tier_node" value="${esc(tier)}" list="tierNodes" placeholder="节点名" spellcheck="false" aria-label="分层缓存的上层节点"${ro}><datalist id="tierNodes">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>` +
-        (unknown ? '<span class="hint">没有这个名字的节点：各节点照常直接回源。</span>' : ""))) };
+        (unknown ? '<span class="hint">没有这个名字的节点：各节点照常直接回源。</span>' : ""))) +
+      card("大文件分片", "", setRow("分片缓存", "达到这个大小的对象按 512 KiB 一片缓存：Range 请求（视频拖动、断点续传）只读涉及的片，缓存按片淘汰，大文件不必整份放进内存；缺了的片只向源站补那几片（源站不支持 Range 时整份重取）。只对声明了长度、未压缩的 200 应答生效，单个对象仍以 32 MiB 为上限。",
+        nsel("cache_chunking", chunking, sizes, "分片缓存的起始大小"))) };
   },
   async workers(z) {
     return { sub: "把匹配的请求交给 Worker 脚本处理。脚本本身在账户主页的 Workers 里管理。", acts: '<a class="btn" href="#/workers">管理脚本</a>', body: await ruleSection(z.id, "route") };

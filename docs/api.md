@@ -384,6 +384,7 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `origin_check_interval` | `30`: 10 to 3600 seconds between two checks of an address |
 | `session_affinity` | `false`, `true`: requests from one visitor address start with the same origin address |
 | `cache_tier_node` | `""`, or the name of a node (at most 64 bytes): tiered cache, see [Cache](#cache) |
+| `cache_chunking` | `0` (off), or `524288` to `33554432` bytes: objects of at least this size are cached in 512 KiB chunks, see [Cache](#large-objects-in-chunks) |
 | `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
 
 ```sh
@@ -515,6 +516,40 @@ More of the cache:
   that node has just failed, the origin is asked directly. The setting does nothing on the node it
   names, nor when it names no node of the fleet (it is not checked when saved), nor for requests
   that an origin rule or the record's `origin.node` already sends somewhere.
+
+#### Large objects in chunks
+
+With the zone setting `cache_chunking` at N bytes (524288 to 33554432; `0`, the default, is off), an
+answer the cache stores that is a `200` of announced length (`Content-Length`) of at least N bytes,
+sent without `Content-Encoding`, is kept in chunks of 512 KiB (524288 bytes) instead of as one copy:
+
+- Visitors get the same answers as from a whole copy: the whole object, single ranges (`206`),
+  `If-Range`, `304` to `If-None-Match` / `If-Modified-Since`, `HEAD`, `416`. A range request reads only
+  the chunks it covers.
+- The memory and disk tiers keep and drop chunks one by one like any other object, so a large object
+  does not have to fit in a tier whole (the disk tier takes no single object over an eighth of its
+  size). Node status counts chunks as objects.
+- A chunk that was dropped while the copy is fresh is fetched again by itself: one request to the
+  origin for the missing chunks, with `Range`, `If-Range` (the copy's strong `ETag`, else its
+  `Last-Modified`) and `Accept-Encoding: identity`. Its answer is used only if it is a `206` for exactly
+  those bytes of an object of the same length, `ETag` and `Last-Modified`
+  (`fcf-cache-status: MISS`). A `200` (the origin ignores ranges, or the object changed) is used as the
+  answer and stored whole this once; any other answer drops the copy and the request goes to the
+  origin as it would without chunks. A copy with no validator (or only a weak `ETag`) is fetched again
+  whole when a chunk is missing.
+- Chunks of two versions are never served together: every fill is marked, and a chunk is only used
+  with the copy it was cut for.
+- An expired copy is answered stale (`stale-while-revalidate`, `UPDATING`; the origin failing,
+  `STALE`) only when every chunk the request needs is still there; it is not revalidated with a
+  conditional request but fetched again whole.
+- Purges by URL, prefix, host, tag or everything take the chunks with the copy; `purged` counts the
+  object once.
+- Turning the setting off makes copies kept in chunks misses; they are replaced by whole ones.
+
+What has not changed: no object over 32 MiB is cached; the origin's answer is read whole before the
+visitor gets its first byte (it is cut into chunks as it is read); answers without `Content-Length`
+are kept whole; a range request for an object that is not cached still goes to the origin as it is,
+and its answer is not kept.
 
 ### Origins: health checks, weights and session affinity
 

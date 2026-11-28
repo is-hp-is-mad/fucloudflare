@@ -22,6 +22,58 @@ struct Env {
 /// Makes the origin answer 503 for paths containing "flaky".
 static FLAKY_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The length of the test origin's large objects (paths under `/vid/`):
+/// three whole cache chunks and a part.
+const VIDEO_LEN: u64 = 3 * chunked::CHUNK + 12_345;
+/// The version of the objects under `/vid/` whose path holds "shifty".
+static SHIFTY: AtomicUsize = AtomicUsize::new(0);
+/// The range requests the origin got for paths under `/vid/`: path, `Range`, `If-Range`.
+static VIDEO_RANGES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The bytes of a large test object, different in each chunk and version.
+fn video_bytes(version: usize) -> Vec<u8> {
+    (0..VIDEO_LEN).map(|i| b'a' + ((i * 31 + version as u64 * 7 + i / chunked::CHUNK) % 26) as u8).collect()
+}
+
+/// A large object as an origin serves it. Paths with "norange" ignore
+/// `Range`; those with "shifty" honour it but ignore `If-Range` (so they
+/// can answer a part of another version); the others honour both
+/// ("unvalidated" ones have no entity tag, nor any other validator). "brief"
+/// ones are fresh for a second ("brief-swr" ones may then be answered stale
+/// while they are fetched anew).
+fn video(path: &str, range: Option<&str>, if_range: Option<&str>) -> axum::response::Response {
+    let version = if path.contains("shifty") { SHIFTY.load(Ordering::SeqCst) } else { 0 };
+    let etag = format!("\"vid{version}\"");
+    let data = video_bytes(version);
+    if let Some(r) = range {
+        VIDEO_RANGES.lock().unwrap().push(format!("{path} {r} {}", if_range.unwrap_or("-")));
+    }
+    let honoured = !path.contains("norange") && (path.contains("shifty") || if_range.is_none_or(|v| v == etag));
+    let part = range.filter(|_| honoured).and_then(|r| {
+        let (a, b) = r.strip_prefix("bytes=")?.split_once('-')?;
+        let a: u64 = a.parse().ok()?;
+        let b = if b.is_empty() { VIDEO_LEN - 1 } else { b.parse::<u64>().ok()?.min(VIDEO_LEN - 1) };
+        (a <= b).then_some((a, b))
+    });
+    let cc = match (path.contains("brief"), path.contains("swr")) {
+        (true, true) => "public, max-age=1, stale-while-revalidate=60",
+        (true, false) => "public, max-age=1",
+        _ => "public, max-age=60",
+    };
+    let mut builder = axum::http::Response::builder().header("cache-control", cc).header("cache-tag", "videos").header("content-type", "video/mp4");
+    if !path.contains("unvalidated") {
+        builder = builder.header("etag", &etag);
+    }
+    match part {
+        Some((a, b)) => builder
+            .status(206)
+            .header("content-range", format!("bytes {a}-{b}/{VIDEO_LEN}"))
+            .body(axum::body::Body::from(data[a as usize..=b as usize].to_vec()))
+            .unwrap(),
+        None => builder.body(axum::body::Body::from(data)).unwrap(),
+    }
+}
+
 /// A body sent without announcing its length.
 struct Chunks(std::collections::VecDeque<Bytes>);
 
@@ -43,6 +95,7 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
         async move {
             let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
             let h_inm = req.headers().get("if-none-match").and_then(|v| v.to_str().ok()).map(String::from);
+            let (h_range, h_if_range) = (req.headers().get("range").and_then(|v| v.to_str().ok()).map(String::from), req.headers().get("if-range").and_then(|v| v.to_str().ok()).map(String::from));
             let (path, line) = {
             let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
             let path = req.uri().path().to_string();
@@ -63,6 +116,9 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
             let text = format!("{line} body={}", String::from_utf8_lossy(&body));
             let cc = if path.contains("private") { "private" } else { "max-age=60" };
             use axum::response::IntoResponse;
+            if path.starts_with("/vid/") {
+                return video(&path, h_range.as_deref(), h_if_range.as_deref());
+            }
             if path.contains("etag") {
                 let status = if h_inm.as_deref() == Some("\"v1\"") { 304 } else { 200 };
                 let body = if status == 304 { String::new() } else { format!("etag-body hit={n}") };
@@ -2375,4 +2431,317 @@ async fn the_admission_cookie_is_scoped_to_the_rooms_path() {
     assert_eq!(r.status, 200);
     let c = r.header("set-cookie").unwrap_or_default().to_string();
     assert!(c.ends_with("; Path=/shop; Max-Age=120; HttpOnly; SameSite=Lax"), "{c}");
+}
+
+/// The cache key of a plain-HTTP request for `path` on example.com that
+/// takes no compression (as the raw test requests are).
+fn video_key(path: &str) -> String {
+    cache::cache_key(false, "example.com", path, "", &HeaderMap::new())
+}
+
+/// Which of the four chunks of the object at `path` the cache has (of any fill).
+async fn video_chunks(env: &Env, path: &str) -> Vec<bool> {
+    let base = Cache::shared_key(&video_key(path));
+    let mut out = Vec::new();
+    for n in 0..4 {
+        out.push(env.edge.cache.lookup_exact(&chunked::chunk_key(&base, n)).await.is_some());
+    }
+    out
+}
+
+/// The cache's entry for the object at `path`, if any.
+async fn video_entry(env: &Env, path: &str) -> Option<Arc<cache::Entry>> {
+    env.edge.cache.lookup(&video_key(path)).await
+}
+
+fn forget_chunk(env: &Env, path: &str, n: u64) {
+    env.edge.cache.remove(&chunked::chunk_key(&Cache::shared_key(&video_key(path)), n));
+}
+
+/// The range requests the origin got for `path`.
+fn ranges_asked(path: &str) -> Vec<String> {
+    VIDEO_RANGES.lock().unwrap().iter().filter(|l| l.split(' ').next() == Some(path)).cloned().collect()
+}
+
+/// Is the entry of the object at `path` gone, and which of its chunks are left?
+async fn video_gone(env: &Env, path: &str) -> (bool, Vec<bool>) {
+    (video_entry(env, path).await.is_none(), video_chunks(env, path).await)
+}
+
+async fn ranged(env: &Env, path: &str, range: &str) -> Reply {
+    send(env, "GET", "example.com", path, &format!("Range: {range}\r\n"), "").await
+}
+
+const C: u64 = chunked::CHUNK;
+
+#[tokio::test]
+async fn large_objects_are_kept_in_chunks_and_served_whole_and_by_range() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/ranged-whole.bin";
+    let data = video_bytes(0);
+
+    let first = get(&env, "example.com", path).await;
+    assert_eq!((first.status, first.header("fcf-cache-status")), (200, Some("MISS")));
+    assert!(first.body.as_bytes() == data, "the first visitor gets the whole object");
+    assert_eq!(first.header("content-length"), Some(VIDEO_LEN.to_string().as_str()));
+    let entry = video_entry(&env, path).await.unwrap();
+    assert!(entry.body.is_empty() && matches!(&entry.piece, Some(cache::Piece::Meta { total, .. }) if *total == VIDEO_LEN), "{:?}", entry.piece);
+    assert_eq!(video_chunks(&env, path).await, [true; 4]);
+
+    let again = get(&env, "example.com", path).await;
+    assert_eq!((again.status, again.header("fcf-cache-status"), hits()), (200, Some("HIT"), 1));
+    assert!(again.body.as_bytes() == data);
+    assert_eq!((again.header("content-length"), again.header("accept-ranges"), again.header("etag")), (Some(VIDEO_LEN.to_string().as_str()), Some("bytes"), Some("\"vid0\"")));
+    assert!(again.header("fucf-chunked").is_none() && again.header("cache-tag").is_none(), "nothing of how it is kept shows");
+
+    let part = ranged(&env, path, "bytes=100-199").await;
+    assert_eq!((part.status, part.header("fcf-cache-status"), part.header("content-range")), (206, Some("HIT"), Some(format!("bytes 100-199/{VIDEO_LEN}").as_str())));
+    assert!(part.body.as_bytes() == &data[100..200]);
+    let across = ranged(&env, path, &format!("bytes={}-{}", C - 5, 2 * C + 5)).await;
+    assert!(across.status == 206 && across.body.as_bytes() == &data[(C - 5) as usize..=(2 * C + 5) as usize], "a range over three chunks");
+    let tail = ranged(&env, path, "bytes=-10").await;
+    assert!(tail.status == 206 && tail.body.as_bytes() == &data[data.len() - 10..]);
+    let open = ranged(&env, path, &format!("bytes={}-", 3 * C)).await;
+    assert!(open.status == 206 && open.body.as_bytes() == &data[3 * C as usize..], "the last, partial chunk");
+    let beyond = ranged(&env, path, &format!("bytes={VIDEO_LEN}-")).await;
+    assert_eq!((beyond.status, beyond.header("content-range")), (416, Some(format!("bytes */{VIDEO_LEN}").as_str())));
+    let head = send(&env, "HEAD", "example.com", path, "", "").await;
+    assert_eq!((head.status, head.header("content-length"), head.body.as_str()), (200, Some(VIDEO_LEN.to_string().as_str()), ""));
+    let unchanged = send(&env, "GET", "example.com", path, "If-None-Match: \"vid0\"\r\n", "").await;
+    assert_eq!((unchanged.status, unchanged.body.as_str()), (304, ""));
+    assert_eq!(hits(), 1, "all of that came from the cache");
+    assert!(ranges_asked(path).is_empty(), "and the origin was never asked for a range");
+}
+
+#[tokio::test]
+async fn a_chunk_the_cache_let_go_is_fetched_again_by_itself() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/ranged-refill.bin";
+    let data = video_bytes(0);
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"));
+
+    forget_chunk(&env, path, 2);
+    let part = ranged(&env, path, "bytes=0-9").await;
+    assert_eq!((part.status, part.header("fcf-cache-status"), hits()), (206, Some("HIT"), 1), "what is there is served");
+    let whole = get(&env, "example.com", path).await;
+    assert_eq!((whole.status, whole.header("fcf-cache-status"), hits()), (200, Some("MISS"), 2));
+    assert!(whole.body.as_bytes() == data, "the whole object, the missing chunk from the origin");
+    assert_eq!(ranges_asked(path), [format!("{path} bytes={}-{} \"vid0\"", 2 * C, 3 * C - 1)], "just that chunk, of that version");
+    assert_eq!(video_chunks(&env, path).await, [true; 4], "and it is kept again");
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("HIT"));
+
+    // two missing chunks: one request from the first to the last of them
+    forget_chunk(&env, path, 1);
+    forget_chunk(&env, path, 3);
+    let range = format!("bytes={}-{}", C + 5, 3 * C + 5);
+    let part = ranged(&env, path, &range).await;
+    assert_eq!((part.status, part.header("fcf-cache-status")), (206, Some("MISS")));
+    assert!(part.body.as_bytes() == &data[(C + 5) as usize..=(3 * C + 5) as usize]);
+    assert_eq!(ranges_asked(path)[1], format!("{path} bytes={C}-{} \"vid0\"", VIDEO_LEN - 1));
+    assert_eq!((hits(), video_chunks(&env, path).await), (3, vec![true; 4]));
+    let again = ranged(&env, path, &range).await;
+    assert_eq!((again.header("fcf-cache-status"), hits()), (Some("HIT"), 3));
+}
+
+#[tokio::test]
+async fn an_origin_that_ignores_ranges_gets_the_object_kept_whole_once() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/norange-a.bin";
+    let data = video_bytes(0);
+    get(&env, "example.com", path).await;
+    assert_eq!(video_chunks(&env, path).await, [true; 4], "an origin's whole answer is kept in chunks all the same");
+
+    forget_chunk(&env, path, 1);
+    let whole = get(&env, "example.com", path).await;
+    assert_eq!((whole.status, whole.header("fcf-cache-status"), hits()), (200, Some("MISS"), 2), "one request, its whole answer used");
+    assert!(whole.body.as_bytes() == data);
+    assert_eq!(ranges_asked(path).len(), 1);
+    let entry = video_entry(&env, path).await.unwrap();
+    assert!(entry.piece.is_none() && entry.body.len() as u64 == VIDEO_LEN, "now kept whole");
+    let part = ranged(&env, path, "bytes=5-9").await;
+    assert_eq!((part.status, part.header("fcf-cache-status"), hits()), (206, Some("HIT"), 2));
+    assert!(part.body.as_bytes() == &data[5..10]);
+
+    // a range request whose chunk is gone: the origin's whole answer goes to the visitor, as without chunks
+    let path = "/vid/norange-b.bin";
+    get(&env, "example.com", path).await;
+    forget_chunk(&env, path, 0);
+    let part = ranged(&env, path, "bytes=0-9").await;
+    assert_eq!((part.status, part.header("fcf-cache-status"), hits()), (200, Some("DYNAMIC"), 4));
+    assert!(part.body.as_bytes() == data);
+    assert!(video_entry(&env, path).await.is_none(), "the entry whose chunks could not be had is gone");
+}
+
+#[tokio::test]
+async fn chunks_of_two_versions_are_never_served_together() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    SHIFTY.store(0, Ordering::SeqCst);
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/shifty-a.bin";
+    assert!(get(&env, "example.com", path).await.body.as_bytes() == video_bytes(0));
+
+    // the object changes at the origin while a chunk is gone: the range the origin answers
+    // is of the new version, so it is not used; the object is fetched whole instead
+    SHIFTY.store(1, Ordering::SeqCst);
+    forget_chunk(&env, path, 2);
+    let whole = get(&env, "example.com", path).await;
+    assert_eq!((whole.status, whole.header("fcf-cache-status"), whole.header("etag"), hits()), (200, Some("MISS"), Some("\"vid1\""), 3));
+    assert!(whole.body.as_bytes() == video_bytes(1), "all of the new version, nothing of the old");
+    assert_eq!(ranges_asked(path), [format!("{path} bytes={}-{} \"vid0\"", 2 * C, 3 * C - 1)]);
+    let entry = video_entry(&env, path).await.unwrap();
+    assert!(entry.piece.is_none(), "kept whole this once");
+    let again = get(&env, "example.com", path).await;
+    assert!(again.header("fcf-cache-status") == Some("HIT") && again.body.as_bytes() == video_bytes(1));
+    SHIFTY.store(0, Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn purges_remove_every_chunk_of_an_object() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let path = "/vid/ranged-purged.bin";
+    let purges: [(&str, Box<dyn Fn(&Env) -> usize>); 4] = [
+        ("url", Box::new(|env: &Env| env.edge.cache.purge_urls(&env.zone, &[format!("https://example.com{path}")], false))),
+        ("host", Box::new(|env: &Env| env.edge.cache.purge_urls(&env.zone, &["example.com/".into()], true))),
+        ("tag", Box::new(|env: &Env| env.edge.cache.purge_tags(&env.zone, &["videos".into()]))),
+        ("everything", Box::new(|env: &Env| env.edge.cache.purge_zone(&env.zone))),
+    ];
+    for (how, purge) in purges {
+        assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"), "{how}");
+        assert_eq!(video_gone(&env, path).await, (false, vec![true; 4]));
+        assert_eq!(purge(&env), 1, "{how}: one object");
+        assert_eq!(video_gone(&env, path).await, (true, vec![false; 4]), "{how}");
+    }
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"));
+}
+
+#[tokio::test]
+async fn an_expired_chunked_object_is_fetched_anew_or_served_stale() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let path = "/vid/ranged-brief.bin";
+    let data = video_bytes(0);
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let renewed = get(&env, "example.com", path).await;
+    assert!(renewed.header("fcf-cache-status") == Some("EXPIRED") && renewed.body.as_bytes() == data);
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("HIT"));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    let rule = json!({ "expression": "http.request.uri.path contains \"ranged-brief\"", "origin_port": closed, "priority": 1 });
+    env.store.save_item::<OriginRule>(&env.zone, None, rule, true).unwrap();
+    let stale = get(&env, "example.com", path).await;
+    assert_eq!((stale.status, stale.header("fcf-cache-status")), (200, Some("STALE")));
+    assert!(stale.body.as_bytes() == data);
+    // without a chunk it needs, the error is what the visitor gets
+    forget_chunk(&env, path, 3);
+    assert_eq!(get(&env, "example.com", path).await.status, 521);
+}
+
+#[tokio::test]
+async fn with_chunking_off_large_objects_are_cached_whole_as_before() {
+    let env = setup().await;
+    let hits = || env.hits.load(Ordering::SeqCst);
+    for bad in [json!(1), json!(C - 1), json!(cache::MAX_OBJECT + 1), json!(-1), json!("on")] {
+        assert!(env.store.update_setting(&env.zone, "cache_chunking", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(env.store.snapshot().zones.values().next().unwrap().zone.settings.cache_chunking, 0, "off by default");
+    let path = "/vid/ranged-off.bin";
+    let data = video_bytes(0);
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"));
+    let entry = video_entry(&env, path).await.unwrap();
+    assert!(entry.piece.is_none() && entry.body.len() as u64 == VIDEO_LEN, "one whole entry");
+    assert_eq!(video_chunks(&env, path).await, [false; 4]);
+    let part = ranged(&env, path, "bytes=100-199").await;
+    assert!(part.status == 206 && part.header("fcf-cache-status") == Some("HIT") && part.body.as_bytes() == &data[100..200]);
+    assert_eq!(hits(), 1);
+    // a range request for what is not cached goes to the origin as it is, as before
+    let cold = ranged(&env, "/vid/ranged-off-cold.bin", "bytes=0-9").await;
+    assert_eq!((cold.status, cold.header("fcf-cache-status")), (206, Some("DYNAMIC")));
+    assert!(cold.body.as_bytes() == &data[..10]);
+    assert!(video_entry(&env, "/vid/ranged-off-cold.bin").await.is_none());
+
+    // switched on, what is kept whole is still served whole ...
+    for value in [json!(C), json!(cache::MAX_OBJECT)] {
+        env.store.update_setting(&env.zone, "cache_chunking", value).unwrap();
+    }
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("HIT"));
+    // ... and once kept in chunks, switching off makes it a miss, fetched and kept whole again
+    env.edge.cache.purge_zone(&env.zone);
+    get(&env, "example.com", path).await;
+    assert_eq!(video_chunks(&env, path).await, [true; 4]);
+    env.store.update_setting(&env.zone, "cache_chunking", json!(0)).unwrap();
+    let off = get(&env, "example.com", path).await;
+    assert!(off.header("fcf-cache-status") == Some("MISS") && off.body.as_bytes() == data);
+    assert!(video_entry(&env, path).await.unwrap().piece.is_none());
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("HIT"));
+    // an object smaller than the threshold is kept whole too
+    env.store.update_setting(&env.zone, "cache_chunking", json!(VIDEO_LEN + 1)).unwrap();
+    let path = "/vid/ranged-under.bin";
+    get(&env, "example.com", path).await;
+    assert!(video_entry(&env, path).await.unwrap().piece.is_none());
+    assert!(ranges_asked("/vid/ranged-off.bin").is_empty() && ranges_asked(path).is_empty());
+}
+
+#[tokio::test]
+async fn an_expired_chunked_object_is_answered_at_once_while_it_is_fetched_anew() {
+    let env = setup().await;
+    tokio::spawn(env.edge.clone().refresh_stale());
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/ranged-brief-swr.bin";
+    let data = video_bytes(0);
+    assert_eq!(get(&env, "example.com", path).await.header("fcf-cache-status"), Some("MISS"));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let stale = get(&env, "example.com", path).await;
+    assert!(stale.header("fcf-cache-status") == Some("UPDATING") && stale.body.as_bytes() == data);
+    for _ in 0..40 {
+        if hits() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(hits(), 2, "fetched anew behind the visitor's back");
+    let fresh = get(&env, "example.com", path).await;
+    assert!(fresh.header("fcf-cache-status") == Some("HIT") && fresh.body.as_bytes() == data);
+    assert_eq!(video_chunks(&env, path).await, [true; 4]);
+    // an expired object missing a chunk is not answered stale: the visitor waits for the origin
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    forget_chunk(&env, path, 0);
+    let expired = get(&env, "example.com", path).await;
+    assert!(expired.header("fcf-cache-status") == Some("EXPIRED") && expired.body.as_bytes() == data);
+    assert_eq!(hits(), 3);
+}
+
+#[tokio::test]
+async fn a_chunked_object_without_a_validator_is_fetched_whole_when_a_chunk_is_gone() {
+    let env = setup().await;
+    env.store.update_setting(&env.zone, "cache_chunking", json!(C)).unwrap();
+    let hits = || env.hits.load(Ordering::SeqCst);
+    let path = "/vid/ranged-unvalidated.bin";
+    let data = video_bytes(0);
+    get(&env, "example.com", path).await;
+    assert_eq!(video_chunks(&env, path).await, [true; 4]);
+    forget_chunk(&env, path, 1);
+    // nothing to ask for the chunk by that would tell another version: a miss
+    let whole = get(&env, "example.com", path).await;
+    assert_eq!((whole.status, whole.header("fcf-cache-status"), hits()), (200, Some("MISS"), 2));
+    assert!(whole.body.as_bytes() == data);
+    assert!(ranges_asked(path).is_empty());
+    assert_eq!(video_chunks(&env, path).await, [true; 4], "kept in chunks again");
+    // a range request then goes to the origin as it is, as for anything not cached
+    forget_chunk(&env, path, 0);
+    let part = ranged(&env, path, "bytes=0-9").await;
+    assert_eq!((part.status, part.header("fcf-cache-status"), hits()), (206, Some("DYNAMIC"), 3));
+    assert!(part.body.as_bytes() == &data[..10]);
+    assert_eq!(ranges_asked(path), [format!("{path} bytes=0-9 -")], "the visitor's own range");
+    assert!(video_entry(&env, path).await.is_none());
 }

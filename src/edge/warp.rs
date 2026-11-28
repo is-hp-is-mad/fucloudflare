@@ -95,7 +95,7 @@ pub fn cached(edge: &Edge, key: &str) -> Option<Arc<cache::Entry>> {
 /// Keep an object for `ttl`. Purges name objects by `key`: exactly, or by a prefix of it.
 #[allow(dead_code)]
 pub fn store(edge: &Edge, key: &str, status: StatusCode, headers: HeaderMap, body: Bytes, ttl: Duration) {
-    let entry = cache::Entry { status, headers, body, stored: Instant::now(), ttl, zone_id: CACHE_SCOPE.to_string(), url: key.to_string() };
+    let entry = cache::Entry { status, headers, body, stored: Instant::now(), ttl, zone_id: CACHE_SCOPE.to_string(), url: key.to_string(), piece: None };
     edge.cache.put(cache_key(key), entry);
 }
 

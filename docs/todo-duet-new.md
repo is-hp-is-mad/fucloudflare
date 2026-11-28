@@ -65,7 +65,7 @@
 
 ## 2. 追加任务（第二批，核心大手术，最后做）
 
-### [ ] N6 大文件分片缓存
+### [x] N6 大文件分片缓存
 
 - 现状：`src/edge/cache.rs` 已有 `pub enum Range` 和 `pub fn parse_range(value: &str, len: u64) -> Range`；`Entry` 在 33 行。大响应目前整体进内存/磁盘层，内存预算吃不消。
 - 设计：超过阈值（先定 512 KB 固定chunk、总大小阈值可配在域名设置 `cache_chunking`）的响应按固定大小分片存储：元数据条（响应头+总长）存原键，第 n 片存 `原键 + "|chunk:" + n`；`Cache-Control`/`tags`/SWR 语义挂在元数据条上。
@@ -157,3 +157,9 @@
 - 清除会在配置里再执行一次（`apply_purges`），所以不断言准确的 `purged` 数，只断言 MISS / HIT。
 - 缺请求头时代码把所有 IP 放进同一个空键（不是"按 IP"），单 IP 的 e2e 区分不出来，检查写成两种理解都通过，留待验证。
 - 留待能运行的人：真实握手的 RTT 和 `fastest`、cookie / ASN / 国家特征、源站健康、AXFR、新记录类型、`swr` / `ignore_query`。没有对着真实服务跑过，只做了 `py_compile` 和 `--list-tests`。
+
+### N6
+- 新文件 `src/edge/chunked.rs`：区域设置 `cache_chunking`（字节，0 关，524288–33554432）开启后，入缓存的、声明长度且不小于阈值、未压缩的 GET 200 按 512 KiB 分片：元数据条存原键（`Entry.piece = Meta{fill,total}`，体为空），第 n 片存 `键|chunk:n`（`Piece::Chunk{fill,n}`，带 `Cache-Tag` 副本以便按标签清除）；每次填充一个随机 fill id，片只与同 fill、长度正好的元数据一起用，不会拼出两个版本。
+- 取：`chunked::serve` 按 `cached_response` 同样的规则（有逐条对比测试）只读涉及的片；缺片时 `Edge::refill` 只对缺的那段发 `Range`+`If-Range`（强 ETag，否则 Last-Modified）+`Accept-Encoding: identity`，只接受跨度、总长、ETag/Last-Modified 都对得上的 206；源站回 200 就直接用这份、这一次整份存放；其他应答丢元数据后照不分片回源；没有校验值的整份重取。过期副本只在片齐时给 UPDATING/STALE，不做 304 续期。
+- 写：仍是整份读完才发给访客（边读边切片、切好的片直接作应答体），单对象上限仍 32 MiB；真正的边收边发、冷 Range 请求的部分填充留待以后。磁盘层元数据写成 `.k` 文件，防止降级后旧二进制把空体当对象发出去。
+- 留待能跑真实流量的人：分层缓存上层节点之间的 Range 补片、慢源站下补片的时延、磁盘上 64 片逐个读的速度、滚动升级时旧节点改设置会丢掉 `cache_chunking`、整份重存后旧片要等淘汰或清除才消失（不会被发出去）。

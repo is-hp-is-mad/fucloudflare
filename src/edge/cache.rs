@@ -39,6 +39,22 @@ pub struct Entry {
     pub zone_id: String,
     /// `host/path?query`, used for purge-by-URL.
     pub url: String,
+    /// Set on the entries of an object kept in chunks (see
+    /// crate::edge::chunked); `None` for every other entry.
+    pub piece: Option<Piece>,
+}
+
+/// What an entry of an object kept in chunks holds. Every fill of such an
+/// object gets a new `fill` id, carried by its entry and each of its
+/// chunks: a chunk is only used with the entry of its own fill, so chunks
+/// of two versions of an object can never be served together.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Piece {
+    /// The object's status, headers and freshness, under the object's key;
+    /// its body is empty and `total` bytes long in chunks.
+    Meta { fill: String, total: u64 },
+    /// Chunk `n` of the fill (see crate::edge::chunked::chunk_key).
+    Chunk { fill: String, n: u64 },
 }
 
 impl Entry {
@@ -224,6 +240,12 @@ pub fn decide(path: &str, status: StatusCode, headers: &HeaderMap, force: bool, 
     }
 }
 
+/// Does an entry count as an object of its own (what a purge reports)?
+/// The chunks of an object kept in chunks do not: they go with it.
+fn is_object(piece: &Option<Piece>) -> bool {
+    !matches!(piece, Some(Piece::Chunk { .. }))
+}
+
 #[derive(Default)]
 struct Inner {
     /// Entry and when it was last used (a tick of `clock`).
@@ -294,21 +316,51 @@ impl Cache {
         if let Some(hit) = self.get(key) {
             return Some(hit);
         }
-        let disk = self.disk.as_ref()?;
+        self.disk.as_ref()?;
         let candidates: Vec<String> = [Some(key.to_string()), identity_key(key)].into_iter().flatten().collect();
         for k in candidates {
-            let Some(file) = disk.file_of(&k) else { continue };
-            let read = tokio::task::spawn_blocking(move || Disk::read(&file)).await.ok().flatten();
-            match read {
-                Some(entry) => {
-                    let entry = Arc::new(entry);
-                    self.memory_put(k, entry.clone());
-                    return Some(entry);
-                }
-                None => disk.forget(&k),
+            if let Some(entry) = self.from_disk(k).await {
+                return Some(entry);
             }
         }
         None
+    }
+
+    /// Exactly the entry under `key` (no shared uncompressed copy is looked
+    /// for), from memory, else from disk: the chunks of an object, whose
+    /// keys must never lead to another entry.
+    pub async fn lookup_exact(&self, key: &str) -> Option<Arc<Entry>> {
+        match self.memory_get(key) {
+            Some(hit) => Some(hit),
+            None => self.from_disk(key.to_string()).await,
+        }
+    }
+
+    /// The entry under `key` on disk, read back into memory. An index entry
+    /// whose file cannot be read is forgotten.
+    async fn from_disk(&self, key: String) -> Option<Arc<Entry>> {
+        let disk = self.disk.as_ref()?;
+        let file = disk.file_of(&key)?;
+        let read = tokio::task::spawn_blocking(move || Disk::read(&file)).await.ok().flatten();
+        match read {
+            Some(entry) => {
+                let entry = Arc::new(entry);
+                self.memory_put(key, entry.clone());
+                Some(entry)
+            }
+            None => {
+                disk.forget(&key);
+                None
+            }
+        }
+    }
+
+    /// The key under which [`Cache::put`] keeps an uncompressed answer to a
+    /// request with this key (one copy for every compression). An object
+    /// kept in chunks is always uncompressed: its entry is kept there, and
+    /// its chunk keys start with it.
+    pub fn shared_key(key: &str) -> String {
+        identity_key(key).unwrap_or_else(|| key.to_string())
     }
 
     pub fn put(&self, key: String, entry: Entry) {
@@ -317,6 +369,12 @@ impl Cache {
             Some(shared) if !entry.headers.contains_key(header::CONTENT_ENCODING) => shared,
             _ => key,
         };
+        self.put_exact(key, entry);
+    }
+
+    /// Keep `entry` under exactly `key`: unlike [`Cache::put`], an
+    /// uncompressed one is not moved to the shared key.
+    pub fn put_exact(&self, key: String, entry: Entry) {
         let entry = Arc::new(entry);
         if let Some(disk) = &self.disk {
             if entry.ttl >= Duration::from_secs(30) && entry.size() <= disk.max_bytes / 8 {
@@ -354,12 +412,27 @@ impl Cache {
         }
     }
 
+    /// Forget the entry under exactly `key`, in memory and on disk.
+    pub fn remove(&self, key: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((old, _)) = inner.map.remove(key) {
+            inner.bytes -= old.size();
+        }
+        drop(inner);
+        if let Some(disk) = &self.disk {
+            disk.forget(key);
+        }
+    }
+
     fn remove_where(&self, pred: impl Fn(&str, &str) -> bool) -> usize {
         let mut inner = self.inner.lock().unwrap();
-        let before = inner.map.len();
-        inner.map.retain(|_, (e, _)| !pred(&e.zone_id, &e.url));
+        let mut gone = 0;
+        inner.map.retain(|_, (e, _)| {
+            let doomed = pred(&e.zone_id, &e.url);
+            gone += usize::from(doomed && is_object(&e.piece));
+            !doomed
+        });
         inner.bytes = inner.map.values().map(|(e, _)| e.size()).sum();
-        let mut gone = before - inner.map.len();
         drop(inner);
         if let Some(disk) = &self.disk {
             gone = gone.max(disk.remove_where(&|m| pred(&m.zone_id, &m.url)));
@@ -374,10 +447,13 @@ impl Cache {
         }
         let hit = |have: &[String]| have.iter().any(|t| tags.contains(t));
         let mut inner = self.inner.lock().unwrap();
-        let before = inner.map.len();
-        inner.map.retain(|_, (e, _)| !(e.zone_id == zone_id && hit(&tags_of(&e.headers))));
+        let mut gone = 0;
+        inner.map.retain(|_, (e, _)| {
+            let doomed = e.zone_id == zone_id && hit(&tags_of(&e.headers));
+            gone += usize::from(doomed && is_object(&e.piece));
+            !doomed
+        });
         inner.bytes = inner.map.values().map(|(e, _)| e.size()).sum();
-        let mut gone = before - inner.map.len();
         drop(inner);
         if let Some(disk) = &self.disk {
             gone = gone.max(disk.remove_where(&|m| m.zone_id == zone_id && hit(&m.tags)));
@@ -422,6 +498,10 @@ struct FileHead {
     ttl_ms: u64,
     zone_id: String,
     url: String,
+    /// Left out for an entry that is not part of an object kept in chunks,
+    /// so such files are written exactly as before chunks existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    piece: Option<Piece>,
 }
 
 struct Meta {
@@ -432,6 +512,8 @@ struct Meta {
     /// The origin's `Cache-Tag`s.
     tags: Vec<String>,
     used: u64,
+    /// A chunk of an object kept in chunks: not counted as an object of its own.
+    chunk: bool,
 }
 
 #[derive(Default)]
@@ -472,12 +554,13 @@ impl Disk {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            if !name.ends_with(".c") {
+            // `.k`: the entry of an object kept in chunks (see [`Disk::file_name`])
+            if !name.ends_with(".c") && !name.ends_with(".k") {
                 continue;
             }
             match Disk::head(&path) {
                 Some((head, size)) if keep_until(head.stored_ms, head.ttl_ms) > now => {
-                    found.push((head.stored_ms, head.key, Meta { file: path, size, tags: split_tags(head.headers.iter().filter(|(n, _)| n == "cache-tag").map(|(_, v)| v.as_str())), zone_id: head.zone_id, url: head.url, used: 0 }));
+                    found.push((head.stored_ms, head.key, Meta { file: path, size, tags: split_tags(head.headers.iter().filter(|(n, _)| n == "cache-tag").map(|(_, v)| v.as_str())), zone_id: head.zone_id, url: head.url, used: 0, chunk: !is_object(&head.piece) }));
                 }
                 _ => {
                     let _ = std::fs::remove_file(&path);
@@ -490,8 +573,13 @@ impl Disk {
             index.clock += 1;
             meta.used = index.clock;
             index.bytes += meta.size;
+            let file = meta.file.clone();
             if let Some(old) = index.map.insert(key, meta) {
                 index.bytes -= old.size;
+                // one key in a `.c` and a `.k` file: the older one goes
+                if old.file != file {
+                    let _ = std::fs::remove_file(&old.file);
+                }
             }
         }
         let index = Arc::new(Mutex::new(index));
@@ -508,8 +596,14 @@ impl Disk {
         Ok(disk)
     }
 
-    fn file_name(key: &str) -> String {
-        format!("{}.c", crate::acme::b64(&crate::acme::sha256(key.as_bytes())))
+    /// The entry of an object kept in chunks goes to a `.k` file, every
+    /// other one to a `.c` file: a binary from before chunks only reads
+    /// `.c` files, so after a downgrade it never serves such an entry's
+    /// empty body as the object (it ignores those files; chunks it reads are
+    /// never asked for and age out).
+    fn file_name(key: &str, piece: Option<&Piece>) -> String {
+        let ext = if matches!(piece, Some(Piece::Meta { .. })) { "k" } else { "c" };
+        format!("{}.{ext}", crate::acme::b64(&crate::acme::sha256(key.as_bytes())))
     }
 
     fn head(path: &std::path::Path) -> Option<(FileHead, usize)> {
@@ -548,6 +642,7 @@ impl Disk {
             ttl,
             zone_id: head.zone_id,
             url: head.url,
+            piece: head.piece,
         })
     }
 
@@ -575,10 +670,11 @@ impl Disk {
     fn remove_where(&self, pred: &dyn Fn(&Meta) -> bool) -> usize {
         let mut index = self.index.lock().unwrap();
         let doomed: Vec<String> = index.map.iter().filter(|(_, m)| pred(m)).map(|(k, _)| k.clone()).collect();
-        let mut files = Vec::new();
+        let (mut files, mut objects) = (Vec::new(), 0);
         for k in &doomed {
             if let Some(m) = index.map.remove(k) {
                 index.bytes -= m.size;
+                objects += usize::from(!m.chunk);
                 files.push(m.file);
             }
         }
@@ -586,7 +682,7 @@ impl Disk {
         if !files.is_empty() {
             let _ = self.jobs.lock().unwrap().send(Job::Remove(files));
         }
-        doomed.len()
+        objects
     }
 
     fn clear(&self) {
@@ -639,7 +735,7 @@ impl Disk {
                 }
                 Job::Remove(_) => Disk::run_removal(job),
                 Job::Write(key, entry) => {
-                    let path = dir.join(Disk::file_name(&key));
+                    let path = dir.join(Disk::file_name(&key, entry.piece.as_ref()));
                     let head = FileHead {
                         key: key.clone(),
                         status: entry.status.as_u16(),
@@ -648,6 +744,7 @@ impl Disk {
                         ttl_ms: entry.ttl.as_millis() as u64,
                         zone_id: entry.zone_id.clone(),
                         url: entry.url.clone(),
+                        piece: entry.piece.clone(),
                     };
                     let Ok(head_json) = serde_json::to_vec(&head) else { continue };
                     let tmp = path.with_extension("tmp");
@@ -666,9 +763,13 @@ impl Disk {
                         let mut index = index.lock().unwrap();
                         index.clock += 1;
                         let used = index.clock;
-                        let meta = Meta { file: path, size, zone_id: entry.zone_id.clone(), url: entry.url.clone(), tags: tags_of(&entry.headers), used };
+                        let meta = Meta { file: path.clone(), size, zone_id: entry.zone_id.clone(), url: entry.url.clone(), tags: tags_of(&entry.headers), used, chunk: !is_object(&entry.piece) };
                         if let Some(old) = index.map.insert(key, meta) {
                             index.bytes -= old.size;
+                            // the key went from a `.c` to a `.k` file or back
+                            if old.file != path {
+                                let _ = std::fs::remove_file(&old.file);
+                            }
                         }
                         index.bytes += size;
                     }
@@ -762,7 +863,7 @@ mod tests {
             if !tags.is_empty() {
                 headers.insert("cache-tag", tags.parse().unwrap());
             }
-            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"x"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: zone.into(), url: "u".into() }
+            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"x"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: zone.into(), url: "u".into(), piece: None }
         };
         cache.put("a".into(), entry("z", "product-1, listing"));
         cache.put("b".into(), entry("z", "listing"));
@@ -784,6 +885,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             zone_id: zone.into(),
             url: url.into(),
+            piece: None,
         };
         cache.put("k1".into(), entry("z1", "a.test/x.js", 100));
         cache.put("k2".into(), entry("z1", "a.test/img/y.png", 100));
@@ -824,7 +926,7 @@ mod tests {
             if encoded {
                 headers.insert(header::CONTENT_ENCODING, "br".parse().unwrap());
             }
-            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"body"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: "z".into(), url: "u".into() }
+            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"body"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: "z".into(), url: "u".into(), piece: None }
         };
         cache.put(k.clone(), entry(false));
         for bucket in ["", "gzip", "br", "gzip, br"] {
@@ -853,6 +955,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             zone_id: "z".into(),
             url: "a.test/p?v=1".into(),
+            piece: None,
         };
         cache.put(k_en.clone(), entry(b"en"));
         cache.put(cache_key(true, "a.test", "/p?v=1", de, &h), entry(b"de"));
@@ -870,7 +973,7 @@ mod tests {
     #[test]
     fn evicts_the_least_recently_used() {
         let cache = Cache::new(3 * 1600);
-        let entry = || Entry { status: StatusCode::OK, headers: HeaderMap::new(), body: Bytes::from(vec![0u8; 1000]), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: "z".into(), url: "u".into() };
+        let entry = || Entry { status: StatusCode::OK, headers: HeaderMap::new(), body: Bytes::from(vec![0u8; 1000]), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: "z".into(), url: "u".into(), piece: None };
         cache.put("old-but-busy".into(), entry());
         cache.put("b".into(), entry());
         cache.put("c".into(), entry());
@@ -885,7 +988,7 @@ mod tests {
         let entry = |url: &str, n: usize| {
             let mut headers = HeaderMap::new();
             headers.insert(header::CONTENT_TYPE, "text/css".parse().unwrap());
-            Entry { status: StatusCode::OK, headers, body: Bytes::from(vec![b'x'; n]), stored: Instant::now(), ttl: Duration::from_secs(600), zone_id: "z".into(), url: url.into() }
+            Entry { status: StatusCode::OK, headers, body: Bytes::from(vec![b'x'; n]), stored: Instant::now(), ttl: Duration::from_secs(600), zone_id: "z".into(), url: url.into(), piece: None }
         };
         {
             let cache = Cache::with_disk(2000, dir.clone(), 1 << 20).unwrap();
@@ -917,7 +1020,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fucf-cache-{}", uuid::Uuid::new_v4().simple()));
         let cache = Cache::with_disk(1 << 20, dir.clone(), 64 * 1024).unwrap();
         for i in 0..40 {
-            let e = Entry { status: StatusCode::OK, headers: HeaderMap::new(), body: Bytes::from(vec![0u8; 4000]), stored: Instant::now(), ttl: Duration::from_secs(600), zone_id: "z".into(), url: format!("u{i}") };
+            let e = Entry { status: StatusCode::OK, headers: HeaderMap::new(), body: Bytes::from(vec![0u8; 4000]), stored: Instant::now(), ttl: Duration::from_secs(600), zone_id: "z".into(), url: format!("u{i}"), piece: None };
             cache.put(format!("k{i}"), e);
         }
         cache.flush();

@@ -190,6 +190,12 @@ pub struct Settings {
     /// Tiered cache: the node the others fetch cacheable requests through (empty: every
     /// node asks the origin itself).
     pub cache_tier_node: String,
+    /// Objects of at least this many bytes are kept in the edge cache in
+    /// chunks of crate::edge::chunked::CHUNK bytes (0: never): a range
+    /// request then reads only the chunks it covers, and a chunk the cache
+    /// let go is fetched again by itself. 0, or from one chunk to
+    /// crate::edge::cache::MAX_OBJECT.
+    pub cache_chunking: u64,
 }
 
 impl Default for Settings {
@@ -226,6 +232,7 @@ impl Default for Settings {
             session_affinity: false,
             dns_transfer_to: Vec::new(),
             cache_tier_node: String::new(),
+            cache_chunking: 0,
         }
     }
 }
@@ -257,6 +264,9 @@ impl Settings {
         }
         if self.cache_tier_node.len() > 64 {
             return invalid("cache_tier_node is the name of a node, or empty");
+        }
+        if self.cache_chunking != 0 && !(crate::edge::chunked::CHUNK..=crate::edge::cache::MAX_OBJECT).contains(&self.cache_chunking) {
+            return invalid("cache_chunking is 0 (off), or 524288 to 33554432 bytes");
         }
         if !(10..=3600).contains(&self.origin_check_interval) {
             return invalid("origin_check_interval is 10 to 3600 seconds");

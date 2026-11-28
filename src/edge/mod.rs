@@ -3,6 +3,7 @@
 
 pub mod cache;
 pub mod cachekey;
+pub mod chunked;
 pub mod certdir;
 pub mod cgi;
 pub mod autofw;
@@ -1574,8 +1575,13 @@ impl Edge {
         let (mut stale, mut fallback) = (None, None);
         // May what the origin answers be stored?
         let mut storable = use_cache;
+        // An object kept in chunks (see chunked): its entry when some chunks it needs are
+        // gone, its expired entry to serve if the origin fails, and whether what the origin
+        // answers this time must be stored whole (the chunks could not be had).
+        let (mut chunk_refill, mut chunk_fallback, mut no_chunk) = (None, None, false);
         if use_cache {
-            match self.cache.lookup(&key).await {
+            let (found, chunked_meta) = chunked::split(self.cache.lookup(&key).await, settings.cache_chunking > 0);
+            match found {
                 Some(entry) if entry.fresh() => return Ok(cached_response(&entry, &method, &conditional, "HIT")),
                 // A part is cut from what we have; otherwise the request goes
                 // to the origin as it is, and its partial answer is not kept.
@@ -1594,6 +1600,25 @@ impl Edge {
                     stale = Some(entry).filter(|e| e.has_validator());
                 }
                 None => status_label = "MISS",
+            }
+            // the same, for an object kept in chunks; range requests of an expired one go to the origin
+            if let Some(meta) = chunked_meta {
+                if meta.fresh() {
+                    if let Some(resp) = chunked::serve(&self.cache, &key, &meta, &method, &conditional, "HIT").await {
+                        return Ok(resp);
+                    }
+                    chunk_refill = Some(meta);
+                } else if conditional.range.is_none() {
+                    if !refresh && meta.stored.elapsed() < meta.ttl + cache::stale_while_revalidate(&meta.headers) {
+                        if let Some(resp) = chunked::serve(&self.cache, &key, &meta, &method, &conditional, "UPDATING").await {
+                            if self.refresh_later(&key, &zone.zone.id, &info, &headers) {
+                                return Ok(resp);
+                            }
+                        }
+                    }
+                    status_label = "EXPIRED";
+                    chunk_fallback = Some(meta).filter(|e| e.stored.elapsed() < e.ttl + cache::STALE_IF_ERROR);
+                }
             }
         }
 
@@ -1654,6 +1679,15 @@ impl Edge {
         }
         let origin_uri: hyper::Uri =
             uri.parse().map_err(|_| EdgeError::new(400, "Bad request", "invalid request URI"))?;
+        // Chunks of a cached object are missing: ask the origin for just those.
+        let mut ready = None;
+        if let Some(meta) = chunk_refill {
+            match self.refill(&key, &meta, &method, &conditional, &target, &headers, &origin_uri).await {
+                chunked::Refill::Served(resp) => return Ok(resp),
+                chunked::Refill::Refetch => {}
+                chunked::Refill::Unchunked(whole) => (ready, no_chunk) = (whole, true),
+            }
+        }
 
         // Try the origin's addresses in turn. A request is only re-sent when
         // nothing was listening (so it cannot have been processed) and its
@@ -1662,6 +1696,9 @@ impl Edge {
         hosts.reverse();
         let mut body = Some(body);
         let outcome = loop {
+            if let Some(resp) = ready.take() {
+                break Ok(resp);
+            }
             let Some(host) = hosts.pop() else {
                 break Err(EdgeError::origin(530, ORIGIN_NOT_CONFIGURED, "no origin available"));
             };
@@ -1696,6 +1733,11 @@ impl Edge {
         };
         if let Some(entry) = fallback.filter(|_| failed) {
             return Ok(cached_response(&entry, &method, &conditional, "STALE"));
+        }
+        if let Some(meta) = chunk_fallback.filter(|_| failed) {
+            if let Some(resp) = chunked::serve(&self.cache, &key, &meta, &method, &conditional, "STALE").await {
+                return Ok(resp);
+            }
         }
         let mut resp = outcome?;
 
@@ -1737,6 +1779,7 @@ impl Edge {
                 ttl,
                 zone_id: entry.zone_id.clone(),
                 url: entry.url.clone(),
+                piece: None,
             };
             let out = cached_response(&renewed, &method, &conditional, "REVALIDATED");
             self.cache.put(key, renewed);
@@ -1756,6 +1799,11 @@ impl Edge {
         // Read what is to be stored: a body of announced length entirely, one
         // of unknown length (chunked) as far as the limit allows.
         let (whole, body) = match (&decision, length) {
+            // a large object is kept in chunks, cut as it is read
+            (Decision::Store(ttl), Some(len)) if method == Method::GET && !no_chunk && chunked::applies(settings.cache_chunking, len, parts.status, &parts.headers) => {
+                let object = chunked::Object { key: &key, status: parts.status, headers: &parts.headers, ttl: *ttl, zone_id: &zone.zone.id, url: format!("{}{}", info.host, uri) };
+                (None, Some(chunked::fill(&self.cache, object, body, len).await.map_err(unreadable)?))
+            }
             (Decision::Store(_), Some(len)) if method == Method::GET && len <= cache::MAX_OBJECT => {
                 (Some(Limited::new(body, len as usize).collect().await.map_err(unreadable)?.to_bytes()), None)
             }
@@ -1778,6 +1826,7 @@ impl Edge {
                         ttl: *ttl,
                         zone_id: zone.zone.id.clone(),
                         url: format!("{}{}", info.host, uri),
+                        piece: None,
                     },
                 );
                 full(data)
