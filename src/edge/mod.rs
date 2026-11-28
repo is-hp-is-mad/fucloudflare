@@ -1925,11 +1925,11 @@ impl Edge {
                 Verdict::Pass => None,
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
-                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(req.headers()) };
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(&parts.headers) };
                     Some(page(403, "Access denied", &detail, ray, &ctx))
                 }
                 Verdict::RateLimited { retry_after } => {
-                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(req.headers()) };
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(&parts.headers) };
                     let mut resp = page(429, "Too many requests", "You are being rate limited.", ray, &ctx);
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
