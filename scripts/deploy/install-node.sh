@@ -176,7 +176,7 @@ if f".{domain}" not in txt:
     add.append(rule_end)
 if f"-i {domain}" not in txt:
     add.append(rule_eq)
-if add:
+if add and "/var/lib/fucf/domains.lst" not in txt:
     txt, n = re.subn(r'^(\s*default_backend\s+\S*reality\S*)', "\n".join(add) + r"\n\1", txt, count=1, flags=re.M)
     if n == 0:
         sys.exit("cannot find reality default_backend in haproxy.cfg")
