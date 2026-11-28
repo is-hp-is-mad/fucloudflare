@@ -124,6 +124,11 @@ jobs:
           # 530: the origin is this edge itself; 404: a host nobody proxies
           curl -s -H "Host: example.com" http://127.0.0.1:18080/ -o edge-pages/530-origin-is-edge.html -w "%{http_code}\n"
           curl -s -H "Host: nowhere.test" http://127.0.0.1:18080/ -o edge-pages/404-unknown-host.html -w "%{http_code}\n"
+          # the panel's embedded typefaces: served, typed, cacheable, allowed by the CSP
+          for f in inter-latin-wght.woff2 source-serif-4-latin-wght.woff2; do
+            curl -fsS -D- -o /dev/null http://127.0.0.1:8787/fonts/$f | grep -qi '^content-type: font/woff2' || { echo "font $f not served"; exit 1; }
+          done
+          curl -fsS -D- -o /dev/null http://127.0.0.1:8787/ | grep -qi "font-src 'self'" || { echo "CSP blocks the fonts"; exit 1; }
           curl -s -m 20 -H "Host: down.example.com" http://127.0.0.1:18080/ -o edge-pages/52x-origin-down.html -w "%{http_code}\n" || true
           echo "SESSION=$SESSION" >> $GITHUB_ENV; echo "ZONE=$ZONE" >> $GITHUB_ENV
       - name: screenshots

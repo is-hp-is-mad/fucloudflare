@@ -175,6 +175,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
         .route("/", get(panel_html))
+        .route("/fonts/{name}", get(font))
         .nest("/client/v4", open.merge(v4))
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()) })
         .layer(middleware::from_fn(security_headers))
@@ -186,9 +187,23 @@ async fn panel_html() -> Response {
     resp.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         header::HeaderValue::from_static(
-            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
     );
+    resp
+}
+
+/// The panel's typefaces (see `src/fonts/README.md`).
+async fn font(Path(name): Path<String>) -> Response {
+    let bytes: &'static [u8] = match name.as_str() {
+        "inter-latin-wght.woff2" => include_bytes!("fonts/inter-latin-wght.woff2"),
+        "source-serif-4-latin-wght.woff2" => include_bytes!("fonts/source-serif-4-latin-wght.woff2"),
+        _ => return ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()).into_response(),
+    };
+    let mut resp = bytes.into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("font/woff2"));
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("public, max-age=31536000, immutable"));
     resp
 }
 
