@@ -318,7 +318,7 @@ fn answer(status: StatusCode, body: Value) -> Response<Body> {
 }
 
 /// `POST /cdn-cgi/challenge-platform/verify`: the page's answer.
-pub async fn verify(waf: &Waf, ip: IpAddr, ssl: bool, req: Request<Body>, ray: &str) -> Result<Response<Body>, EdgeError> {
+pub async fn verify(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Request<Body>, ray: String) -> Result<Response<Body>, EdgeError> {
     if req.method() != Method::POST {
         return Ok(answer(StatusCode::METHOD_NOT_ALLOWED, json!({ "ok": false, "code": "post_only" })));
     }
@@ -333,7 +333,7 @@ pub async fn verify(waf: &Waf, ip: IpAddr, ssl: bool, req: Request<Body>, ray: &
     let sealed = report["t"].as_str().unwrap_or_default();
     let ua = parts.headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default();
     let refuse = |code: &str| Ok(answer(StatusCode::FORBIDDEN, json!({ "ok": false, "code": code })));
-    let Some(ticket) = Ticket::open(waf, sealed) else { return refuse("bad_ticket") };
+    let Some(ticket) = Ticket::open(&waf, sealed) else { return refuse("bad_ticket") };
     let age = now().saturating_sub(ticket.issued);
     if ticket.issued > now() + 5 || age > TICKET_SECS {
         return refuse("expired");

@@ -1000,6 +1000,7 @@ async fn the_human_check_lets_a_person_through_and_keeps_automation_out() {
     let safari = json!({ "wd": false, "auto": [], "ua": UA, "uad": null, "langs": 2, "plug": 5, "hc": 8, "scr": [1512, 982, 1512, 944, 30],
         "win": [1512, 860, 1512, 944], "tz": "Asia/Shanghai", "touch": 0, "chrome": false, "own": 0, "wdp": true, "nat": 0,
         "gl": "Apple Inc. / Apple GPU", "cdp": false, "notif": "default", "perm": "prompt" });
+    let env = &env;
     let post = |body: String| {
         let headers = format!("{browser}Content-Type: application/json\r\n");
         async move { send(&env, "POST", "example.com", "/cdn-cgi/challenge-platform/verify", &headers, &body).await }
