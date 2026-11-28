@@ -14,6 +14,7 @@ pub mod errpages;
 pub mod origins;
 pub mod reputation;
 pub mod files;
+pub mod fleetrate;
 pub mod compress;
 pub mod earlyhints;
 pub mod images;

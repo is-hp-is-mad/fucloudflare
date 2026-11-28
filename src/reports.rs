@@ -47,6 +47,12 @@ pub struct Report {
     pub rtt: HashMap<String, crate::rtt::Measure>,
     /// The clients it put over a rate limit since its report before.
     pub blocks: Vec<crate::edge::waf::Block>,
+    /// Its hottest rate limit counts, for the others to weigh in (see
+    /// crate::edge::fleetrate). A node of an earlier build leaves it out
+    /// and ignores it (a report takes whatever fields it does not know);
+    /// one it cannot read is left out without failing the report.
+    #[serde(default, deserialize_with = "crate::edge::fleetrate::lenient")]
+    pub rate: Vec<crate::edge::fleetrate::RateCount>,
 }
 
 struct Kept {
@@ -143,6 +149,7 @@ impl Reports {
         self.waf.absorb(&report.node, report.events.clone());
         self.rtt.merge(&report.node, &report.rtt);
         self.waf.absorb_blocks(&report.blocks);
+        self.waf.absorb_rate(&(self.me)(), &report.node, &report.rate);
         if latest && now.saturating_sub(report.at) < LIVE_SECS {
             self.fleet.heard(&report.node, &report.version, &report.build, &report.role);
             if let Some(usage) = report.usage.clone() {
@@ -223,14 +230,15 @@ mod tests {
     struct Node {
         stats: Arc<Stats>,
         fleet: Arc<Fleet>,
+        waf: Arc<Waf>,
         reports: Reports,
     }
 
     fn node(name: &'static str) -> Node {
-        let (stats, fleet) = (Arc::new(Stats::default()), Arc::new(Fleet::default()));
-        let reports = Reports::new(stats.clone(), Arc::new(Waf::new()), fleet.clone(), Arc::default(), move || name.to_string());
+        let (stats, fleet, waf) = (Arc::new(Stats::default()), Arc::new(Fleet::default()), Arc::new(Waf::new()));
+        let reports = Reports::new(stats.clone(), waf.clone(), fleet.clone(), Arc::default(), move || name.to_string());
         reports.floor.store(0, Ordering::Relaxed);
-        Node { stats, fleet, reports }
+        Node { stats, fleet, waf, reports }
     }
 
     /// A report of `node` made `ago` seconds ago: `n` requests for zone "z".
@@ -275,6 +283,56 @@ mod tests {
         again.reports.take(report("x", "run", 2, 10, 0), false);
         assert!(!fetch(&b, &again, &mut b_from_c));
         assert_eq!((requests(&b), b_from_c.1), (113, 1));
+    }
+
+    /// A count of `n` for rule "r" and key "k", in a window that ends in a minute.
+    fn rate(n: u32) -> Vec<crate::edge::fleetrate::RateCount> {
+        vec![crate::edge::fleetrate::RateCount { rule: "r".into(), key: "k".into(), count: n, until: now_secs() + 60 }]
+    }
+
+    #[test]
+    fn rate_counts_reach_every_peer_once_and_a_node_never_takes_back_its_own() {
+        let (a, b, c) = (node("a"), node("b"), node("c"));
+        let (mut b_from_a, mut c_from_b, mut a_from_c) = <((String, u64), (String, u64), (String, u64))>::default();
+        assert!(a.reports.own(Report { node: "a".into(), rate: rate(6), ..report("", "run", 0, 1, 0) }));
+        assert!(fetch(&b, &a, &mut b_from_a) && fetch(&c, &b, &mut c_from_b));
+        assert_eq!((b.waf.remote_rate("r", "k"), c.waf.remote_rate("r", "k")), (6, 6));
+        assert!(!fetch(&a, &c, &mut a_from_c), "its own report, back from c");
+        assert_eq!(a.waf.remote_rate("r", "k"), 0);
+        // the next report of a, with the count grown in the same window: replaced, not added
+        assert!(b.reports.take(Report { node: "a".into(), rate: rate(9), ..report("", "run", 1, 1, 0) }, true));
+        assert_eq!(b.waf.remote_rate("r", "k"), 9);
+        // x's count comes by two ways: it counts once
+        assert!(b.reports.take(Report { rate: rate(4), ..report("x", "run", 0, 1, 0) }, false));
+        assert!(c.reports.take(Report { rate: rate(4), ..report("x", "run", 0, 1, 0) }, false));
+        let mut b_from_c = Default::default();
+        fetch(&b, &c, &mut b_from_c);
+        assert_eq!(b.waf.remote_rate("r", "k"), 13);
+    }
+
+    #[test]
+    fn a_batch_from_an_older_or_a_newer_build_is_read_whatever_rate_says() {
+        let a = node("a");
+        let made = report("x", "run", 0, 2, 0);
+        let mut old = serde_json::to_value(&made).unwrap();
+        old.as_object_mut().unwrap().remove("rate");
+        let mut newer = serde_json::to_value(Report { seq: 1, ..made.clone() }).unwrap();
+        newer["rate"] = json!({ "kind": "a later shape" });
+        newer["future"] = json!([{ "something": "else" }]);
+        let mut mixed = serde_json::to_value(Report { seq: 2, ..made.clone() }).unwrap();
+        mixed["rate"] = json!([{ "rule": "r", "key": "k", "count": 5, "until": now_secs() + 60 }, { "rule": "r", "count": "many" }, 7]);
+        let delta = DomainDelta { domain: "reports".into(), epoch: "e".into(), from_rev: 0, to_rev: 3, full_resync: true, payload: json!({ "reports": [old, newer, mixed] }) };
+        assert!(a.reports.merge_delta(&delta, &HlcClock::default()).unwrap());
+        assert_eq!(requests(&a), 6, "all three are counted");
+        assert_eq!(a.waf.remote_rate("r", "k"), 5, "what could be read of rate is taken");
+        // what this build sends, a build that does not know rate reads as before
+        #[derive(Deserialize)]
+        struct Earlier {
+            node: String,
+            seq: u64,
+        }
+        let earlier: Earlier = serde_json::from_value(serde_json::to_value(Report { rate: rate(3), ..made }).unwrap()).unwrap();
+        assert_eq!((earlier.node.as_str(), earlier.seq), ("x", 0));
     }
 
     #[test]

@@ -879,11 +879,33 @@ A rate limit's clients:
 - `status_codes` (at most 20, 100 to 599, as numbers or strings): only requests answered with one of
   these count (`[401, 403]` against password guessing). They are counted once the answer is there,
   so the client that goes over is stopped from its next request on. Empty: every matching request.
-- Counting is per node. A client that one node holds back for 10 seconds or more is held back by the
-  other nodes too, once they hear of it with the reports.
+- Counting is per node, with an approximate share of the other nodes' counts weighed in (see below).
+  A client that one node holds back for 10 seconds or more is held back by the other nodes too, once
+  they hear of it with the reports.
 - Through the Rulesets API these are the `characteristics` and `counting_expression` of
   `http_ratelimit`: see [Rulesets](#rulesets). A cache rule's `ignore_query` is not shown there, and a
   change of the rule through its phase leaves it as it is.
+
+Across the fleet a rate limit is approximate, not exact. With the reports the nodes send each other
+anyway (every 15 to 60 seconds), each node tells the others its hottest counts: the clients whose
+count in the current window passed half of the rule's `threshold`, at most 64 of them, each with
+the end of the window it was counted in. A request is then judged by its count on the node that
+serves it plus half the sum of the other nodes' counts for the same rule and client. A client
+spread evenly over N nodes is then held back after about N/2 times its limit (4/3 of it on two
+nodes) instead of N times, report lag aside.
+
+- A node's count stops weighing in when its window ends; a node that tells the same client again
+  in the same window replaces its count (a report that comes twice adds nothing), and a node never
+  counts its own reports, which come back through the peers.
+- It can let through more than the limit (a client under half of it on every node is never told,
+  and reports lag) and, briefly, hold back a client a little early (the nodes' windows do not line
+  up). For a hard limit, send the clients to one node.
+- Memory is bounded: a node keeps at most 1024 of its own hot counts and 4096 clients of the
+  others; clients whose key is longer than 512 bytes are counted on their node only.
+- The key that is sent is what the rule tells clients apart by: visitor addresses, header and
+  cookie values. It travels only inside the fleet's own authenticated report channel (`rate` in the
+  reports of the `reports` sync domain) and is never logged. A node of an earlier build ignores it,
+  so a fleet in the middle of a rolling upgrade counts as before on the nodes not yet upgraded.
 
 ```sh
 curl -s -X POST $BASE/zones/$ZONE/rate_limits -H "Authorization: Bearer $TOKEN" -d '{

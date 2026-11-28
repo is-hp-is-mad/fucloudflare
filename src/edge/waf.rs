@@ -159,6 +159,8 @@ pub fn managed_match(info: &ReqInfo, body: Option<&[u8]>) -> Option<(&'static st
 
 struct Counter {
     window_start: Instant,
+    /// When the window started (unix seconds): the other nodes are told when it ends.
+    started: u64,
     count: u32,
     blocked_until: Option<Instant>,
 }
@@ -194,6 +196,8 @@ pub struct Waf {
     blocks_out: Mutex<Vec<Block>>,
     /// When an origin error was last logged, per (zone, host, status).
     origin_logged: Mutex<HashMap<(String, String, u16), u64>>,
+    /// The rate limit counts of the other nodes, and the hottest here for them.
+    fleet: super::fleetrate::FleetRate,
     key: hmac::Key,
 }
 
@@ -228,6 +232,7 @@ impl Waf {
             counters: Mutex::default(),
             blocks_out: Mutex::default(),
             origin_logged: Mutex::default(),
+            fleet: Default::default(),
             key,
         }
     }
@@ -478,17 +483,37 @@ impl Waf {
                 continue;
             }
             let until = now + Duration::from_secs(left);
-            let c = counters.entry((block.rule.clone(), block.key.clone())).or_insert(Counter { window_start: now, count: 0, blocked_until: None });
+            let c = counters.entry((block.rule.clone(), block.key.clone())).or_insert(Counter { window_start: now, started: unix, count: 0, blocked_until: None });
             if c.blocked_until.is_none_or(|have| have < until) {
                 c.blocked_until = Some(until);
             }
         }
     }
 
-    /// Count one request; `Some(retry_after_secs)` when over the limit.
+    /// The hottest rate limit counts of this node, for its next report (see super::fleetrate).
+    pub fn rate_report(&self) -> Vec<super::fleetrate::RateCount> {
+        self.fleet.report(super::stats::now_secs())
+    }
+
+    /// The rate limit counts another node reported: weighed in here from now on.
+    pub fn absorb_rate(&self, me: &str, node: &str, counts: &[super::fleetrate::RateCount]) {
+        self.fleet.absorb(me, node, counts, super::stats::now_secs());
+    }
+
+    /// What the other nodes counted for (rule, key), for the tests of the reports.
+    #[cfg(test)]
+    pub fn remote_rate(&self, rule: &str, key: &str) -> u64 {
+        self.fleet.remote(rule, key, super::stats::now_secs())
+    }
+
+    /// Count one request; `Some(retry_after_secs)` when over the limit, by
+    /// this node's count and a share of the other nodes' (see super::fleetrate).
     fn count(&self, rule_id: &str, key: &str, threshold: u32, period: u32, timeout: u32) -> Option<u64> {
-        let now = Instant::now();
-        let period = Duration::from_secs(period as u64);
+        let (now, unix) = (Instant::now(), super::stats::now_secs());
+        // read before the counters are locked: the view is never locked while they are
+        let remote = self.fleet.remote(rule_id, key, unix);
+        let period_secs = u64::from(period);
+        let period = Duration::from_secs(period_secs);
         let mut counters = self.counters.lock().unwrap();
         if counters.len() > 100_000 {
             counters.retain(|_, c| c.blocked_until.is_some_and(|b| b > now) || now - c.window_start < period);
@@ -502,19 +527,23 @@ impl Waf {
         }
         let c = counters
             .entry((rule_id.to_string(), key.to_string()))
-            .or_insert(Counter { window_start: now, count: 0, blocked_until: None });
+            .or_insert(Counter { window_start: now, started: unix, count: 0, blocked_until: None });
         if let Some(until) = c.blocked_until {
             if until > now {
                 return Some((until - now).as_secs().max(1));
             }
-            *c = Counter { window_start: now, count: 0, blocked_until: None };
+            *c = Counter { window_start: now, started: unix, count: 0, blocked_until: None };
         }
         if now - c.window_start >= period {
             c.window_start = now;
+            c.started = unix;
             c.count = 0;
         }
         c.count += 1;
-        if c.count <= threshold {
+        if self.reporting.load(Ordering::Relaxed) && super::fleetrate::worth_reporting(c.count, threshold) {
+            self.fleet.note(rule_id, key, c.count, c.started.saturating_add(period_secs), unix);
+        }
+        if !super::fleetrate::over(c.count, remote, threshold) {
             return None;
         }
         let window_end = c.window_start + period;
@@ -692,6 +721,37 @@ mod tests {
         // one that is over already says nothing
         there.absorb_blocks(&[Block { rule: "r".into(), key: "late".into(), until: 1 }]);
         assert!(there.limited("r", "late").is_none());
+    }
+
+    #[test]
+    fn a_client_spread_over_the_nodes_is_held_back_by_their_counts_together() {
+        let (here, there, quiet) = (Waf::new(), Waf::new(), Waf::new());
+        here.set_reporting();
+        // limit 10: 5 is not past half and is not told, 6 is
+        (0..5).for_each(|_| assert_eq!(here.count("r", "k", 10, 60, 0), None));
+        assert!(here.rate_report().is_empty());
+        assert_eq!(here.count("r", "k", 10, 60, 0), None);
+        let told = here.rate_report();
+        assert_eq!((told.len(), told[0].rule.as_str(), told[0].key.as_str(), told[0].count), (1, "r", "k", 6));
+        let left = told[0].until.saturating_sub(super::super::stats::now_secs());
+        assert!((59..=60).contains(&left), "the window it was counted in ends in a minute: {left}");
+        // a node that does not report keeps no hot counts
+        (0..8).for_each(|_| {
+            quiet.count("r", "k", 10, 60, 0);
+        });
+        assert!(quiet.rate_report().is_empty());
+        // there, 6 elsewhere weigh 3: the 8th request is the 11th
+        there.absorb_rate("there", "here", &told);
+        (0..7).for_each(|_| assert_eq!(there.count("r", "k", 10, 60, 0), None));
+        assert!(there.count("r", "k", 10, 60, 0).is_some());
+        // the same report again adds nothing; other keys and rules are not touched
+        there.absorb_rate("there", "here", &told);
+        assert_eq!(there.count("r", "other", 10, 60, 0), None);
+        assert_eq!(there.count("r2", "k", 10, 60, 0), None);
+        // its own counts, back from a peer, are not counted twice
+        here.absorb_rate("here", "here", &told);
+        (0..4).for_each(|_| assert_eq!(here.count("r", "k", 10, 60, 0), None));
+        assert!(here.count("r", "k", 10, 60, 0).is_some(), "the 11th of its own");
     }
 
     #[test]
