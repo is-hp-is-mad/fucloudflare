@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: check / clippy / test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gnu
+      - name: cargo check --tests
+        run: cargo check --tests --locked
+      - name: cargo clippy (advisory)
+        run: cargo clippy --all-targets --locked -- -W clippy::all 2>&1 | tee clippy.txt
+        continue-on-error: true
+      - name: cargo test
+        run: cargo test --locked -- --test-threads=4
+      - name: rustfmt (advisory)
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clippy-report
+          path: clippy.txt
+          if-no-files-found: ignore
+
+  worker-auth:
+    name: workers/auth tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test workers/auth/worker.test.mjs
+
+  build-musl:
+    name: build x86_64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: musl
+      - name: cargo build --release (musl)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/fucf dist/fucf-linux-x86_64
+          file dist/fucf-linux-x86_64
+          ./dist/fucf-linux-x86_64 --version || ./dist/fucf-linux-x86_64 --help | head -5 || true
+          (cd dist && sha256sum fucf-linux-x86_64 > fucf-linux-x86_64.sha256)
+          echo "${GITHUB_SHA}" > dist/COMMIT
+          cat dist/fucf-linux-x86_64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fucf-linux-x86_64
+          path: dist/
+          retention-days: 30
