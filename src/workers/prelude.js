@@ -1,6 +1,8 @@
 // Runtime prelude for fucf workers: a small implementation of the Fetch API
-// surface (Headers, Request, Response, URL, fetch) on top of three host
-// functions: __fetch(json) -> json, __bodyText(id) -> string, __log(string).
+// surface (Headers, Request, Response, URL, fetch) on top of host functions:
+// __fetch(json) -> json, __bodyText(id) -> string, __bodyBytes(id) ->
+// ArrayBuffer, __bodyPut(ArrayBuffer) -> id, __textBytes(string) ->
+// ArrayBuffer, __log(string), and the crypto / KV / D1 ones (see mod.rs).
 (function () {
   "use strict";
   const lower = (s) => String(s).toLowerCase();
@@ -94,7 +96,15 @@
   }
 
   // Bodies are strings (`_text`) or opaque host-side byte buffers (`_bodyId`),
-  // so binary responses pass through a worker untouched.
+  // so binary bodies pass through a worker untouched. An ArrayBuffer or a view
+  // (Uint8Array, DataView, ...) is copied to the host when the body is made,
+  // as the Fetch API snapshots it then.
+  function putBytes(data) {
+    const u8 = toUint8(data);
+    const whole = u8.buffer instanceof ArrayBuffer && u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength;
+    const exact = whole ? u8.buffer : u8.slice().buffer;
+    return __bodyPut(exact);
+  }
   function initBody(self, body) {
     self._text = null;
     self._bodyId = null;
@@ -103,17 +113,30 @@
     if (body && body.__bodyOf) {
       self._text = body.__bodyOf._text;
       self._bodyId = body.__bodyOf._bodyId;
-    } else self._text = String(body);
+    } else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) self._bodyId = putBytes(body);
+    else self._text = String(body);
+  }
+  function takeBody(self) {
+    if (self.bodyUsed) throw new TypeError("Body has already been used");
+    self.bodyUsed = true;
   }
   const bodyMethods = {
     text() {
-      if (this.bodyUsed) return Promise.reject(new TypeError("Body has already been used"));
-      this.bodyUsed = true;
+      try { takeBody(this); } catch (e) { return Promise.reject(e); }
       if (this._text !== null) return Promise.resolve(this._text);
       if (this._bodyId !== null) return Promise.resolve(__bodyText(this._bodyId));
       return Promise.resolve("");
     },
     json() { return this.text().then(JSON.parse); },
+    arrayBuffer() {
+      try {
+        takeBody(this);
+        if (this._bodyId !== null) return Promise.resolve(__bodyBytes(this._bodyId));
+        if (this._text !== null) return Promise.resolve(__textBytes(this._text));
+        return Promise.resolve(new ArrayBuffer(0));
+      } catch (e) { return Promise.reject(e); }
+    },
+    bytes() { return this.arrayBuffer().then((b) => new Uint8Array(b)); },
   };
   const bodyGetter = {
     get() { return this._text === null && this._bodyId === null ? null : { __bodyOf: this }; },

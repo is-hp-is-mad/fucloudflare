@@ -1,22 +1,28 @@
 //! Workers: user JavaScript executed at the edge (Boa engine).
 //!
-//! Each request gets a fresh JS context on a blocking thread. The Fetch API
-//! lives in `prelude.js`; this module provides the host functions under it
-//! and converts between HTTP and the JSON the prelude speaks.
+//! Every invocation (a request, an email, a cron tick) gets a fresh JS
+//! context on a blocking thread; see [`invoke`] for why nothing is reused.
+//! The Fetch API lives in `prelude.js`; this module provides the host
+//! functions under it and converts between HTTP and the JSON the prelude
+//! speaks. Bodies cross the boundary as host-side byte buffers, so binary
+//! payloads pass through untouched.
 //!
 //! Scripts use the Cloudflare shapes:
 //! `export default { async fetch(request, env, ctx) { ... } }` or
-//! `addEventListener("fetch", event => event.respondWith(...))`.
+//! `addEventListener("fetch", event => event.respondWith(...))`, as one file
+//! (`upload` takes wrangler's multipart form with a single module).
 
 pub mod cron;
 pub mod crypto;
 pub mod db;
 pub mod kv;
+pub mod upload;
 
 use crate::edge::{full, Body, Edge, EdgeError, WORKER_BODY_LIMIT};
 use crate::expr::ReqInfo;
 use crate::items::WorkerScript;
 use crate::store::Snapshot;
+use boa_engine::object::builtins::{AlignedVec, JsArrayBuffer};
 use boa_engine::property::Attribute;
 use boa_engine::{js_string, Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Script, Source};
 use bytes::Bytes;
@@ -33,6 +39,11 @@ const WALL_LIMIT: Duration = Duration::from_secs(30);
 const LOOP_LIMIT: u64 = 20_000_000;
 const MAX_SUBREQUESTS: u32 = 50;
 const MAX_CONCURRENT_WORKERS: usize = 16;
+/// Bytes one invocation may hand to the host as bodies (`new Response(bytes)`,
+/// a byte request body for `fetch`). Each body is also capped at
+/// `WORKER_BODY_LIMIT`; this total keeps a loop of puts from copying one
+/// buffer into host memory over and over.
+const BODY_PUT_BUDGET: usize = 4 * WORKER_BODY_LIMIT;
 
 static WORKER_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_WORKERS));
@@ -47,6 +58,8 @@ struct State {
     runtime: tokio::runtime::Handle,
     /// Byte buffers referenced from JS by index; 0 is the request body.
     bodies: Vec<Bytes>,
+    /// Bytes added to `bodies` from JS so far (see `BODY_PUT_BUDGET`).
+    put_bytes: usize,
     subrequests: u32,
     kv: Option<Arc<kv::KvStore>>,
     d1: Option<Arc<db::D1Store>>,
@@ -54,8 +67,48 @@ struct State {
     allowed_d1: HashSet<String>,
 }
 
+impl State {
+    /// The state for one invocation of `script`; must be called inside the
+    /// tokio runtime, whose handle the host functions block on.
+    fn new(edge: Arc<Edge>, snap: Arc<Snapshot>, script: &WorkerScript, info: ReqInfo, bodies: Vec<Bytes>) -> Self {
+        State {
+            kv: edge.kv.get().cloned(),
+            d1: edge.d1.get().cloned(),
+            edge,
+            snap,
+            info,
+            name: script.name.clone(),
+            runtime: tokio::runtime::Handle::current(),
+            bodies,
+            put_bytes: 0,
+            subrequests: 0,
+            allowed_kv: script.kv_bindings.values().cloned().collect(),
+            allowed_d1: script.d1_bindings.values().cloned().collect(),
+        }
+    }
+}
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+/// Holds an invocation's `State` in the thread-local and takes it out again
+/// when dropped, also when the job panics: blocking threads are pooled, and
+/// one visitor's request body must not stay parked on a thread after the
+/// invocation that owned it.
+struct InstalledState;
+
+impl InstalledState {
+    fn install(state: State) -> Self {
+        STATE.set(Some(state));
+        InstalledState
+    }
+}
+
+impl Drop for InstalledState {
+    fn drop(&mut self) {
+        STATE.set(None);
+    }
 }
 
 fn throw(msg: impl Into<String>) -> JsError {
@@ -102,12 +155,58 @@ fn host_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(JsString::from(out.to_string()).into())
 }
 
-fn host_body_text(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+fn body_of(args: &[JsValue], ctx: &mut Context) -> JsResult<Bytes> {
     let id = args.first().cloned().unwrap_or_default().to_u32(ctx)? as usize;
-    let text = STATE.with_borrow(|s| {
-        s.as_ref().and_then(|s| s.bodies.get(id)).map(|b| String::from_utf8_lossy(b).into_owned())
-    });
-    Ok(JsString::from(text.ok_or_else(|| throw("unknown body"))?).into())
+    STATE
+        .with_borrow(|s| s.as_ref().and_then(|s| s.bodies.get(id).cloned()))
+        .ok_or_else(|| throw("unknown body"))
+}
+
+fn host_body_text(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let body = body_of(args, ctx)?;
+    Ok(JsString::from(String::from_utf8_lossy(&body).into_owned()).into())
+}
+
+/// A fresh `ArrayBuffer` holding `bytes`; each call copies, so JS may change
+/// what it gets without touching the host-side body.
+fn array_buffer(bytes: &[u8], ctx: &mut Context) -> JsResult<JsValue> {
+    let mut block = AlignedVec::with_capacity(0, bytes.len());
+    block.extend_from_slice(bytes);
+    Ok(JsArrayBuffer::from_byte_block(block, ctx)?.into())
+}
+
+/// `__bodyBytes(id)`: a body's exact bytes, for `arrayBuffer()` / `bytes()`.
+fn host_body_bytes(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let body = body_of(args, ctx)?;
+    array_buffer(&body, ctx)
+}
+
+/// `__textBytes(string)`: the UTF-8 bytes the host would send for a text
+/// body (lone surrogates become U+FFFD, as on the way out).
+fn host_text_bytes(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = arg_string(args, ctx)?;
+    array_buffer(text.as_bytes(), ctx)
+}
+
+/// `__bodyPut(arrayBuffer)`: copy a JS buffer into a new host-side body and
+/// return its id, so a byte body leaves the worker without a detour through
+/// strings or base64.
+fn host_body_put(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let obj = args.first().and_then(JsValue::as_object).ok_or_else(|| throw("expected an ArrayBuffer"))?;
+    let bytes = JsArrayBuffer::from_object(obj)?.to_vec().ok_or_else(|| throw("the ArrayBuffer is detached"))?;
+    if bytes.len() > WORKER_BODY_LIMIT {
+        return Err(throw("body too large"));
+    }
+    let id = STATE.with_borrow_mut(|s| {
+        let s = s.as_mut().ok_or_else(|| throw("no worker state"))?;
+        if s.put_bytes + bytes.len() > BODY_PUT_BUDGET {
+            return Err(throw("too many body bytes in one invocation"));
+        }
+        s.put_bytes += bytes.len();
+        s.bodies.push(Bytes::from(bytes));
+        Ok(s.bodies.len() - 1)
+    })?;
+    Ok(JsValue::from(id as u32))
 }
 
 fn host_log(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -187,9 +286,12 @@ fn host_d1_exec(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 
 fn register_natives(ctx: &mut Context) -> Result<(), String> {
-    let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 18] = [
+    let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 21] = [
         (js_string!("__fetch"), 1, host_fetch),
         (js_string!("__bodyText"), 1, host_body_text),
+        (js_string!("__bodyBytes"), 1, host_body_bytes),
+        (js_string!("__textBytes"), 1, host_text_bytes),
+        (js_string!("__bodyPut"), 1, host_body_put),
         (js_string!("__log"), 1, host_log),
         (js_string!("__cryptoRandom"), 1, crypto::host_crypto_random),
         (js_string!("__cryptoDigest"), 2, crypto::host_crypto_digest),
@@ -223,12 +325,18 @@ fn env_json(script: &WorkerScript) -> String {
     .to_string()
 }
 
-/// `export default X` -> a global assignment, so module-style scripts run as
-/// classic scripts (single-file workers only; other imports/exports fail).
+/// Module-style scripts run as classic scripts: `export default X` and
+/// esbuild's closing `export { X as default };` (what `wrangler deploy`
+/// bundles to) become a global assignment. Single-file workers only; any
+/// other `import` / `export` still fails to parse, and so is refused at upload.
 fn transform(src: &str) -> String {
     static EXPORT: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^(\s*)export\s+default\s+").expect("regex"));
-    EXPORT.replace(src, "${1}globalThis.__default = ").into_owned()
+    static EXPORT_AS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^([ \t]*)export\s*\{\s*([A-Za-z_$][A-Za-z0-9_$]*)\s+as\s+default\s*,?\s*\}\s*;?").expect("regex")
+    });
+    let src = EXPORT.replace(src, "${1}globalThis.__default = ");
+    EXPORT_AS.replace(&src, "${1}globalThis.__default = ${2};").into_owned()
 }
 
 fn describe(e: JsError, ctx: &mut Context) -> String {
@@ -261,8 +369,52 @@ fn global_string(ctx: &mut Context, name: JsString) -> Option<String> {
     v.as_string().map(|s| s.to_std_string_lossy())
 }
 
-/// Run the script for one request; blocking.
-fn execute(script: &WorkerScript, request: String) -> Result<(Output, Bytes), String> {
+/// The handlers a script can be invoked for, as the prelude names them.
+#[derive(Clone, Copy)]
+enum Handler {
+    Fetch,
+    Email,
+    Scheduled,
+}
+
+impl Handler {
+    fn name(self) -> &'static str {
+        match self {
+            Handler::Fetch => "fetch",
+            Handler::Email => "email",
+            Handler::Scheduled => "scheduled",
+        }
+    }
+
+    /// The prelude call that dispatches to the handler; `__input` is the
+    /// handler's JSON argument and `__env` the script's bindings.
+    fn call(self) -> &'static str {
+        match self {
+            Handler::Fetch => "__run(__input, __env)",
+            Handler::Email => "__runEmail(__input, __env)",
+            Handler::Scheduled => "__runScheduled(__input, __env)",
+        }
+    }
+}
+
+/// Run one handler of `script` and return the JSON the prelude left in
+/// `__out`; blocking, with the invocation's `State` installed.
+///
+/// Every call builds its own `Context`, which is the isolation guarantee:
+/// globals, prototypes, module-level variables and pending promises of one
+/// request (one visitor) cannot reach the next, and two scripts never share
+/// anything. Reuse was checked against Boa 0.22 and left out on purpose:
+/// a parsed `Script` is tied to the realm and the string interner of the
+/// context that parsed it, and its `Gc` handles cannot leave the thread while
+/// requests land on any pooled blocking thread. Resetting only the realm in a
+/// kept context would save little (`Context::create_realm` builds the same
+/// intrinsics and global bindings a new context does, and the prelude and the
+/// script would still be compiled again for the new realm; not measured) and
+/// would keep the context's job queue,
+/// where a job left behind by a failed request could run inside the next one
+/// with that request's host state. Swapping the engine means rewriting this
+/// function and the host functions above, nothing else.
+fn invoke(script: &WorkerScript, handler: Handler, input: String) -> Result<String, String> {
     let mut ctx = Context::default();
     ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_LIMIT);
     ctx.runtime_limits_mut().set_recursion_limit(400);
@@ -271,19 +423,87 @@ fn execute(script: &WorkerScript, request: String) -> Result<(Output, Bytes), St
     ctx.eval(Source::from_bytes(PRELUDE)).map_err(|e| format!("prelude: {}", describe(e, &mut ctx)))?;
 
     let env = env_json(script);
-    for (name, value) in [(js_string!("__req"), request), (js_string!("__env"), env)] {
+    for (name, value) in [(js_string!("__input"), input), (js_string!("__env"), env)] {
         ctx.register_global_property(name, JsString::from(value), Attribute::all()).map_err(|e| e.to_string())?;
     }
 
     let code = transform(&script.script);
     ctx.eval(Source::from_bytes(&code)).map_err(|e| describe(e, &mut ctx))?;
-    ctx.eval(Source::from_bytes("__run(__req, __env)")).map_err(|e| describe(e, &mut ctx))?;
+    ctx.eval(Source::from_bytes(handler.call())).map_err(|e| describe(e, &mut ctx))?;
     ctx.run_jobs().map_err(|e| describe(e, &mut ctx))?;
 
     if let Some(err) = global_string(&mut ctx, js_string!("__err")) {
         return Err(err);
     }
-    let out = global_string(&mut ctx, js_string!("__out")).ok_or("the fetch handler never settled")?;
+    global_string(&mut ctx, js_string!("__out")).ok_or_else(|| format!("the {} handler never settled", handler.name()))
+}
+
+/// Why an invocation produced no result.
+enum RunError {
+    /// No worker slot came free in time.
+    Busy,
+    /// The worker runtime is shutting down.
+    Closed,
+    TimedOut,
+    Crashed(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Busy => f.write_str("too many concurrent worker executions"),
+            RunError::Closed => f.write_str("worker runtime shutting down"),
+            RunError::TimedOut => f.write_str("exceeded the time limit"),
+            RunError::Crashed(why) => write!(f, "crashed: {why}"),
+            RunError::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl RunError {
+    /// The error as the email and cron callers report it: the script's own
+    /// error as it is, the runtime's failures named after the kind of worker.
+    fn message(self, kind: &str) -> String {
+        match self {
+            RunError::Failed(why) => why,
+            RunError::Busy | RunError::Closed => self.to_string(),
+            RunError::TimedOut | RunError::Crashed(_) => format!("{kind} worker {self}"),
+        }
+    }
+}
+
+/// Run `handler` of `script` on a blocking thread, within the concurrency
+/// and wall-clock limits. `finish` turns the prelude's `__out` JSON into the
+/// result on that same thread, while the invocation's host-side bodies are
+/// still installed.
+async fn run_handler<T: Send + 'static>(
+    state: State,
+    script: Arc<WorkerScript>,
+    handler: Handler,
+    input: String,
+    finish: fn(String) -> Result<T, String>,
+) -> Result<T, RunError> {
+    let slot = tokio::time::timeout(Duration::from_secs(5), WORKER_SLOTS.acquire())
+        .await
+        .map_err(|_| RunError::Busy)?
+        .map_err(|_| RunError::Closed)?;
+    let task = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let _state = InstalledState::install(state);
+        finish(invoke(&script, handler, input)?)
+    });
+    match tokio::time::timeout(WALL_LIMIT, task).await {
+        Err(_) => Err(RunError::TimedOut),
+        Ok(Err(join)) => Err(RunError::Crashed(join.to_string())),
+        Ok(Ok(res)) => res.map_err(RunError::Failed),
+    }
+}
+
+/// A fetch handler's `Output` and the bytes it names: its text, or a
+/// host-side body (the request body, a subrequest's response, or bytes the
+/// script put). Runs on the worker thread, before the state is dropped.
+fn finish_fetch(out: String) -> Result<(Output, Bytes), String> {
     let out: Output = serde_json::from_str(&out).map_err(|e| e.to_string())?;
     let body = match (&out.body, out.body_id) {
         (Some(text), _) => Bytes::from(text.clone()),
@@ -309,42 +529,16 @@ pub async fn run(
     })
     .to_string();
     let name = script.name.clone();
-    let kv = edge.kv.get().cloned();
-    let d1 = edge.d1.get().cloned();
-    let state = State {
-        edge,
-        snap,
-        info,
-        name: name.clone(),
-        runtime: tokio::runtime::Handle::current(),
-        bodies: vec![body],
-        subrequests: 0,
-        kv,
-        d1,
-        allowed_kv: script.kv_bindings.values().cloned().collect(),
-        allowed_d1: script.d1_bindings.values().cloned().collect(),
-    };
-
-    let slot = tokio::time::timeout(Duration::from_secs(5), WORKER_SLOTS.acquire())
-        .await
-        .map_err(|_| EdgeError::new(503, "Worker busy", "too many concurrent worker executions"))?
-        .map_err(|_| EdgeError::new(503, "Worker unavailable", "worker runtime shutting down"))?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        STATE.set(Some(state));
-        let result = execute(&script, request);
-        STATE.set(None);
-        result
-    });
+    let state = State::new(edge, snap, &script, info, vec![body]);
     let failed = |why: String| {
         tracing::warn!(worker = %name, "worker failed: {why}");
         EdgeError::new(500, "Worker threw exception", "the worker script for this route failed")
     };
-    let (out, body) = match tokio::time::timeout(WALL_LIMIT, task).await {
-        Err(_) => return Err(failed("exceeded the time limit".into())),
-        Ok(Err(join)) => return Err(failed(format!("crashed: {join}"))),
-        Ok(Ok(Err(e))) => return Err(failed(e)),
-        Ok(Ok(Ok(x))) => x,
+    let (out, body) = match run_handler(state, script, Handler::Fetch, request, finish_fetch).await {
+        Err(RunError::Busy) => return Err(EdgeError::new(503, "Worker busy", "too many concurrent worker executions")),
+        Err(RunError::Closed) => return Err(EdgeError::new(503, "Worker unavailable", "worker runtime shutting down")),
+        Err(e) => return Err(failed(e.to_string())),
+        Ok(x) => x,
     };
     if body.len() > WORKER_BODY_LIMIT {
         return Err(failed("response body too large".into()));
@@ -396,28 +590,7 @@ fn parse_email_headers(raw: &[u8]) -> Vec<(String, String)> {
     out
 }
 
-fn execute_email(script: &WorkerScript, msg_json: String) -> Result<EmailOutcome, String> {
-    let mut ctx = Context::default();
-    ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_LIMIT);
-    ctx.runtime_limits_mut().set_recursion_limit(400);
-
-    register_natives(&mut ctx)?;
-    ctx.eval(Source::from_bytes(PRELUDE)).map_err(|e| format!("prelude: {}", describe(e, &mut ctx)))?;
-
-    let env = env_json(script);
-    for (name, value) in [(js_string!("__msg"), msg_json), (js_string!("__env"), env)] {
-        ctx.register_global_property(name, JsString::from(value), Attribute::all()).map_err(|e| e.to_string())?;
-    }
-
-    let code = transform(&script.script);
-    ctx.eval(Source::from_bytes(&code)).map_err(|e| describe(e, &mut ctx))?;
-    ctx.eval(Source::from_bytes("__runEmail(__msg, __env)")).map_err(|e| describe(e, &mut ctx))?;
-    ctx.run_jobs().map_err(|e| describe(e, &mut ctx))?;
-
-    if let Some(err) = global_string(&mut ctx, js_string!("__err")) {
-        return Err(err);
-    }
-    let out = global_string(&mut ctx, js_string!("__out")).ok_or("the email handler never settled")?;
+fn finish_email(out: String) -> Result<EmailOutcome, String> {
     serde_json::from_str(&out).map_err(|e| e.to_string())
 }
 
@@ -437,63 +610,13 @@ pub async fn run_email(
         "rawSize": raw.len(),
     })
     .to_string();
-    let name = script.name.clone();
-    let kv = edge.kv.get().cloned();
-    let d1 = edge.d1.get().cloned();
-    let state = State {
-        edge,
-        snap,
-        info: ReqInfo::default(),
-        name: name.clone(),
-        runtime: tokio::runtime::Handle::current(),
-        bodies: vec![raw],
-        subrequests: 0,
-        kv,
-        d1,
-        allowed_kv: script.kv_bindings.values().cloned().collect(),
-        allowed_d1: script.d1_bindings.values().cloned().collect(),
-    };
-
-    let slot = tokio::time::timeout(Duration::from_secs(5), WORKER_SLOTS.acquire())
+    let state = State::new(edge, snap, &script, ReqInfo::default(), vec![raw]);
+    run_handler(state, script, Handler::Email, msg_json, finish_email)
         .await
-        .map_err(|_| "too many concurrent worker executions".to_string())?
-        .map_err(|_| "worker runtime shutting down".to_string())?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        STATE.set(Some(state));
-        let result = execute_email(&script, msg_json);
-        STATE.set(None);
-        result
-    });
-    match tokio::time::timeout(WALL_LIMIT, task).await {
-        Err(_) => Err("email worker exceeded the time limit".into()),
-        Ok(Err(join)) => Err(format!("email worker crashed: {join}")),
-        Ok(Ok(res)) => res,
-    }
+        .map_err(|e| e.message("email"))
 }
 
-fn execute_scheduled(script: &WorkerScript, ctrl_json: String) -> Result<(), String> {
-    let mut ctx = Context::default();
-    ctx.runtime_limits_mut().set_loop_iteration_limit(LOOP_LIMIT);
-    ctx.runtime_limits_mut().set_recursion_limit(400);
-
-    register_natives(&mut ctx)?;
-    ctx.eval(Source::from_bytes(PRELUDE)).map_err(|e| format!("prelude: {}", describe(e, &mut ctx)))?;
-
-    let env = env_json(script);
-    for (name, value) in [(js_string!("__ctrl"), ctrl_json), (js_string!("__env"), env)] {
-        ctx.register_global_property(name, JsString::from(value), Attribute::all()).map_err(|e| e.to_string())?;
-    }
-
-    let code = transform(&script.script);
-    ctx.eval(Source::from_bytes(&code)).map_err(|e| describe(e, &mut ctx))?;
-    ctx.eval(Source::from_bytes("__runScheduled(__ctrl, __env)")).map_err(|e| describe(e, &mut ctx))?;
-    ctx.run_jobs().map_err(|e| describe(e, &mut ctx))?;
-
-    if let Some(err) = global_string(&mut ctx, js_string!("__err")) {
-        return Err(err);
-    }
-    let _ = global_string(&mut ctx, js_string!("__out")).ok_or("the scheduled handler never settled")?;
+fn finish_scheduled(_: String) -> Result<(), String> {
     Ok(())
 }
 
@@ -509,39 +632,10 @@ pub async fn run_scheduled(
         "scheduledTime": scheduled_ms,
     })
     .to_string();
-    let name = script.name.clone();
-    let kv = edge.kv.get().cloned();
-    let d1 = edge.d1.get().cloned();
-    let state = State {
-        edge,
-        snap,
-        info: ReqInfo::default(),
-        name,
-        runtime: tokio::runtime::Handle::current(),
-        bodies: Vec::new(),
-        subrequests: 0,
-        kv,
-        d1,
-        allowed_kv: script.kv_bindings.values().cloned().collect(),
-        allowed_d1: script.d1_bindings.values().cloned().collect(),
-    };
-
-    let slot = tokio::time::timeout(Duration::from_secs(5), WORKER_SLOTS.acquire())
+    let state = State::new(edge, snap, &script, ReqInfo::default(), Vec::new());
+    run_handler(state, script, Handler::Scheduled, ctrl_json, finish_scheduled)
         .await
-        .map_err(|_| "too many concurrent worker executions".to_string())?
-        .map_err(|_| "worker runtime shutting down".to_string())?;
-    let task = tokio::task::spawn_blocking(move || {
-        let _slot = slot;
-        STATE.set(Some(state));
-        let result = execute_scheduled(&script, ctrl_json);
-        STATE.set(None);
-        result
-    });
-    match tokio::time::timeout(WALL_LIMIT, task).await {
-        Err(_) => Err("scheduled worker exceeded the time limit".into()),
-        Ok(Err(join)) => Err(format!("scheduled worker crashed: {join}")),
-        Ok(Ok(res)) => res,
-    }
+        .map_err(|e| e.message("scheduled"))
 }
 
 #[cfg(test)]
@@ -854,6 +948,304 @@ mod tests {
         assert_eq!(v["d1Blocked"], true, "unauthorized D1 access must be blocked: {v}");
         // RFC 6070 test vector 1: PBKDF2-HMAC-SHA256("password", "salt", 1, 32)
         assert_eq!(v["hex"], "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+
+    /// A store and an edge in a fresh directory, for running scripts directly.
+    fn test_edge(tag: &str) -> (std::path::PathBuf, Arc<crate::store::Store>, Arc<Edge>) {
+        let dir = std::env::temp_dir().join(format!("fucf-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        let store = Arc::new(crate::store::Store::open(&dir.join("s.json"), vec![]).unwrap());
+        let edge = Arc::new(
+            Edge::new(store.clone(), Arc::new(crate::edge::cache::Cache::new(1 << 20)), Arc::new(crate::edge::waf::Waf::new()), vec![]).unwrap(),
+        );
+        (dir, store, edge)
+    }
+
+    fn script_named(name: &str, src: &str) -> Arc<WorkerScript> {
+        Arc::new(WorkerScript {
+            name: name.into(),
+            script: src.into(),
+            vars: Default::default(),
+            kv_bindings: Default::default(),
+            d1_bindings: Default::default(),
+            crons: Vec::new(),
+            created_on: String::new(),
+            modified_on: String::new(),
+            sync: Default::default(),
+        })
+    }
+
+    /// A runtime with a single blocking thread, so consecutive invocations
+    /// run on the very same OS thread: whatever a thread-local or a reused
+    /// engine kept would show up in the next one.
+    fn one_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap()
+    }
+
+    /// Run `script` for `POST https://t.example{path}` with `body`: the
+    /// status, headers and body of the response, or the error's status.
+    fn post(
+        rt: &tokio::runtime::Runtime,
+        edge: &Arc<Edge>,
+        store: &Arc<crate::store::Store>,
+        script: &Arc<WorkerScript>,
+        path: &str,
+        body: &[u8],
+    ) -> (u16, hyper::HeaderMap, Bytes) {
+        let info = ReqInfo { method: "POST".into(), host: "t.example".into(), path: path.into(), ssl: true, ..Default::default() };
+        match rt.block_on(run(edge.clone(), store.snapshot(), script.clone(), info, Bytes::copy_from_slice(body))) {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let headers = resp.headers().clone();
+                let bytes = rt.block_on(http_body_util::BodyExt::collect(resp.into_body())).unwrap().to_bytes();
+                (status, headers, bytes)
+            }
+            Err(e) => (e.status, hyper::HeaderMap::new(), Bytes::new()),
+        }
+    }
+
+    #[test]
+    fn nothing_one_request_leaves_behind_reaches_the_next_request_to_the_same_script() {
+        let (dir, store, edge) = test_edge("w-iso1");
+        let script = script_named(
+            "iso-state",
+            r#"
+            let calls = 0;
+            export default {
+                async fetch(request) {
+                    calls++;
+                    let leftover = "none";
+                    try { __bodyText(1); leftover = "leaked"; } catch (e) {}
+                    const seen = {
+                        calls,
+                        global: typeof globalThis.leaked,
+                        objectProto: ({}).polluted === undefined,
+                        arrayProto: typeof [].evil,
+                        stringProto: " a ".trim(),
+                        responseProto: typeof Response.prototype.extra,
+                        late: typeof globalThis.late,
+                        handler: typeof globalThis.__default.extra,
+                        leftover,
+                        own: __bodyText(0),
+                    };
+                    const text = await request.text();
+                    globalThis.leaked = text;
+                    Object.prototype.polluted = text;
+                    Array.prototype.evil = () => text;
+                    String.prototype.trim = () => text;
+                    Response.prototype.extra = text;
+                    globalThis.__default.extra = text;
+                    void new Response(new TextEncoder().encode(text));
+                    new Promise(() => {});
+                    Promise.resolve().then(() => { globalThis.late = text; });
+                    if (new URL(request.url).pathname === "/throw") throw new Error("after polluting");
+                    return Response.json(seen);
+                }
+            }
+            "#,
+        );
+        let clean = |v: &serde_json::Value, own: &str| {
+            assert_eq!(v["calls"], 1, "{v}");
+            assert_eq!(v["global"], "undefined", "{v}");
+            assert_eq!(v["objectProto"], true, "{v}");
+            assert_eq!(v["arrayProto"], "undefined", "{v}");
+            assert_eq!(v["stringProto"], "a", "{v}");
+            assert_eq!(v["responseProto"], "undefined", "{v}");
+            assert_eq!(v["late"], "undefined", "{v}");
+            assert_eq!(v["handler"], "undefined", "{v}");
+            assert_eq!(v["leftover"], "none", "{v}");
+            assert_eq!(v["own"], own, "{v}");
+        };
+        let rt = one_thread_runtime();
+        let (status, _, first) = post(&rt, &edge, &store, &script, "/a", b"visitor-a-secret");
+        assert_eq!(status, 200);
+        clean(&serde_json::from_slice(&first).unwrap(), "visitor-a-secret");
+        let (status, _, _) = post(&rt, &edge, &store, &script, "/throw", b"visitor-b-secret");
+        assert_eq!(status, 500, "a script that throws gets the error page");
+        let (status, _, third) = post(&rt, &edge, &store, &script, "/c", b"visitor-c");
+        assert_eq!(status, 200);
+        assert!(!String::from_utf8_lossy(&third).contains("secret"), "{third:?}");
+        clean(&serde_json::from_slice(&third).unwrap(), "visitor-c");
+        let parked = rt.block_on(rt.spawn_blocking(|| STATE.with_borrow(|s| s.is_some()))).unwrap();
+        assert!(!parked, "the worker thread keeps no state once an invocation is over");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn two_scripts_run_one_after_the_other_do_not_see_each_other() {
+        let (dir, store, edge) = test_edge("w-iso2");
+        let a = script_named(
+            "iso-a",
+            r#"
+            globalThis.fromA = "a-was-here";
+            addEventListener("fetch", (e) => e.respondWith(new Response("a-listener")));
+            "#,
+        );
+        let b = script_named(
+            "iso-b",
+            r#"export default { fetch() { return new Response(typeof globalThis.fromA + "/" + typeof globalThis.fromB); } }; globalThis.fromB = 1;"#,
+        );
+        let handlerless = script_named("iso-c", "globalThis.nothing = true;");
+        let rt = one_thread_runtime();
+        assert_eq!(post(&rt, &edge, &store, &a, "/", b"").2, "a-listener");
+        assert_eq!(post(&rt, &edge, &store, &b, "/", b"").2, "undefined/number");
+        // the listener that a registered does not answer for a script without a handler
+        assert_eq!(post(&rt, &edge, &store, &handlerless, "/", b"").0, 500);
+        assert_eq!(post(&rt, &edge, &store, &a, "/", b"").2, "a-listener");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Every byte value, then sequences that are not UTF-8: a bad
+    /// continuation, two bytes UTF-8 never uses, an encoded surrogate and a
+    /// sequence cut off at the end.
+    fn awkward_bytes() -> Vec<u8> {
+        let mut bytes: Vec<u8> = (0..=255u8).collect();
+        bytes.extend_from_slice(&[0xc3, 0x28, 0xff, 0xfe, 0xed, 0xa0, 0x80, 0xe2, 0x82]);
+        bytes
+    }
+
+    #[test]
+    fn a_byte_body_goes_through_a_worker_byte_for_byte() {
+        let (dir, store, edge) = test_edge("w-bytes");
+        let script = script_named(
+            "bytes",
+            r#"
+            export default {
+                async fetch(request) {
+                    const path = new URL(request.url).pathname;
+                    if (path === "/echo") return new Response(await request.arrayBuffer());
+                    if (path === "/reverse") {
+                        const b = await request.bytes();
+                        const r = new Uint8Array(b.length);
+                        for (let i = 0; i < b.length; i++) r[i] = b[b.length - 1 - i];
+                        return new Response(r, { headers: { "content-type": "application/octet-stream" } });
+                    }
+                    if (path === "/view") return new Response(new Uint8Array(await request.arrayBuffer()).subarray(1, 4));
+                    if (path === "/dataview") return new Response(new DataView(await request.arrayBuffer(), 2, 2));
+                    if (path === "/sum") {
+                        const b = await request.bytes();
+                        let s = 0;
+                        for (const x of b) s += x;
+                        return Response.json({ s, len: b.length, isView: ArrayBuffer.isView(b) });
+                    }
+                    if (path === "/twice") {
+                        await request.arrayBuffer();
+                        try { await request.text(); return new Response("read twice"); }
+                        catch (e) { return new Response("used:" + e.name); }
+                    }
+                    if (path === "/text") {
+                        const t = await request.text();
+                        const len = (await new Response(t).arrayBuffer()).byteLength;
+                        return Response.json({ t, len });
+                    }
+                    if (path === "/json") return Response.json((await request.json()).n + 1);
+                    if (path === "/clone") {
+                        const r = new Response(new Uint8Array([9, 8, 7]));
+                        const c = r.clone();
+                        const both = [...new Uint8Array(await r.arrayBuffer()), ...new Uint8Array(await c.arrayBuffer())];
+                        return new Response(new Uint8Array(both));
+                    }
+                    if (path === "/snapshot") {
+                        const src = new Uint8Array([1, 2, 3]);
+                        const r = new Response(src);
+                        src[0] = 99;
+                        return r;
+                    }
+                    if (path === "/empty") return new Response(await new Response(null).arrayBuffer());
+                    if (path === "/request-body") {
+                        const req = new Request("https://example.com/x", { method: "POST", body: new Uint8Array([5, 6]) });
+                        return new Response(await req.arrayBuffer());
+                    }
+                }
+            }
+            "#,
+        );
+        let rt = one_thread_runtime();
+        let input = awkward_bytes();
+        let (status, headers, echoed) = post(&rt, &edge, &store, &script, "/echo", &input);
+        assert_eq!((status, echoed.as_ref()), (200, input.as_slice()));
+        assert!(headers.get("content-type").is_none(), "a byte body gets no text content type");
+        let reversed: Vec<u8> = input.iter().rev().copied().collect();
+        let (_, headers, back) = post(&rt, &edge, &store, &script, "/reverse", &input);
+        assert_eq!(back.as_ref(), reversed.as_slice());
+        assert_eq!(headers.get("content-type").unwrap(), "application/octet-stream");
+        assert_eq!(post(&rt, &edge, &store, &script, "/view", &input).2.as_ref(), &input[1..4]);
+        assert_eq!(post(&rt, &edge, &store, &script, "/dataview", &input).2.as_ref(), &input[2..4]);
+        let sum: u64 = input.iter().map(|&b| b as u64).sum();
+        let v: serde_json::Value = serde_json::from_slice(&post(&rt, &edge, &store, &script, "/sum", &input).2).unwrap();
+        assert_eq!(v, serde_json::json!({ "s": sum, "len": input.len(), "isView": true }));
+        assert_eq!(post(&rt, &edge, &store, &script, "/twice", &input).2, "used:TypeError");
+        assert_eq!(post(&rt, &edge, &store, &script, "/clone", b"").2.as_ref(), &[9, 8, 7, 9, 8, 7]);
+        assert_eq!(post(&rt, &edge, &store, &script, "/snapshot", b"").2.as_ref(), &[1, 2, 3]);
+        assert_eq!(post(&rt, &edge, &store, &script, "/empty", b"").2.as_ref(), b"");
+        assert_eq!(post(&rt, &edge, &store, &script, "/request-body", b"").2.as_ref(), &[5, 6]);
+
+        // text() and json() read as before
+        let text = "h\u{e9}llo \u{2603}";
+        let v: serde_json::Value = serde_json::from_slice(&post(&rt, &edge, &store, &script, "/text", text.as_bytes()).2).unwrap();
+        assert_eq!(v, serde_json::json!({ "t": text, "len": text.len() }));
+        assert_eq!(post(&rt, &edge, &store, &script, "/json", br#"{"n":41}"#).2, "42");
+        let v: serde_json::Value = serde_json::from_slice(&post(&rt, &edge, &store, &script, "/text", &input).2).unwrap();
+        assert_eq!(v["t"], String::from_utf8_lossy(&input).as_ref(), "text() of bytes that are not UTF-8 is lossy, as before");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn byte_bodies_keep_to_the_size_limits() {
+        let (dir, store, edge) = test_edge("w-limit");
+        let script = script_named(
+            "limits",
+            &format!(
+                r#"
+                export default {{
+                    async fetch(request) {{
+                        const path = new URL(request.url).pathname;
+                        if (path === "/over") return new Response(new Uint8Array({over}));
+                        if (path === "/at") return new Response(new Uint8Array({at}));
+                        if (path === "/budget") {{
+                            const buf = new Uint8Array({chunk});
+                            let made = 0;
+                            try {{ for (let i = 0; i < 10; i++) {{ void new Response(buf); made++; }} }}
+                            catch (e) {{ return new Response("stopped after " + made + ": " + e.message); }}
+                            return new Response("not stopped");
+                        }}
+                        if (path === "/not-a-buffer") {{
+                            try {{ __bodyPut(42); }} catch (e) {{ return new Response(e.message); }}
+                        }}
+                    }}
+                }}
+                "#,
+                over = WORKER_BODY_LIMIT + 1,
+                at = WORKER_BODY_LIMIT,
+                chunk = WORKER_BODY_LIMIT / 2,
+            ),
+        );
+        let rt = one_thread_runtime();
+        assert_eq!(post(&rt, &edge, &store, &script, "/over", b"").0, 500);
+        let (status, _, body) = post(&rt, &edge, &store, &script, "/at", b"");
+        assert_eq!((status, body.len()), (200, WORKER_BODY_LIMIT));
+        let budget = post(&rt, &edge, &store, &script, "/budget", b"").2;
+        let expect = format!("stopped after {}: too many body bytes in one invocation", BODY_PUT_BUDGET / (WORKER_BODY_LIMIT / 2));
+        assert_eq!(String::from_utf8_lossy(&budget), expect);
+        assert_eq!(post(&rt, &edge, &store, &script, "/not-a-buffer", b"").2, "expected an ArrayBuffer");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn esbuild_style_default_exports_become_the_handler() {
+        assert_eq!(transform("export { worker_default as default };"), "globalThis.__default = worker_default;");
+        let bundled = "var src_default = {\n  fetch() {}\n};\nexport {\n  src_default as default\n};\n//# sourceMappingURL=worker.js.map\n";
+        let out = transform(bundled);
+        assert!(out.contains("globalThis.__default = src_default;"), "{out}");
+        assert!(check_syntax(bundled).is_ok());
+        // other export lists and imports are left alone, and so refused
+        assert!(check_syntax("const a = 1, b = 2; export { a, b as default };").is_err());
+        assert!(check_syntax("import x from './x.js'; export default x;").is_err());
+        let (dir, store, edge) = test_edge("w-esb");
+        let script = script_named("esb", "var worker_default = { async fetch() { return new Response('bundled'); } };\nexport { worker_default as default };\n");
+        let rt = one_thread_runtime();
+        assert_eq!(post(&rt, &edge, &store, &script, "/", b"").2, "bundled");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

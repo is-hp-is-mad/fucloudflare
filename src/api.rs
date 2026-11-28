@@ -2422,9 +2422,15 @@ async fn list_workers(State(st): St) -> ApiResult {
     ok(Value::Array(st.store.list_workers().iter().map(worker_json).collect()))
 }
 
-/// Upload a script: the request body is the JavaScript source.
-async fn put_worker(State(st): St, Path(name): Path<String>, bytes: Bytes) -> ApiResult {
-    let script = String::from_utf8(bytes.to_vec()).map_err(|_| bad("script must be UTF-8"))?;
+/// Upload a script: the request body is the JavaScript source, or wrangler's
+/// `multipart/form-data` upload holding one module (see `workers::upload`).
+async fn put_worker(State(st): St, Path(name): Path<String>, headers: header::HeaderMap, bytes: Bytes) -> ApiResult {
+    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let script = if crate::workers::upload::is_multipart(content_type) {
+        crate::workers::upload::module_from_form(content_type, &bytes).map_err(bad)?
+    } else {
+        String::from_utf8(bytes.to_vec()).map_err(|_| bad("script must be UTF-8"))?
+    };
     if script.trim().is_empty() {
         return Err(bad("script is empty"));
     }
@@ -3584,6 +3590,55 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir_acc);
+    }
+
+    #[tokio::test]
+    async fn a_wrangler_multipart_upload_stores_its_one_module_and_anything_more_is_refused() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-wup-{}", uuid::Uuid::new_v4().simple()));
+        let mut app = router(make_test_state(&dir, crate::sync::NodeRole::Peer));
+        let url = format!("/client/v4/accounts/{}/workers/scripts/wup?excludeScript=true&bindings_inherit=strict", crate::tokens::account_id());
+        let ct = "multipart/form-data; boundary=----formdata-undici-042";
+        let module = "var worker_default = {\n  async fetch() { return new Response(\"bundled ok\"); }\n};\nexport {\n  worker_default as default\n};\n";
+        let form = |meta: &str, parts: &[(&str, &str, &str)]| {
+            let mut out = format!("------formdata-undici-042\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{meta}\r\n");
+            for (name, ty, data) in parts {
+                out += &format!("------formdata-undici-042\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{name}\"\r\nContent-Type: {ty}\r\n\r\n{data}\r\n");
+            }
+            out + "------formdata-undici-042--\r\n"
+        };
+        let meta = r#"{"main_module":"worker.js","bindings":[],"compatibility_date":"2025-01-01"}"#;
+        let headers = vec![("authorization", "Bearer test-token"), ("content-type", ct)];
+
+        let body = form(meta, &[("worker.js", "application/javascript+module", module)]);
+        let (sc, _, b) = call_raw(&mut app, "PUT", &url, headers.clone(), body.into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!((v["success"].clone(), v["result"]["id"].clone()), (json!(true), json!("wup")));
+        let (sc, b) = call(&mut app, "GET", "/client/v4/workers/scripts/wup", vec![]).await;
+        assert_eq!((sc, String::from_utf8(b).unwrap()), (StatusCode::OK, module.to_string()));
+
+        // refused uploads leave the stored script as it was
+        let refused = [
+            form(meta, &[("worker.js", "application/javascript+module", module), ("chunk.js", "application/javascript+module", "export const x = 1;")]),
+            form(meta, &[("worker.js", "application/javascript+module", "import x from './chunk.js'; export default x;")]),
+            form(r#"{"main_module":"worker.js","bindings":[{"type":"plain_text","name":"A","text":"b"}]}"#, &[("worker.js", "application/javascript+module", module)]),
+            form(r#"{"main_module":"a.wasm"}"#, &[("a.wasm", "application/wasm", "asm")]),
+            "not a form".to_string(),
+        ];
+        for body in refused {
+            let (sc, _, b) = call_raw(&mut app, "PUT", &url, headers.clone(), body.clone().into_bytes()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{body}: {}", String::from_utf8_lossy(&b));
+            assert_eq!(serde_json::from_slice::<Value>(&b).unwrap()["success"], json!(false));
+        }
+        let (_, b) = call(&mut app, "GET", "/client/v4/workers/scripts/wup", vec![]).await;
+        assert_eq!(String::from_utf8(b).unwrap(), module);
+
+        // a raw body is still the script itself
+        let (sc, _, _) = call_raw(&mut app, "PUT", &url, vec![("authorization", "Bearer test-token"), ("content-type", "application/javascript")], b"export default {}".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (_, b) = call(&mut app, "GET", "/client/v4/workers/scripts/wup", vec![]).await;
+        assert_eq!(b, b"export default {}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

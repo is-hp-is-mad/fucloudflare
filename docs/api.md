@@ -1095,7 +1095,8 @@ GET    /steering/test?ip=&ua=                     where an address is placed, an
 ```
 GET    /workers/scripts
 GET    /workers/scripts/{name}            the script (not for viewers)
-PUT    /workers/scripts/{name}            the body is the JavaScript source; it is syntax-checked
+PUT    /workers/scripts/{name}            the body is the JavaScript source, or a wrangler-style multipart
+                                          upload with one module (below); it is syntax-checked
 DELETE /workers/scripts/{name}
 GET    /workers/scripts/{name}/settings   {"vars", "kv_bindings", "d1_bindings", "crons"}
 PATCH  /workers/scripts/{name}/settings   any of those; bindings map a name in env to a namespace / database id
@@ -1105,6 +1106,40 @@ CRUD   /zones/{id}/workers/routes         {"pattern": "example.com/api/*", "scri
 ```
 
 `crons` are five-field UTC expressions.
+
+**Uploading.** A Worker here is one file: `export default { ... }`, esbuild's closing
+`export { name as default };`, or `addEventListener("fetch", ...)`; there is no module loader, so any other
+`import` or `export` is refused at upload. A `PUT` with `Content-Type: multipart/form-data` is read the way
+Cloudflare's API reads `wrangler deploy`'s upload: a `metadata` part (JSON) that names the script in
+`main_module` (or `body_part` for a service-worker script), and exactly one other part, of that name, with a
+JavaScript type (`application/javascript+module`, `application/javascript`, `text/javascript`). The module is
+stored as the script, byte for byte; other metadata fields (`compatibility_date`, `observability`, ...) are
+ignored. Refused with `400`, nothing stored: more than one module or any extra part (wasm, text or data
+modules, source maps), a non-JavaScript type, a missing or second `metadata` part, a `bindings` list that is
+not empty (set `vars`, `kv_bindings` and `d1_bindings` with `PATCH .../settings` instead), and `assets`.
+
+So bundle into one file first. `wrangler deploy` bundles with esbuild by default; `--dry-run --outdir dist`
+writes that bundle without calling any API. `wrangler deploy` itself does not finish against fucf yet: before
+uploading it reads `/accounts/{id}/workers/services/{name}`, which fucf does not have. Upload the bundle
+yourself instead, either form:
+
+```
+curl -s -X PUT $BASE/accounts/$ACCOUNT/workers/scripts/my-worker -H "Authorization: Bearer $TOKEN" \
+  -F 'metadata={"main_module":"index.js","bindings":[]};type=application/json' \
+  -F 'index.js=@dist/index.js;type=application/javascript+module'
+
+curl -s -X PUT $BASE/workers/scripts/my-worker -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/javascript" --data-binary @dist/index.js
+```
+
+**Runtime.** Every request (and every email or cron run) gets a fresh JavaScript context: globals,
+module-level variables, changed prototypes and unsettled promises of one request are gone in the next, and
+two scripts share nothing. Nothing about the context is reused between requests, by design, so state that
+must outlive a request goes in KV or D1. Request and response bodies are bytes: `request.arrayBuffer()` and
+`request.bytes()` give them exactly (`text()` and `json()` decode as UTF-8, replacing invalid sequences), and
+`new Response(body)` takes a string, an `ArrayBuffer` or any view on one (`Uint8Array`, `DataView`, ...),
+copied when the response is made. A byte body gets no `Content-Type` of its own. Bodies are limited to 16 MiB
+each, and one invocation may hand at most 64 MiB of byte bodies to the edge in all.
 
 ### Workers KV
 

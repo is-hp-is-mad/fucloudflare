@@ -115,7 +115,7 @@
 - 设计：新增报告种类 `rate`：每 30 秒各节点把本节点最热的若干计数键（键+计数+窗口）编成报告；其他节点收到后合入一张"远端视图"，按窗口半衰衰减。裁决时有效计数 = 本地计数 + 远端视图求和（可乘系数 0.5 防爆）。只在规则计数超过某阈值（如限速的一半）后才上报，控制报告量。
 - 单元测试：合并、衰减、去重纯逻辑。近似即可，文档写清"近似、不保证精确"。
 
-### [ ] N12 Workers 运行时加固（不换引擎）
+### [x] N12 Workers 运行时加固（不换引擎）
 
 - 背景：引擎选型（Boa/QuickJS/V8）所有者尚未拍板，**本任务不换引擎**，只做不锁死未来替换的结构性改进。代码在 `src/workers/`（`mod.rs`、`kv.rs`、`db.rs`、`crypto.rs`、`cron.rs`、`prelude.js`）。
 - 子项：a) 上下文复用：按脚本内容版本缓存/复用 Boa context，不再每请求新建（注意隔离：全局状态每请求重置或文档声明不保证）；b) 请求体按字节暴露（`Uint8Array`/`ArrayBuffer`），不再只按文本；c) 多文件：支持简单打包格式（ wrangler 的 esbuild 产出本就是单文件——核实 wrangler 实际产出格式，若是单文件 bundle 则文档写清"先用 wrangler build 再上传"即可，不另造模块系统）。
@@ -194,3 +194,9 @@
 - 接线：`waf.rs` 的 `Counter` 记下窗口开始的 unix 秒（保证同一窗口每次上报的 `until` 完全一样），`count()` 先读远端和再锁计数器；`reports.rs` 的 `take()` 在去重之后合入；`sync/mod.rs` 和 `api.rs` 的 `TelemetryPush` 各一行。`rate` 用宽松反序列化，格式不对只丢这一项、不会让整批报告解码失败，旧节点直接忽略这个字段（有测试）。
 - 没做半衰衰减，改成到窗口结束就失效（固定窗口下更直观）；没另设 30 秒定时器，跟着现有上报走。内存上限：本地热键 1024、远端视图 4096 个键、每键 64 个节点、键长超过 512 字节不上报。键里有访客 IP 和头 / Cookie 值，只走机群自己认证过的上报通道，不写日志。
 - 留给能跑多节点的人：平均分散到 N 个节点的客户端大约在 N/2 倍限额时被拦；每个节点都没过半的客户端抓不到；仅因远端计数被拦也会向全机群广播 Block；节点间时钟偏差会让失效时间相应偏移。
+
+### N12
+- 上下文复用没做：查过 Boa 0.22 源码，解析好的 `Script` 绑在原上下文的 realm 和字符串表上（还是 `Gc`，不能跨线程），只重置 realm 也要重建内置对象、重编译前置脚本和用户脚本，还会把失败请求留下的任务带进下一个请求。所以每次执行仍新建上下文，三种入口（fetch / email / scheduled）合并成 `src/workers/mod.rs` 的 `invoke` + `run_handler`，`InstalledState` 保证线程本地状态在 panic 时也清掉；测试在单个阻塞线程上证明全局变量、原型、未完成的 Promise、请求体都不串到下一个请求或另一个脚本。没有测过速度。
+- 字节体：`request.arrayBuffer()` / `bytes()`，`new Response(ArrayBuffer | Uint8Array | DataView …)`，经新的宿主函数 `__bodyBytes` / `__bodyPut` / `__textBytes` 走，不经字符串或 base64；0..=255 加非法 UTF-8 逐字节往返；单个 16 MiB、一次执行合计 64 MiB。
+- 多文件：新文件 `src/workers/upload.rs` 解析 wrangler 的 multipart（`metadata` + 恰好一个 JS 模块），`put_worker` 按 `Content-Type` 分流；多个模块、wasm、source map、非空 `bindings`、`assets` 一律 400。`transform` 认 esbuild 的 `export { x as default };`。文档写明先 `wrangler deploy --dry-run --outdir dist` 打包再用 curl 上传。
+- 留待能跑 wrangler 的人：`/accounts/{id}/workers/services/{name}` 还没有（wrangler 认 10007 或 10090），之后还要 secrets 检查、`/subdomain`、`/schedules`；`compat.yml` 里 wrangler 作业的注释已部分过时；没拿真实的 esbuild 打包产物（带 middleware facade 的）试过。

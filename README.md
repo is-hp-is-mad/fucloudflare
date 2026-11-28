@@ -102,7 +102,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/waiting_rooms[/{id}]         CRUD             {"name", "host", "path_prefix":"/shop", "total_active_users", "new_users_per_minute", "session_minutes", "enabled"}，见“等候室”
 /zones/{id}/spectrum/apps[/{id}]         CRUD             {"protocol":"tcp/2222", "dns":{"name":"ssh"}, "origin_direct":["tcp://192.0.2.1:22"], "proxy_protocol":"off|v1"}
 /zones/{id}/workers/routes[/{id}]        CRUD             {"pattern":"example.com/api/*", "script":"name"}
-/workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码
+/workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码，或只含一个模块的 wrangler 式 multipart 上传，见“Workers”
 /workers/scripts/{name}/settings         GET PATCH        {"vars": {"KEY":"value"}}
 ```
 
@@ -517,6 +517,10 @@ export default {
 
 支持 `export default { fetch }` 和 `addEventListener("fetch", ...)` 两种写法；提供 `Request` `Response` `Headers`
 `URL` `URLSearchParams` `fetch` `console`。`fetch` 访问本边缘托管的域名时走缓存和回源规则，其余地址直接外连。
+
+- **隔离**：每个请求（以及每封邮件、每次定时触发）都新建一个 JS 上下文，上一个请求留下的全局变量、模块顶层变量、改过的原型、没结束的 Promise 到下一个请求都不在，两个脚本之间也什么都不共享。这是有意的：Boa 0.22 解析出的脚本绑在创建它的上下文（realm 和字符串表）上，不能跨上下文复用；只重置 realm 的话，新 realm 照样要建全部内置对象，前置脚本和用户脚本照样要重新编译，还会把上一个请求没跑完的任务带进下一个请求。要跨请求保存的东西放 KV 或 D1。
+- **字节请求体**：`request.arrayBuffer()` / `request.bytes()` 原样拿到请求体的每个字节（`text()` / `json()` 照旧按 UTF-8 解码，坏的字节换成替换符）；`new Response(...)` 除了字符串还接受 `ArrayBuffer`、`Uint8Array`、`DataView` 等，构造时复制一份，二进制体不自动加 `Content-Type`。单个体不超过 16 MiB，一次执行交给边缘的字节体合计不超过 64 MiB。
+- **上传与打包**：脚本只能是一个文件（`export default {...}`、esbuild 生成的末尾 `export { x as default };` 或 `addEventListener`），没有模块加载器，其他 `import` / `export` 上传时就被拒。`PUT` 也接受 wrangler 那样的 `multipart/form-data`：`metadata` 部分（JSON，`main_module` 或 `body_part` 指明脚本）加上恰好一个同名的 JavaScript 部分，存下的就是这个模块本身。多个模块、wasm / 文本 / 数据模块、source map、非空的 `bindings`、`assets` 一律 400，什么都不改；变量和 KV / D1 绑定用 `PATCH /workers/scripts/{name}/settings` 设置。所以先打成一个文件：`wrangler deploy --dry-run --outdir dist` 用 esbuild 打包、不调用任何接口，再用 curl 上传 `dist/` 里的文件（例子见 `docs/api.md`）。`wrangler deploy` 本身目前还走不完：上传前它要读 `/accounts/{id}/workers/services/{name}`，fucf 还没有这个接口。
 
 ## 电子邮件路由
 
@@ -1050,8 +1054,9 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 - 分析：按国家 / 主机名 / 路径的拆分只保留 7 天，每小时每个维度只留排名靠前的若干项（其余并入"(other)"）；DNS 查询数（`dns_analytics`）不进时间序列，也不在节点之间汇总。
 - 封禁导出（`--ban-export`）：只写 IPv4 的封禁，按 /64 封的 IPv6 还没有写进文件。
 - WAF：托管规则是一组正则，不是完整的 OWASP CRS；请求体只检查不超过 1 MiB 的。
-- Workers：每个请求新建 JS 上下文（无全局状态复用）；只支持单文件脚本；请求体/响应体只能以文本读取
-  （未读取的二进制体可原样透传）；不支持流式 API；单请求最多 50 个子请求，体积上限 16 MiB。
+- Workers：每个请求新建 JS 上下文（无全局状态复用，每次都要重新编译前置脚本和用户脚本）；只支持单文件脚本，
+  `wrangler deploy` 还走不完（缺 `/workers/services/{name}`），要先打包再用 curl 上传；不支持流式 API；
+  单请求最多 50 个子请求，体积上限 16 MiB。
   CPU 限制靠循环次数上限，墙钟超时 30 秒后向客户端返回 500，但脚本线程要到自身结束才释放。
 - Spectrum：所有应用共用边缘 IP，同一协议端口只能被一个应用占用；UDP 会话空闲 60 秒回收。
 
