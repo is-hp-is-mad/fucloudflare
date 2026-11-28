@@ -390,19 +390,6 @@ main{position:relative}.lang{position:absolute;top:3rem;right:1.5rem;min-height:
 /// A small mark for the edge's pages (an open sector: the edge between visitor and origin).
 const PAGE_MARK: &str = "<svg class=\"mark\" viewBox=\"0 0 40 40\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M6 28a14 14 0 0 1 28 0\"/><path d=\"M20 28l8-10\"/><circle cx=\"20\" cy=\"28\" r=\"2\" fill=\"currentColor\"/></svg>";
 
-fn html_page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
-    let html = format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\">\
-         <title>{title}</title><style>{PAGE_CSS}</style></head><body><main>{body}</main></body></html>"
-    );
-    let mut resp = Response::new(full(html));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
-}
-
 const ICON_BROWSER: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3.5\" y=\"4.5\" width=\"17\" height=\"15\" rx=\"2\"/><path d=\"M3.5 9h17M7 6.8h.01M9.5 6.8h.01\"/></svg>";
 const ICON_EDGE: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.9\" stroke-linecap=\"round\"><path d=\"M4 17a8 8 0 0 1 16 0\"/><path d=\"M12 17l4.5-5.5\"/><circle cx=\"12\" cy=\"17\" r=\"1.3\" fill=\"currentColor\"/></svg>";
 const ICON_ORIGIN: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"4\" y=\"4.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><rect x=\"4\" y=\"13.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><path d=\"M7.5 7.5h.01M7.5 16.5h.01\"/></svg>";

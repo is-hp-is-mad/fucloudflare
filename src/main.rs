@@ -9,6 +9,10 @@ mod fleet;
 mod geo;
 mod geo_cn;
 mod gfw;
+#[cfg(unix)]
+mod handoff;
+#[cfg(not(unix))]
+#[path = "handoff_plain.rs"]
 mod handoff;
 mod items;
 mod limits;
@@ -973,6 +977,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// How long requests under way get to finish before the process turns
 /// into the next binary (it keeps the listeners: nobody is refused).
+#[cfg(unix)]
 const HANDOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long requests under way get when the process stops; whoever comes
 /// meanwhile gets the "node updating" page.

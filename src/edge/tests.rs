@@ -1959,6 +1959,7 @@ async fn origin_that_is_the_edge_itself_is_explained_on_the_dashboard_only() {
     assert!(e.rule_id == "530" && e.description.contains("origin_node") && e.description.starts_with(ORIGIN_MISCONFIGURED.zh), "{e:?}");
 }
 
+#[cfg(unix)] // a file root is a Unix path
 #[tokio::test]
 async fn proxy_rules_answer_by_themselves_and_serve_files() {
     let env = setup().await;

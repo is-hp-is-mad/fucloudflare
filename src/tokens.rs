@@ -241,12 +241,6 @@ pub struct Condition {
     pub request_ip: Option<IpList>,
 }
 
-impl Condition {
-    pub fn is_empty(&self) -> bool {
-        self.request_ip.as_ref().is_none_or(|l| l.inside.is_empty() && l.not_in.is_empty())
-    }
-}
-
 fn parse_net(s: &str) -> Option<(IpAddr, u8)> {
     let (addr, prefix) = match s.trim().split_once('/') {
         Some((a, p)) => (a, Some(p.parse::<u8>().ok()?)),
