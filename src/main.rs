@@ -644,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     let edge = Arc::new(edge);
+    tokio::spawn(edge.clone().refresh_stale());
     let mut edge_listeners = Vec::new();
     for (what, addr, tls) in [("HTTP", &args.http_listen, false), ("HTTPS", &args.https_listen, true)] {
         if addr == "off" {

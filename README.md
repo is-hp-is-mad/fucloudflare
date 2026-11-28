@@ -306,6 +306,7 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 - 故障转移：一个主机名有多条代理 A/AAAA 记录时轮询；连接被拒的地址 10 秒内排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
 - 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份）。首条匹配生效。
 - 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象。
+- `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
   遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `CF-Cache-Status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`。

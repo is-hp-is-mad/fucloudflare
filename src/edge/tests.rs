@@ -98,6 +98,9 @@ async fn origin(hits: Arc<AtomicUsize>, name: &'static str) -> u16 {
             if path.contains("altsvc") {
                 return ([("alt-svc", "h3=\":443\"; ma=86400"), ("cache-control", "public, max-age=60")], "behind another CDN").into_response();
             }
+            if path.contains("swr") {
+                return ([("cache-control", "public, max-age=1, stale-while-revalidate=60")], format!("swr hit={n}")).into_response();
+            }
             if path.contains("lastmod") {
                 return ([("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")], "dated").into_response();
             }
@@ -2114,6 +2117,24 @@ async fn the_panel_is_answered_here_when_its_node_is_gone() {
     // and goes on doing so for a while, without trying the gone node first
     let r = get(&env, "panel.example.net", "/client/v4/system").await;
     assert!(r.status == 200 && r.body.contains("GET /client/v4/system"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn a_stale_copy_is_served_at_once_while_a_new_one_is_fetched() {
+    let env = setup().await;
+    tokio::spawn(env.edge.clone().refresh_stale());
+    let ask = || get(&env, "www.example.com", "/swr/app.js");
+    let first = ask().await;
+    assert_eq!((first.header("fcf-cache-status"), ask().await.header("fcf-cache-status")), (Some("MISS"), Some("HIT")));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // past its freshness: the old copy at once ...
+    let stale = ask().await;
+    assert_eq!((stale.header("fcf-cache-status"), stale.body.as_str()), (Some("UPDATING"), first.body.as_str()));
+    // ... and the one fetched meanwhile from then on
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let fresh = ask().await;
+    assert_eq!(fresh.header("fcf-cache-status"), Some("HIT"));
+    assert_ne!(fresh.body, first.body, "fetched anew behind the visitor's back");
 }
 
 #[tokio::test]

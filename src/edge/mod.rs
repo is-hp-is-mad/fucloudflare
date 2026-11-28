@@ -971,6 +971,16 @@ pub struct Outgoing {
     pub on_upgrade: Option<OnUpgrade>,
     /// A gRPC call: goes to the origin over HTTP/2, trailers and all.
     pub grpc: bool,
+    /// Fetching anew what was just answered stale: not answered stale again.
+    pub refresh: bool,
+}
+
+/// A copy to fetch anew in the background (stale-while-revalidate).
+struct Refresh {
+    key: String,
+    zone_id: String,
+    info: ReqInfo,
+    headers: HeaderMap,
 }
 
 pub struct Edge {
@@ -1018,6 +1028,10 @@ pub struct Edge {
     pub rtt: Arc<crate::rtt::Rtt>,
     /// Which origin addresses pass this node's health checks.
     pub origins: Arc<origins::Health>,
+    /// Copies answered stale, waiting to be fetched anew (see [`Edge::refresh_stale`]), and the keys of those under way.
+    refresh_tx: tokio::sync::mpsc::Sender<Refresh>,
+    refresh_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Refresh>>>,
+    refreshing: std::sync::Mutex<std::collections::HashSet<String>>,
     /// True when this node runs in `--role accelerate` mode.
     pub accelerate: std::sync::atomic::AtomicBool,
     /// Explicitly trust `X-Forwarded-Host` from the local HTTP/3 front.
@@ -1266,6 +1280,7 @@ fn is_addr(rtype: &str) -> bool {
 
 impl Edge {
     pub fn new(store: Arc<Store>, cache: Arc<Cache>, waf: Arc<Waf>, edge_ips: Vec<IpAddr>) -> anyhow::Result<Self> {
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(256);
         Ok(Edge {
             store,
             cache,
@@ -1291,6 +1306,9 @@ impl Edge {
             node_name: Default::default(),
             rtt: Default::default(),
             origins: Default::default(),
+            refresh_tx,
+            refresh_rx: std::sync::Mutex::new(Some(refresh_rx)),
+            refreshing: Default::default(),
             accelerate: std::sync::atomic::AtomicBool::new(false),
             trust_forwarded_host: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1497,7 +1515,7 @@ impl Edge {
 
     /// Serve from cache or pull from the origin (no WAF, no workers).
     pub async fn fetch(&self, snap: &Snapshot, zone: &ZoneSnap, out: Outgoing) -> Result<Response<Body>, EdgeError> {
-        let Outgoing { info, mut headers, body, on_upgrade, grpc } = out;
+        let Outgoing { info, mut headers, body, on_upgrade, grpc, refresh } = out;
         let method = Method::from_bytes(info.method.as_bytes())
             .map_err(|_| EdgeError::new(400, "Bad request", "invalid method"))?;
         let uri = info.uri();
@@ -1521,6 +1539,14 @@ impl Edge {
                 // A part is cut from what we have; otherwise the request goes
                 // to the origin as it is, and its partial answer is not kept.
                 _ if conditional.range.is_some() => storable = false,
+                // stale-while-revalidate: the visitor gets the copy at once, a new one is fetched behind its back
+                Some(entry)
+                    if !refresh
+                        && entry.stored.elapsed() < entry.ttl + cache::stale_while_revalidate(&entry.headers)
+                        && self.refresh_later(&key, &zone.zone.id, &info, &headers) =>
+                {
+                    return Ok(cached_response(&entry, &method, &conditional, "UPDATING"));
+                }
                 Some(entry) => {
                     status_label = "EXPIRED";
                     fallback = Some(entry.clone()).filter(|e| e.stored.elapsed() < e.ttl + cache::STALE_IF_ERROR);
@@ -1765,7 +1791,7 @@ impl Edge {
 
         let resp = match snap.find_zone(&host).filter(|z| Self::serves(z, &host)) {
             Some(zone) => {
-                let out = Outgoing { info, headers: map, body: ReqBody::Buffered(body), on_upgrade: None, grpc: false };
+                let out = Outgoing { info, headers: map, body: ReqBody::Buffered(body), on_upgrade: None, grpc: false, refresh: false };
                 self.fetch(snap, zone, out).await.map_err(|e| format!("{} {}: {}", e.status, e.title, e.detail))?
             }
             None => {
@@ -2247,7 +2273,7 @@ impl Edge {
                     crate::workers::run(self.clone(), snap.clone(), script.clone(), info, body).await?
                 }
             }
-            None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc }).await?,
+            None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc, refresh: false }).await?,
         };
         if let Some(info) = &counted {
             self.waf.answered(zone, info, resp.status().as_u16(), ray);
@@ -2392,6 +2418,37 @@ impl Edge {
 }
 
 impl Edge {
+    /// Have the copy under `key` fetched anew in the background. False when
+    /// that cannot be queued: the request then asks the origin itself.
+    fn refresh_later(&self, key: &str, zone_id: &str, info: &ReqInfo, headers: &HeaderMap) -> bool {
+        let mut busy = self.refreshing.lock().unwrap();
+        if busy.contains(key) {
+            return true;
+        }
+        let job = Refresh { key: key.to_string(), zone_id: zone_id.to_string(), info: info.clone(), headers: headers.clone() };
+        let queued = self.refresh_tx.try_send(job).is_ok();
+        if queued {
+            busy.insert(key.to_string());
+        }
+        queued
+    }
+
+    /// Fetch anew the copies that were answered stale, for as long as the process runs.
+    pub async fn refresh_stale(self: Arc<Self>) {
+        let Some(mut queue) = self.refresh_rx.lock().unwrap().take() else { return };
+        while let Some(job) = queue.recv().await {
+            let edge = self.clone();
+            tokio::spawn(async move {
+                let snap = edge.store.snapshot();
+                if let Some(zone) = snap.zones.values().find(|z| z.zone.id == job.zone_id) {
+                    let out = Outgoing { info: job.info, headers: job.headers, body: ReqBody::Buffered(Bytes::new()), on_upgrade: None, grpc: false, refresh: true };
+                    let _ = edge.fetch(&snap, zone, out).await;
+                }
+                edge.refreshing.lock().unwrap().remove(&job.key);
+            });
+        }
+    }
+
     /// One round trip with the visitor at `ip`, as its handshake with this node
     /// showed it: what the DNS steers by (see crate::rtt). Not the nodes of the
     /// fleet among themselves, nor this host.

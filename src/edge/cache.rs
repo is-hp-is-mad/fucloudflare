@@ -82,6 +82,13 @@ pub fn max_age(headers: &HeaderMap) -> Option<u64> {
     directives(headers).into_iter().find(|(k, _)| k == "max-age").and_then(|(_, v)| v?.parse().ok())
 }
 
+/// For how long past its freshness an answer may still be served while a new
+/// copy is fetched in the background (`stale-while-revalidate=N`, at most a day).
+pub fn stale_while_revalidate(headers: &HeaderMap) -> Duration {
+    let secs = directives(headers).into_iter().find(|(k, _)| k == "stale-while-revalidate").and_then(|(_, v)| v?.parse::<u64>().ok());
+    Duration::from_secs(secs.unwrap_or(0).min(86400))
+}
+
 /// May this request be answered from / stored into the cache?
 pub fn request_cacheable(method: &Method, headers: &HeaderMap) -> bool {
     (method == Method::GET || method == Method::HEAD)
