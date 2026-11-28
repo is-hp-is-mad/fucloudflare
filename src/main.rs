@@ -20,6 +20,7 @@ mod log;
 mod mail;
 mod node;
 mod release;
+mod reports;
 mod spectrum;
 mod store;
 mod site_acme;
@@ -522,6 +523,8 @@ async fn main() -> anyhow::Result<()> {
             waf: waf.clone(),
             stats_path: args.data_dir.join("analytics.json"),
             events_path: args.data_dir.join("events.json"),
+            reports: Default::default(),
+            reports_path: args.data_dir.join("reports.json"),
             limits: Arc::new(limits::Limits::open_ephemeral()),
         })
     } else {
@@ -531,6 +534,8 @@ async fn main() -> anyhow::Result<()> {
             waf: waf.clone(),
             stats_path: args.data_dir.join("analytics.json"),
             events_path: args.data_dir.join("events.json"),
+            reports: Default::default(),
+            reports_path: args.data_dir.join("reports.json"),
             limits: Arc::new(limits::Limits::load(&args.data_dir.join("usage.json"))),
         });
         waf.load(&t.events_path);
@@ -826,6 +831,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let fleet = Arc::new(fleet::Fleet::default());
+    // what the nodes report is taken here and kept for the peers: every peer has the whole fleet's
+    let reports = {
+        let (store, ips, name) = (store.clone(), args.edge_ips.clone(), args.node_name.clone());
+        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
+    };
+    if !accel {
+        reports.load(&telemetry.reports_path);
+        let _ = telemetry.reports.set(reports.clone());
+    }
     let releases = Arc::new(release::Releases::new(updater.clone(), !accel));
     let listeners = dns_listeners.iter().map(|a| format!("dns {a} (udp+tcp)")).chain(edge_listeners.iter().map(|a| format!("edge {a} (tcp)"))).collect();
     let info = Arc::new(node::NodeInfo {
@@ -868,6 +882,10 @@ async fn main() -> anyhow::Result<()> {
         );
         s.register_provider(kv_store.clone());
         s.register_provider(d1_store.clone());
+        if !accel {
+            s.register_provider(reports.clone());
+            let _ = s.reports.set(reports.clone());
+        }
         tokio::spawn(s.clone().run());
         Some(s)
     } else {
@@ -946,6 +964,7 @@ async fn main() -> anyhow::Result<()> {
         panel_host,
         health,
         fleet,
+        reports,
         limits: node_limits,
         edge_ips: args.edge_ips.clone(),
         node_name: args.node_name.clone(),
@@ -1081,6 +1100,9 @@ struct Telemetry {
     waf: Arc<edge::waf::Waf>,
     stats_path: PathBuf,
     events_path: PathBuf,
+    /// Which reports of the other nodes went into the analytics (see crate::reports).
+    reports: std::sync::OnceLock<Arc<reports::Reports>>,
+    reports_path: PathBuf,
     limits: Arc<limits::Limits>,
 }
 
@@ -1092,6 +1114,9 @@ impl Telemetry {
         }
         if let Err(e) = self.waf.save(&self.events_path) {
             tracing::warn!("cannot save security events to {}: {e}", self.events_path.display());
+        }
+        if let Some(Err(e)) = self.reports.get().map(|r| r.save(&self.reports_path)) {
+            tracing::warn!("cannot save the report marks to {}: {e}", self.reports_path.display());
         }
         self.limits.save();
     }

@@ -4,6 +4,7 @@
 use crate::gfw::{GfwMonitor, GfwStatus};
 use crate::limits::{Limits, State, Usage};
 use crate::store::Store;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -12,6 +13,17 @@ use std::time::{Duration, Instant};
 
 /// A replica that has not reported for this long is considered gone.
 const FRESH: Duration = Duration::from_secs(60);
+/// Of how many runs of a node's process the reports are told apart.
+const RUNS_KEPT: usize = 4;
+
+/// The reports of one run of a node's process taken here: the highest, and
+/// which of the 64 before it (bit `k - 1`: the one `k` before).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Mark {
+    boot: String,
+    max: u64,
+    before: u64,
+}
 
 #[derive(Default)]
 struct Peer {
@@ -23,6 +35,8 @@ struct Peer {
     role: String,
     seen: Option<Instant>,
     seen_at: String,
+    /// When a report of it last came by way of another peer.
+    heard: Option<Instant>,
     /// What the replica says about the binary it runs (see crate::release).
     exe: PeerExe,
     /// What the replica last said about itself (see crate::node).
@@ -42,16 +56,22 @@ pub struct PeerExe {
 }
 
 impl Peer {
+    /// Since it was last heard of, itself or through another peer.
     fn age(&self) -> Duration {
-        self.seen.map_or(Duration::MAX, |at| at.elapsed())
+        self.seen.into_iter().chain(self.heard).map(|at| at.elapsed()).min().unwrap_or(Duration::MAX)
+    }
+
+    /// It got in touch with this node itself lately.
+    fn direct(&self) -> bool {
+        self.seen.is_some_and(|at| at.elapsed() < FRESH)
     }
 }
 
 #[derive(Default)]
 pub struct Fleet {
     peers: Mutex<HashMap<String, Peer>>,
-    /// Per replica: the run of its process and the last report of that run.
-    reports: Mutex<HashMap<String, (String, u64)>>,
+    /// Per node: which reports of its last runs were taken here.
+    reports: Mutex<HashMap<String, Vec<Mark>>>,
     /// Per replica: what it last said about its traffic allowance.
     usage: Mutex<HashMap<String, Usage>>,
     /// Per replica: what it last said about mainland-China reachability.
@@ -148,15 +168,69 @@ impl Fleet {
         views
     }
 
-    /// Is report `seq` of run `boot` new? False when this very report was
-    /// already processed and is being re-sent because the reply got lost.
-    pub fn fresh_report(&self, node: &str, boot: &str, seq: u64) -> bool {
+    /// Take note of report `seq` of run `boot` of a node. None when that very
+    /// report was taken before (sent again because the reply got lost, or come
+    /// again by way of another peer); else whether it is the node's latest.
+    pub fn mark_report(&self, node: &str, boot: &str, seq: u64) -> Option<bool> {
         let mut reports = self.reports.lock().unwrap();
-        if reports.get(node).is_some_and(|(b, last)| b == boot && seq <= *last) {
-            return false;
+        let runs = reports.entry(node.to_string()).or_default();
+        let Some(i) = runs.iter().position(|m| m.boot == boot) else {
+            runs.push(Mark { boot: boot.to_string(), max: seq, before: 0 });
+            if runs.len() > RUNS_KEPT {
+                runs.remove(0);
+            }
+            return Some(true);
+        };
+        let last_run = i + 1 == runs.len();
+        let mark = &mut runs[i];
+        if seq > mark.max {
+            let step = seq - mark.max;
+            mark.before = if step > 64 { 0 } else { mark.before.checked_shl(step as u32).unwrap_or(0) | (1 << (step - 1)) };
+            mark.max = seq;
+            return Some(last_run);
         }
-        reports.insert(node.to_string(), (boot.to_string(), seq));
-        true
+        // one that was overtaken on its way: new unless it is among the 64 before the highest
+        let back = mark.max - seq;
+        if back == 0 || back > 64 || mark.before & (1 << (back - 1)) != 0 {
+            return None;
+        }
+        mark.before |= 1 << (back - 1);
+        Some(false)
+    }
+
+    /// Is report `seq` of run `boot` new here?
+    pub fn fresh_report(&self, node: &str, boot: &str, seq: u64) -> bool {
+        self.mark_report(node, boot, seq).is_some()
+    }
+
+    /// The marks of [`Fleet::mark_report`], to outlive this process.
+    pub fn report_marks(&self) -> Value {
+        serde_json::to_value(&*self.reports.lock().unwrap()).unwrap_or_default()
+    }
+
+    pub fn restore_report_marks(&self, marks: Value) {
+        if let Ok(marks) = serde_json::from_value(marks) {
+            *self.reports.lock().unwrap() = marks;
+        }
+    }
+
+    /// A report of a node came by way of another peer: the node was there
+    /// when it made it, running configuration `version`.
+    pub fn heard(&self, node: &str, version: &str, build: &str, role: &str) {
+        let mut peers = self.peers.lock().unwrap();
+        let peer = peers.entry(node.to_string()).or_default();
+        (peer.version, peer.build) = (version.to_string(), build.to_string());
+        if !role.is_empty() || peer.role.is_empty() {
+            peer.role = if role.is_empty() { "peer" } else { role }.to_string();
+        }
+        (peer.heard, peer.seen_at) = (Some(Instant::now()), crate::store::now());
+    }
+
+    /// Whether this node says what `node` cannot write itself (its allowance
+    /// and reachability, see [`publish_limits`]): an accelerate node keeps no
+    /// configuration, the peer it reports to speaks for it.
+    pub fn speaks_for(&self, node: &str) -> bool {
+        self.peers.lock().unwrap().get(node).is_some_and(|p| p.role == "accelerate" && p.direct())
     }
 
     pub fn set_usage(&self, node: &str, usage: Usage) {
@@ -246,7 +320,8 @@ pub async fn publish_limits(store: Arc<Store>, fleet: Arc<Fleet>, limits: Arc<Li
                 tracing::warn!("cannot record self node telemetry: {e:?}");
             }
         }
-        // Compat: absorb any peer telemetry reported only via legacy POST /replication/report.
+        // An accelerate node writes nothing itself: the peer it reports to says where it stands
+        // (a peer says it itself, above; several writers of one node's state would undo each other).
         let mut limited = fleet.limited(limits.own());
         limited.retain(|name, _| known.contains(name) && *name != own_name);
         let mut offload = fleet.offloads(limits.own_offload());
@@ -254,7 +329,7 @@ pub async fn publish_limits(store: Arc<Store>, fleet: Arc<Fleet>, limits: Arc<Li
         let mut gfw_map = fleet.gfw_statuses((own_name.clone(), gfw.get()));
         gfw_map.retain(|name, _| known.contains(name) && *name != own_name);
         for name in known {
-            if name == own_name {
+            if name == own_name || !fleet.speaks_for(&name) {
                 continue;
             }
             let st = limited.get(&name).copied().unwrap_or(State::Ok);
@@ -302,6 +377,19 @@ mod tests {
         assert!(fleet.fresh_report("eu", "boot-a", 1));
         assert!(fleet.fresh_report("eu", "boot-c", 0), "a restarted replica starts over");
         assert!(fleet.fresh_report("us", "boot-a", 0), "reports are tracked per replica");
+        // by another way and out of order, each still counts once
+        assert_eq!((fleet.mark_report("us", "boot-a", 3), fleet.mark_report("us", "boot-a", 1)), (Some(true), Some(false)));
+        assert_eq!((fleet.mark_report("us", "boot-a", 1), fleet.mark_report("us", "boot-a", 3)), (None, None));
+        assert_eq!((fleet.mark_report("us", "boot-a", 4), fleet.mark_report("us", "boot-a", 2)), (Some(true), Some(false)));
+        // far ahead: what lies more than 64 back counts as taken
+        assert_eq!(fleet.mark_report("us", "boot-a", 200), Some(true));
+        assert_eq!((fleet.mark_report("us", "boot-a", 100), fleet.mark_report("us", "boot-a", 136)), (None, Some(false)));
+        // the node started again: a late report of the run before is not its latest
+        assert_eq!((fleet.mark_report("us", "boot-b", 0), fleet.mark_report("us", "boot-a", 201)), (Some(true), Some(false)));
+        // the marks outlive the process
+        let again = Fleet::default();
+        again.restore_report_marks(fleet.report_marks());
+        assert_eq!((again.mark_report("us", "boot-a", 201), again.mark_report("us", "boot-b", 0), again.mark_report("us", "boot-b", 1)), (None, None, Some(true)));
         let status = fleet.status("eu", "v2").unwrap();
         assert_eq!((status["in_sync"].as_bool(), status["online"].as_bool()), (Some(true), Some(true)));
         assert!(fleet.status("au", "v2").is_none());

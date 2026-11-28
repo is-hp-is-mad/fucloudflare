@@ -35,6 +35,8 @@ pub struct ApiState {
     pub panel_host: Option<String>,
     pub health: Arc<crate::geo::Health>,
     pub fleet: Arc<crate::fleet::Fleet>,
+    /// The reports of the nodes, taken here and kept for the peers.
+    pub reports: Arc<crate::reports::Reports>,
     pub limits: Arc<crate::limits::Limits>,
     /// This node's public addresses and, if given, its name.
     pub edge_ips: Vec<std::net::IpAddr>,
@@ -62,6 +64,12 @@ pub struct ApiState {
 }
 
 impl ApiState {
+    /// What peers sync with this node beyond the configuration and the accounts.
+    fn synced(&self) -> Vec<Arc<dyn crate::sync::SyncProvider>> {
+        let reports = (!self.role.is_accelerate()).then(|| self.reports.clone() as Arc<dyn crate::sync::SyncProvider>);
+        self.providers.iter().cloned().chain(reports).collect()
+    }
+
     /// The name of the node this process runs on.
     fn node(&self) -> String {
         crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.as_deref())
@@ -2604,7 +2612,10 @@ async fn replication_sync(State(st): St, headers: axum::http::HeaderMap, Query(q
     let mut domains_out: Vec<crate::sync::DomainDelta> = Vec::new();
     if let Some(dom_json) = q.get("domains") {
         if let Ok(cursors) = serde_json::from_str::<HashMap<String, (String, u64)>>(dom_json) {
-            for p in st.providers.iter().cloned() {
+            for p in st.synced() {
+                if p.passive() && !cursors.contains_key(p.domain()) {
+                    continue;
+                }
                 let (ep, since) = cursors.get(p.domain()).map(|(e, r)| (Some(e.clone()), *r)).unwrap_or((None, 0));
                 if p.current_rev() > since || ep.as_deref() != Some(p.epoch().as_str()) {
                     let delta = tokio::task::spawn_blocking(move || p.export_since(since, ep.as_deref()))
@@ -2702,16 +2713,22 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
             st.fleet.set_role(&peer_node, &req.role);
         }
         if let Some(tele) = req.telemetry {
-            if let Some(usage) = tele.usage {
-                st.fleet.set_usage(&peer_node, usage);
-            }
-            if !tele.status.is_null() {
-                st.fleet.set_status(&peer_node, tele.status);
-            }
-            if st.fleet.fresh_report(&peer_node, &tele.boot, tele.seq) {
-                st.stats.absorb(&peer_node, &tele.stats);
-                st.waf.absorb(&peer_node, tele.events);
-            }
+            st.reports.take(
+                crate::reports::Report {
+                    node: peer_node.clone(),
+                    role: req.role.clone(),
+                    version: req.version.clone(),
+                    build: req.build.clone(),
+                    boot: tele.boot,
+                    seq: tele.seq,
+                    at: 0,
+                    stats: tele.stats,
+                    events: tele.events,
+                    usage: tele.usage,
+                    status: tele.status,
+                },
+                true,
+            );
         }
     }
 
@@ -2724,7 +2741,7 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
         adopted |= accounts_blocking(&st, move |accounts| accounts.merge_delta(&acc, &clk).map_err(bad)).await?;
     }
     for d in req.domains {
-        if let Some(p) = st.providers.iter().find(|p| p.domain() == d.domain).cloned() {
+        if let Some(p) = st.synced().into_iter().find(|p| p.domain() == d.domain) {
             let clk = clock.clone();
             adopted |= tokio::task::spawn_blocking(move || p.merge_delta(&d, &clk))
                 .await
@@ -2830,17 +2847,22 @@ async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
         return Err(bad("'node' must be the name of the reporting node"));
     }
     st.fleet.seen(&node, &report.version, &report.build);
-    if let Some(usage) = report.usage {
-        st.fleet.set_usage(&node, usage);
-    }
-    if !report.status.is_null() {
-        st.fleet.set_status(&node, report.status);
-    }
-    let fresh = st.fleet.fresh_report(&node, &report.boot, report.seq);
-    if fresh {
-        st.stats.absorb(&node, &report.stats);
-        st.waf.absorb(&node, report.events);
-    }
+    let fresh = st.reports.take(
+        crate::reports::Report {
+            role: st.fleet.role(&node),
+            node,
+            version: report.version,
+            build: report.build,
+            boot: report.boot,
+            seq: report.seq,
+            at: 0,
+            stats: report.stats,
+            events: report.events,
+            usage: report.usage,
+            status: report.status,
+        },
+        true,
+    );
     ok(json!({ "accepted": fresh, "version": st.store.version() }))
 }
 
@@ -3008,6 +3030,7 @@ mod tests {
             front: None,
         });
         Arc::new(ApiState {
+            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), || "au".to_string())),
             store,
             token: "test-token".into(),
             cache,

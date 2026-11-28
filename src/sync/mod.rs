@@ -71,6 +71,11 @@ pub trait SyncProvider: Send + Sync + 'static {
     fn epoch(&self) -> String;
     fn export_since(&self, since_rev: u64, peer_epoch: Option<&str>) -> Result<DomainDelta, String>;
     fn merge_delta(&self, delta: &DomainDelta, clock: &HlcClock) -> Result<bool, String>;
+    /// Handed out only to a peer that asks for the domain by name, and never
+    /// pushed: a build that does not know it is not sent it over and over.
+    fn passive(&self) -> bool {
+        false
+    }
 }
 
 /// Normalize a peer specification (bare hostname -> `https://<host>`, or full `http(s)://host:port`).
@@ -109,6 +114,8 @@ pub struct PeerSync {
     pub updater: Arc<Updater>,
     pub info: Arc<NodeInfo>,
     pub polled: Arc<AtomicBool>,
+    /// Where this node's reports are kept for the peers (not on accelerate nodes).
+    pub reports: std::sync::OnceLock<Arc<crate::reports::Reports>>,
     /// Extra extensible domain providers (M2 KV / D1).
     pub providers: std::sync::RwLock<Vec<Arc<dyn SyncProvider>>>,
     cursors: Mutex<Vec<PeerCursor>>,
@@ -152,6 +159,7 @@ impl PeerSync {
             updater,
             info,
             polled,
+            reports: Default::default(),
             providers: std::sync::RwLock::new(Vec::new()),
             cursors: Mutex::new((0..n).map(|_| PeerCursor::default()).collect()),
             push_notify: Arc::new(Notify::new()),
@@ -270,6 +278,11 @@ impl PeerSync {
                 utf8_percent_encode(&submission, NON_ALPHANUMERIC),
                 rejected.join(",")
             );
+        }
+        // what is handed out only when asked for is asked for by name
+        let mut domain_cursors = domain_cursors;
+        for p in self.providers.read().unwrap().iter().filter(|p| p.passive()) {
+            domain_cursors.entry(p.domain().to_string()).or_default();
         }
         if !domain_cursors.is_empty() || !self.providers.read().unwrap().is_empty() {
             let encoded = serde_json::to_string(&domain_cursors).unwrap_or_default();
@@ -391,7 +404,7 @@ impl PeerSync {
                 acc_delta = Some(d);
             }
             let providers = self.providers.read().unwrap().clone();
-            for p in providers {
+            for p in providers.into_iter().filter(|p| !p.passive()) {
                 let since = last_doms.get(p.domain()).copied().unwrap_or(0);
                 if p.current_rev() > since {
                     let dom = p.domain().to_string();
@@ -473,12 +486,21 @@ impl PeerSync {
         let payload = json!({
             "boot": self.boot_id,
             "seq": seq,
+            "at": crate::edge::stats::now_secs(),
             "stats": &stats,
             "events": &events,
             "usage": &usage,
             "status": status,
         });
         Some((payload, Some((stats, events)), usage))
+    }
+
+    /// This node's report as the peers keep it.
+    fn report(&self, payload: &Value) -> crate::reports::Report {
+        let mut report: crate::reports::Report = serde_json::from_value(payload.clone()).unwrap_or_default();
+        (report.node, report.role) = (self.node(), self.role.as_str().to_string());
+        (report.version, report.build) = (self.store.version(), env!("CARGO_PKG_VERSION").to_string());
+        report
     }
 
     async fn push_all(&self, include_telemetry: bool) {
@@ -493,7 +515,12 @@ impl PeerSync {
             futs.push(self.push_peer(idx, tele_val));
         }
         let results = futures_join_all(futs).await;
-        let any_ok = results.iter().any(Result::is_ok);
+        // a peer keeps its report for the others to fetch (see crate::reports): told, once it is kept
+        let kept = match (self.reports.get(), &tele) {
+            (Some(reports), Some((payload, _, _))) => reports.own(self.report(payload)),
+            _ => false,
+        };
+        let any_ok = kept || results.iter().any(Result::is_ok);
         if let Some((_, raw, usage)) = tele {
             if any_ok {
                 self.report_seq.fetch_add(1, Ordering::Relaxed);
