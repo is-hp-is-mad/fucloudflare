@@ -991,7 +991,7 @@ const ZONE = {
         setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) +
       card("访客客户端证书（mTLS）", "", setRow("只接受带有效证书的访客", "开启后，没有出示有效客户端证书的请求一律 403（经 HTTP、HTTP/3 前置或任何其他入口都一样）。证书由节点的 <code>--mtls-ca</code> 指定的 CA 签发；节点没配 <code>--mtls-ca</code> 时不会向访客要证书，开启等于全部拒绝。规则里可用 <code>cf.tls_client_auth.cert_verified</code>。",
         sel("mtls", s.mtls || "off", [["off", "关闭"], ["on", "开启：无有效证书 403"]], "访客客户端证书"))) +
-      await originCaCard(z) + await originHealthCard(z) + await ruleSection(z.id, "cert") };
+      await customHostCard(z) + await originCaCard(z) + await originHealthCard(z) + await ruleSection(z.id, "cert") };
   },
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
@@ -1128,6 +1128,27 @@ async function viewZone() {
 const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
 const agoText = s => (Number(s) > 0 ? dur(s) + "前" : "刚刚");
 // GET /zones/{id}/origin_ca: { present, certificate, common_name, created_on, expires_on }; never the CA's key.
+// GET /zones/{id}/custom_hostnames: other people's names served as this zone (SSL for SaaS)
+async function customHostCard(z) {
+  if (z.type === "cert") return "";
+  const r = await api("GET", `/zones/${z.id}/custom_hostnames`).catch(e => ({ error: e.message }));
+  const list = C.customHosts = Array.isArray(r) ? r.filter(isObj) : [];
+  const write = me.role !== "viewer";
+  const state = h => h.status === "active" ? '<span class="st ok">已生效</span>'
+    : h.status === "failed" ? `<span class="st bad">签发失败</span>${h.next_attempt ? `<span class="sub">${when(h.next_attempt)} 后重试</span>` : ""}`
+    : h.seen_at ? '<span class="st warn">签发中</span>' : '<span class="st">等待首次访问</span>';
+  const dcv = h => isObj(h.dcv_delegation)
+    ? `<code>${esc(h.dcv_delegation.name)}</code><span class="sub">CNAME → <code>${esc(h.dcv_delegation.content)}</code></span>` : '<span class="hint">—</span>';
+  const intro = `<p class="hint" style="padding:0 16px">把别人的域名（例如你的 SaaS 客户的 <code>shop.example.net</code>）当作 ${esc(z.name)} 来服务：防火墙、规则和缓存都按本域名生效，缓存按各自主机名分开。名字的所有者要加两条记录：主机名本身 CNAME 到“指向”一栏，以及验证用的 <code>_acme-challenge</code> CNAME。有人访问之后才会申请证书；只有那条 <code>_acme-challenge</code> 指向本条目时 CA 才会验证通过。</p>`;
+  const empty = isObj(r) && typeof r.error === "string" ? `<b>读不到自定义主机名</b>${esc(r.error)}` : "<b>还没有自定义主机名</b>";
+  return card("自定义主机名", write ? btn("customHostEdit", "添加", {}, "pri") : "", intro + table([
+    { label: "主机名", fmt: h => `<b>${esc(h.hostname)}</b>${h.error ? `<span class="sub">${esc(h.error)}</span>` : ""}` },
+    { label: "状态", fmt: state },
+    { label: "指向", fmt: h => `<code>${esc(h.cname_target || z.name)}</code>` },
+    { label: "验证记录", fmt: dcv },
+    { label: "证书到期", fmt: h => h.expires_on ? when(h.expires_on) : '<span class="hint">—</span>' },
+  ], list, write ? h => rowActs("customHostEdit", "customHostDel", { id: h.id }) : null, empty));
+}
 async function originCaCard(z) {
   const r = await api("GET", `/zones/${z.id}/origin_ca`).catch(e => ({ error: e.message }));
   const write = me.role !== "viewer";
@@ -1891,6 +1912,16 @@ const A = {
         setTimeout(() => signedBox(r), 50);
       });
   },
+  customHostEdit: d => {
+    const h = byId("customHosts", d.id), name = (C.zone && C.zone.name) || "";
+    const origin = { k: "custom_origin_server", label: "回源主机", hint: `${name} 下一个开启了代理的主机名，请求按它的记录回源；留空为 ${name} 本身` };
+    const fields = d.id ? [{ type: "html", html: `<p class="hint">主机名 <b>${esc(h.hostname)}</b> 不能修改；要换名字请删除后重新添加。</p>` }, origin]
+      : [{ k: "hostname", label: "主机名", hint: "别人的公共域名，如 shop.example.net；不能是 IP、通配符，也不能是本平台任何域名或其上下级" }, origin];
+    openForm((d.id ? "编辑" : "添加") + " · 自定义主机名", fields, h,
+      v => d.id ? api("PATCH", `/zones/${S.zone}/custom_hostnames/${d.id}`, { custom_origin_server: v.custom_origin_server })
+        : api("POST", `/zones/${S.zone}/custom_hostnames`, v));
+  },
+  customHostDel: d => del(`/zones/${S.zone}/custom_hostnames/${d.id}`, `自定义主机名“${byId("customHosts", d.id).hostname || ""}”（证书随之删除）`),
   originCaDel: async () => {
     if (!(await confirmBox("删除源站 CA？", "CA 私钥随之删除，之后只能新建一个；已签发的证书不会链到新的 CA。"))) return;
     await api("DELETE", `/zones/${S.zone}/origin_ca`); toast("已删除"); render();

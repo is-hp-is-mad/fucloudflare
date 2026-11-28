@@ -1260,7 +1260,7 @@ pub(crate) async fn open_upstream_websocket(
             format!("{base_path}{pq}")
         };
         (target, joined)
-    } else if let Some(zone) = snap.find_zone(&host).filter(|z| Edge::serves(z, &host)) {
+    } else if let Some(zone) = snap.edge_zone(&host) {
         let info = ReqInfo {
             ip: Some(ip),
             ssl,
@@ -1887,7 +1887,7 @@ impl Edge {
             ..Default::default()
         };
 
-        let resp = match snap.find_zone(&host).filter(|z| Self::serves(z, &host)) {
+        let resp = match snap.edge_zone(&host) {
             Some(zone) => {
                 let out = Outgoing { info, headers: map, body: ReqBody::Buffered(body), on_upgrade: None, grpc: false, refresh: false };
                 self.fetch(snap, zone, out).await.map_err(|e| format!("{} {}: {}", e.status, e.title, e.detail))?
@@ -2066,7 +2066,7 @@ impl Edge {
             {
                 return proxy::forward(&self, &rule, ip, ssl, &host, req).await;
             }
-            if let Some(zone) = snap_cgi.find_zone(&host).filter(|z| Self::serves(z, &host)) {
+            if let Some(zone) = snap_cgi.edge_zone(&host) {
                 let path = req.uri().path().to_string();
                 if let Some(route) = zone.routes.iter().find(|r| r.matches(&host, &path)) {
                     if let Some(script_name) = &route.script {
@@ -2181,13 +2181,14 @@ impl Edge {
             return proxy::forward(&self, &rule, ip, ssl, &host, req).await;
         }
 
-        let Some(zone) = snap.find_zone(&host).filter(|z| Self::serves(z, &host)) else {
+        let Some(zone) = snap.edge_zone(&host) else {
             if snap.find_zone(&host).is_some_and(|z| z.is_decoy(&host)) {
                 return Err(EdgeError::hang_up(format!("{host} is a decoy name")));
             }
             if let Some(rule) = proxy::match_fallback(&snap.local_proxy_rules, node_name, listener.as_ref(), &host, req.uri().path()).cloned() {
                 return proxy::forward(&self, &rule, ip, ssl, &host, req).await;
             }
+            crate::custom_hostnames::saw(&self.store, &snap, &host);
             return Err(EdgeError::new(404, "Unknown host", "this host name is not proxied by this edge"));
         };
         let settings = &zone.zone.settings;
@@ -2997,7 +2998,7 @@ async fn serve_with_options(
                         res.warm_sni(name).await;
                     }
                     let http2 = sni
-                        .and_then(|name| edge.store.snapshot().find_zone(&name).map(|z| z.zone.settings.http2))
+                        .and_then(|name| edge.store.snapshot().host_zone(&name).map(|z| z.zone.settings.http2))
                         .unwrap_or(true);
                     let config = if http2 { both } else { h1_only };
                     // from here the handshake waits for the visitor once: one round trip

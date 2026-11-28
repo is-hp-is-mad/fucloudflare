@@ -100,7 +100,7 @@
 3. **Early Hints (103)**：hyper 高层 API 大概率发不出 1xx 中间响应。先查 hyper 1.x 是否有支持；没有就**不实现**，改而在文档说明，并支持在响应里按配置注入 `Link: rel=preload` 头作为替代。
 4. **图片缩放 `/cdn-cgi/image/`**：可加依赖 `image`（纯 Rust，musl 安全）。`/cdn-cgi/image/<options>/<原始路径>` 端点：内部回源取图，按 options 子集（`width`/`height`/`fit`/`quality`/`format`）缩放/转码后输出；结果进缓存（键含 options）。入口参照 `src/edge/cgi.rs` 里现有 `/cdn-cgi/` 路由的写法。不支持的效果忽略而不是报错。
 
-### [ ] N10 自定义主机名（SSL for SaaS）
+### [x] N10 自定义主机名（SSL for SaaS）
 
 - 场景：别人的域名 CNAME 到本机群用户的域名，我们自动给它签证书。
 - 数据：新 item 类型照抄 `src/items.rs` 现有任一类型：`custom_hostname`，字段 `hostname`、`status`（`pending`/`active`/`failed`）、`verify_txt`（给用户拿去验证所有权的 TXT 值）。
@@ -182,3 +182,9 @@
 - n9.3 发不了 103（hyper 1.x 服务端不支持 1xx），改成区域设置 `early_hints_links`，给 HTML 200 应答加 `Link` 头，只认 preload / preconnect 两种写法，最多 16 条。
 - n9.4 图片缩放 `/cdn-cgi/image/<参数>/<路径>`（`image_resizing`，默认关，image =0.25.10 只开 jpeg/png/webp，纯 Rust），原图走完整管道、只限本主机名，输入 16 MiB / 5000 万像素 / 输出每边 4096 封顶，每节点同时两张；结果按原图内容和参数缓存；`format=auto` 不按 Accept 协商，WebP 只能无损输出。
 - 留待能跑的人：滚动升级时旧节点会丢新设置字段；缩放结果按原图完整 TTL 缓存；开了缩放后针对 `/cdn-cgi/image/` 路径写的规则看到的是原图路径；单张 5000 万像素约占 200 MB 内存。
+
+### N10
+- 自定义主机名在 `src/custom_hostnames.rs`；边缘只在 `Snapshot::edge_zone/host_zone` 一处按 Host/SNI 找区域，`records_for` 会把自定义主机名换成回源主机，缓存键仍按自定义主机名分开。名称不能是本机群任何区域、其上下级或已被别的区域占用的自定义主机名（409 不说是谁的），每区域最多 100 个，创建后不能改名。
+- 所有权：不做对外 DNS 查询，只用 DNS-01，应答只发布在 `_acme-challenge.<verify_txt>.<区域>`（partial 区域再加 `.<cname-base>`）；所有者把 `_acme-challenge.<主机名>` CNAME 过来，CA 顺着去查。访客的握手或请求只用来触发签发，证明靠 CA 验证。`fresh` 会撤销 CA 记得的旧授权，防止跨区域复用。复用的是 `src/acme.rs` 的机群管线（`issue_fleet`），不是 `site_acme.rs`，因为后者只在本节点应答挑战。
+- 签发：未知 SNI 只是一次 HashMap 查不到，不写任何东西；`pending` 必须由所有者创建并有过访客才下单；按主机名退避（10 分钟起翻倍，最长 1 天），每区域每小时 10 次、全机群每小时 30 次、每轮 3 个，只在持有 ACME 租约的节点上跑（`issue_due`）。
+- 留待能跑的人：纯加速节点和 HTTP/3 的首次访问不会记下；之后新建的区域若在该名称上或其上级会悄悄接管；两个节点同时接受同一名称时只用较早的那个；Waiting Room 和 Worker 路由不匹配自定义主机名；CA 还记得授权时续期会先失败一次再退避。

@@ -747,6 +747,79 @@ curl -s -X POST $BASE/zones/$ZONE/origin_ca/sign -H "Authorization: Bearer $TOKE
   -d '{"hostnames": ["example.com", "*.example.com"], "days": 365}'
 ```
 
+#### Custom hostnames (SSL for SaaS)
+
+```
+GET    /zones/{id}/custom_hostnames
+POST   /zones/{id}/custom_hostnames          {"hostname": "shop.example.net", "custom_origin_server": "app.example.com"}
+GET    /zones/{id}/custom_hostnames/{id}
+PATCH  /zones/{id}/custom_hostnames/{id}     {"custom_origin_server": ...}: the only thing that changes
+DELETE /zones/{id}/custom_hostnames/{id}
+```
+
+A custom hostname is a name that belongs to somebody else (a customer of a SaaS that runs on this
+zone) served as this zone, with a certificate the fleet obtains for it. Requests for it go through the
+zone's own pipeline: its firewall, rules, cache and settings apply, `http.host` is the
+custom hostname, and cache entries are kept per host name. They reach the origin of
+`custom_origin_server`, a host of the zone with a proxied record (empty: the zone apex), with the
+custom hostname as `Host`. The token permission is `SSL and Certificates Read` / `Write`.
+
+`hostname` is lowercased and stored without a trailing dot. It is refused (400) when it is not a public
+DNS name a CA could certify: empty, longer than 253 characters, an IP address, a wildcard, non-ASCII
+(use the `xn--` form), a reserved or private name (`.test`, `.local`, a single label, ...). It is refused
+(409) when it is a zone of this fleet, a name below one or above one, whoever owns that zone; when it
+is already a custom hostname of any zone; or when it is a name the fleet keeps for itself. It cannot be
+renamed: delete it and create the new name. A zone has at most 100. Certificate-only zones have none,
+and a zone whose DNS is hosted elsewhere has none unless the fleet has a `--cname-base` (see below).
+
+Everything else in the answer is the server's and is ignored in a request body:
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `pending`, `active` or `failed` |
+| `verify_txt` | a random label made for this custom hostname; part of its DCV delegation |
+| `dcv_delegation` | `{"type": "CNAME", "name": "_acme-challenge.<hostname>", "content": "_acme-challenge.<verify_txt>.<zone>"}` (zone hosted elsewhere: `_acme-challenge.<verify_txt>.<zone>.<cname base>`); `null` when the fleet could not answer it |
+| `cname_target` | where the owner points the name itself (`custom_origin_server`, or the zone) |
+| `seen_at` | when a visitor first asked for it |
+| `error`, `attempts`, `last_attempt`, `next_attempt` | the last failure and when the next order may start |
+| `issued_on`, `expires_on`, `certificate` | the certificate in use; its private key is never answered |
+
+The name's owner adds two records at their DNS: the name itself as a CNAME to `cname_target` (or an
+address of the fleet), and `dcv_delegation`. The second one is the proof. The fleet makes no DNS
+lookups of its own, and it cannot see other people's DNS; it orders the certificate with a DNS-01
+challenge whose answer it publishes only at the delegation target of this one custom hostname. The CA
+follows the owner's CNAME, so it validates only when the owner pointed the delegation at this zone's
+custom hostname. HTTP-01 and TLS-ALPN-01 are never used for custom hostnames: they would only show that
+the name reaches some node of the fleet, which is just as true when it points at another user's zone.
+Authorizations the CA remembers from an earlier order are withdrawn, and the attempt fails, so that a
+name proven for one zone never hands its certificate to another one.
+
+Status changes:
+
+- `pending`: created. Nothing is ordered until a visitor asks for it (a TLS handshake with its server
+  name, or an HTTP request with its Host, at any node but an accelerate one), which shows that the
+  name points here. A name that is not a created custom hostname never leads to an order, and never
+  writes anything.
+- `pending` or `failed` → `active`: the CA validated the delegation and issued. The name is served from
+  then on.
+- `pending` or `failed` → `failed`: the order failed (for example, no delegation yet); `error` says why.
+  It is tried again after 10 minutes, doubling up to a day. A `failed` custom hostname is not served.
+- `active`: renewed in the last third of the certificate's lifetime, whether or not anybody visits. A
+  failed renewal keeps the certificate and the status, with the reason in `error`.
+
+Orders are limited to 10 per zone and 30 for the whole fleet per hour (renewals included), and to 3
+per pass (every minute and on every configuration change), one after the other, on the node holding
+the fleet's ACME lease. When two nodes accept the same name for two zones at the same moment, the
+older custom hostname keeps it on every node and the other one is neither served nor ordered. A zone created later at or above the name takes it over: the custom hostname is then
+neither served nor renewed. Deleting a custom hostname, or its zone, deletes its certificate.
+
+```sh
+curl -s -X POST $BASE/zones/$ZONE/custom_hostnames -H "Authorization: Bearer $TOKEN" \
+  -d '{"hostname": "shop.example.net", "custom_origin_server": "app.example.com"}'
+# answer: "dcv_delegation": {"type": "CNAME", "name": "_acme-challenge.shop.example.net",
+#                            "content": "_acme-challenge.0f3c...e9.example.com"}
+```
+
 #### Key exchange
 
 Every TLS configuration of the process (the HTTPS and HTTP/3 listeners, origin pulls, ACME and the

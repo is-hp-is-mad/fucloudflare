@@ -202,7 +202,7 @@ pub(super) async fn apply(edge: &Edge, resp: Response<Body>, browser: bool, zone
     let Some(&kind) = resp.extensions().get::<Kind>() else { return resp };
     let Some((zone_id, host)) = zone.filter(|_| browser) else { return resp };
     let snap = edge.store.snapshot();
-    let template = snap.find_zone(host).filter(|z| z.zone.id == zone_id).and_then(|z| z.zone.settings.error_pages.get(kind));
+    let template = snap.host_zone(host).filter(|z| z.zone.id == zone_id).and_then(|z| z.zone.settings.error_pages.get(kind));
     let Some(template) = template else { return resp };
     let (mut parts, body) = resp.into_parts();
     // the edge's pages are whole in memory: this does not wait on anything

@@ -3042,3 +3042,53 @@ async fn a_chunked_object_without_a_validator_is_fetched_whole_when_a_chunk_is_g
     assert_eq!(ranges_asked(path), [format!("{path} bytes=0-9 -")], "the visitor's own range");
     assert!(video_entry(&env, path).await.is_none());
 }
+
+#[tokio::test]
+async fn an_active_custom_hostname_is_served_as_its_zone_with_its_own_host_and_cache() {
+    use crate::custom_hostnames::{CustomHostname, ACTIVE};
+    let env = setup().await;
+    let h = env.store.save_item::<CustomHostname>(&env.zone, None, json!({ "hostname": "store.example.net", "custom_origin_server": "www.example.com" }), true).unwrap();
+    let get_item = || env.store.item::<CustomHostname>(&env.zone, &h.meta.id).unwrap();
+
+    // pending: not served; the request is noted as its first visitor, a name nobody created is not
+    let version = env.store.version();
+    assert_eq!(get(&env, "other.example.net", "/").await.status, 404);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(env.store.version(), version, "nothing written for an unknown name");
+    assert_eq!(get(&env, "store.example.net", "/").await.status, 404);
+    for _ in 0..100 {
+        if get_item().seen_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(get_item().seen_at.is_some());
+    assert_eq!(env.hits.load(Ordering::SeqCst), 0);
+
+    // active (as when its certificate arrived): the zone serves it under its own name
+    env.store
+        .update_item_async::<CustomHostname, _>(&env.zone, &h.meta.id, |h| {
+            h.status = ACTIVE.into();
+            true
+        })
+        .await
+        .unwrap();
+    let r = get(&env, "store.example.net", "/hello").await;
+    assert!(r.status == 200 && r.body.contains("GET /hello host=store.example.net"), "{}", r.body);
+
+    // the zone's firewall applies to it, and can tell it apart
+    let block = json!({ "expression": "http.host eq \"store.example.net\" and http.request.uri.path eq \"/admin\"", "action": "block" });
+    env.store.save_item::<FirewallRule>(&env.zone, None, block, true).unwrap();
+    assert_eq!(get(&env, "store.example.net", "/admin").await.status, 403);
+    assert_eq!(get(&env, "www.example.com", "/admin").await.status, 200);
+
+    // the zone's cache, with keys of its own
+    assert_eq!(get(&env, "store.example.net", "/assets/app.js").await.header("fcf-cache-status"), Some("MISS"));
+    assert_eq!(get(&env, "store.example.net", "/assets/app.js").await.header("fcf-cache-status"), Some("HIT"));
+    assert_eq!(get(&env, "www.example.com", "/assets/app.js").await.header("fcf-cache-status"), Some("MISS"));
+
+    // names around it are not served, and deleting it ends it
+    assert_eq!(get(&env, "x.store.example.net", "/").await.status, 404);
+    env.store.delete_item::<CustomHostname>(&env.zone, &h.meta.id).unwrap();
+    assert_eq!(get(&env, "store.example.net", "/hello").await.status, 404);
+}

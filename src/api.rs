@@ -228,6 +228,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/zones/{zone_id}/logs/requests", get(request_log))
         .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
         .merge(crud::<crate::edge::waiting::WaitingRoom>("/zones/{zone_id}/waiting_rooms"))
+        .merge(custom_hostname_routes())
         .route("/zones/{zone_id}/origins/health", get(origin_health))
         .route("/zones/{zone_id}/dns_analytics", get(dns_analytics))
         .route("/zones/{zone_id}/analytics", get(analytics))
@@ -2044,6 +2045,43 @@ async fn patch_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, S
 async fn delete_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
     st.store.delete_item_async::<T>(&zone_id, &id).await?;
     ok(json!({ "id": id }))
+}
+
+// ---------------------------------------------------- custom hostnames ----
+
+// The generic item routes, except that every answer carries the DCV
+// delegation its owner has to add (crate::custom_hostnames::view), a zone
+// whose DNS this fleet could not answer gets none, and there is no PUT (a
+// replace could only set what a PATCH sets).
+fn custom_hostname_routes() -> Router<Arc<ApiState>> {
+    let path = "/zones/{zone_id}/custom_hostnames";
+    Router::new()
+        .route(path, get(list_custom_hostnames).post(create_custom_hostname))
+        .route(&format!("{path}/{{item_id}}"), get(get_custom_hostname).patch(patch_custom_hostname).delete(delete_item::<crate::custom_hostnames::CustomHostname>))
+}
+
+async fn list_custom_hostnames(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    let items = st.store.items::<crate::custom_hostnames::CustomHostname>(&zone_id)?;
+    paginated(items.iter().map(|h| crate::custom_hostnames::view(h, &zone, st.cname_base.as_deref())).collect(), &q, 100)
+}
+
+async fn create_custom_hostname(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    crate::custom_hostnames::may_create(&zone, st.cname_base.as_deref()).map_err(bad)?;
+    let h = st.store.save_item_async::<crate::custom_hostnames::CustomHostname>(&zone_id, None, body(&bytes)?, true).await?;
+    ok(crate::custom_hostnames::view(&h, &zone, st.cname_base.as_deref()))
+}
+
+async fn get_custom_hostname(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    ok(crate::custom_hostnames::view(&st.store.item(&zone_id, &id)?, &zone, st.cname_base.as_deref()))
+}
+
+async fn patch_custom_hostname(State(st): St, Path((zone_id, id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    let h = st.store.save_item_async::<crate::custom_hostnames::CustomHostname>(&zone_id, Some(&id), body(&bytes)?, false).await?;
+    ok(crate::custom_hostnames::view(&h, &zone, st.cname_base.as_deref()))
 }
 
 // ------------------------------------------------------------ rulesets ----
@@ -3979,6 +4017,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_hostnames_belong_to_one_zone_of_one_user_and_need_the_ssl_permission() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-custom-hosts-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        for (email, role) in [("admin@example.com", Role::Admin), ("alice@example.com", Role::Editor), ("bob@example.com", Role::Editor), ("viewer@example.com", Role::Viewer)] {
+            st.accounts.create_user(email, role, Some("strong-pass-123"), email, &Client::default()).unwrap();
+        }
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let alice_zone = st.store.create_zone("example.com").unwrap().id;
+        let bob_zone = st.store.create_zone("example.org").unwrap().id;
+        let partial = st.store.create_zone_as("partial.example.net", "partial").unwrap().id;
+        give(&st, &alice_zone, "alice@example.com").await;
+        give(&st, &bob_zone, "bob@example.com").await;
+        let (alice, bob, admin, viewer) = (session("alice@example.com"), session("bob@example.com"), session("admin@example.com"), session("viewer@example.com"));
+        let mut ask = async |bearer: &str, method: &str, path: &str, body: Value| {
+            let body = if body.is_null() { vec![] } else { body.to_string().into_bytes() };
+            let (sc, _, b) = call_raw(&mut app, method, &format!("/client/v4{path}"), vec![("authorization", bearer), ("content-type", "application/json")], body).await;
+            (sc, b)
+        };
+        let hosts = format!("/zones/{alice_zone}/custom_hostnames");
+
+        let (sc, b) = ask(&alice, "POST", &hosts, json!({ "hostname": "Shop.Example.Info", "status": "active", "certificate": "x" })).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let h = json_of(&b)["result"].clone();
+        let id = h["id"].as_str().unwrap().to_string();
+        assert_eq!((h["hostname"].clone(), h["status"].clone(), h.get("certificate")), (json!("shop.example.info"), json!("pending"), None));
+        let token = h["verify_txt"].as_str().unwrap();
+        assert_eq!(h["dcv_delegation"], json!({ "type": "CNAME", "name": "_acme-challenge.shop.example.info", "content": format!("_acme-challenge.{token}.example.com") }));
+        assert!(h.get("private_key").is_none() && h.get("sync").is_none());
+
+        // names: one owner across zones and users, no zone's, nothing that is no public host name
+        for (bearer, path, name, want) in [
+            (&bob, format!("/zones/{bob_zone}/custom_hostnames"), "shop.example.info", StatusCode::CONFLICT),
+            (&alice, hosts.clone(), "www.example.org", StatusCode::CONFLICT),
+            (&alice, hosts.clone(), "a.partial.example.net", StatusCode::CONFLICT),
+            (&alice, hosts.clone(), "example.net", StatusCode::CONFLICT),
+            (&alice, hosts.clone(), "198.51.100.7", StatusCode::BAD_REQUEST),
+            (&alice, hosts.clone(), "*.example.info", StatusCode::BAD_REQUEST),
+            (&alice, hosts.clone(), "shop.test", StatusCode::BAD_REQUEST),
+            (&admin, format!("/zones/{partial}/custom_hostnames"), "p.example.info", StatusCode::BAD_REQUEST),
+        ] {
+            let (sc, b) = ask(bearer, "POST", &path, json!({ "hostname": name })).await;
+            assert_eq!(sc, want, "{name}: {}", String::from_utf8_lossy(&b));
+        }
+        let (sc, _) = ask(&alice, "POST", &hosts, Value::Null).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "no body");
+
+        // PATCH changes the origin only; there is no PUT
+        let (sc, b) = ask(&alice, "PATCH", &format!("{hosts}/{id}"), json!({ "custom_origin_server": "www.example.com", "status": "active", "verify_txt": "mine" })).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!((json_of(&b)["result"]["cname_target"].clone(), json_of(&b)["result"]["status"].clone(), json_of(&b)["result"]["verify_txt"].clone()), (json!("www.example.com"), json!("pending"), json!(token)));
+        let (sc, _) = ask(&alice, "PATCH", &format!("{hosts}/{id}"), json!({ "hostname": "other.example.info" })).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let (sc, _) = ask(&alice, "PUT", &format!("{hosts}/{id}"), json!({ "hostname": "shop.example.info" })).await;
+        assert_eq!(sc, StatusCode::METHOD_NOT_ALLOWED);
+        let (sc, b) = ask(&alice, "GET", &hosts, Value::Null).await;
+        assert_eq!((sc, json_of(&b)["result"].as_array().unwrap().len()), (StatusCode::OK, 1));
+
+        // another user's zone is not there for them, under any id
+        let (sc, _) = ask(&bob, "GET", &hosts, Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        for (method, path) in [("GET", format!("{hosts}/{id}")), ("PATCH", format!("{hosts}/{id}")), ("DELETE", format!("{hosts}/{id}")), ("POST", hosts.clone())] {
+            let (sc, _) = ask(&bob, method, &path, json!({ "hostname": "bob.example.info" })).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        for (method, path) in [("GET", format!("/zones/{bob_zone}/custom_hostnames/{id}")), ("DELETE", format!("/zones/{bob_zone}/custom_hostnames/{id}"))] {
+            let (sc, _) = ask(&bob, method, &path, Value::Null).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "an id of another zone in one's own: {method}");
+        }
+
+        // a viewer of the zone reads and does not write
+        give(&st, &alice_zone, "viewer@example.com").await;
+        let (sc, _) = ask(&viewer, "GET", &hosts, Value::Null).await;
+        assert_eq!(sc, StatusCode::OK);
+        for (method, path) in [("POST", hosts.clone()), ("PATCH", format!("{hosts}/{id}")), ("DELETE", format!("{hosts}/{id}"))] {
+            let (sc, _) = ask(&viewer, method, &path, json!({ "hostname": "v.example.info" })).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN, "{method}");
+        }
+
+        // tokens: the SSL permission, read is not write
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{alice_zone}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let (sc, b) = ask(&admin, "POST", "/user/tokens", spec).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let dns = token("DNS Write").await;
+        let read = token("SSL and Certificates Read").await;
+        let write = token("SSL and Certificates Write").await;
+        let new = json!({ "hostname": "api.example.info" });
+        assert_eq!(ask(&dns, "GET", &hosts, Value::Null).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ask(&read, "GET", &hosts, Value::Null).await.0, StatusCode::OK);
+        assert_eq!(ask(&read, "POST", &hosts, new.clone()).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ask(&write, "GET", &format!("/zones/{bob_zone}/custom_hostnames"), Value::Null).await.0, StatusCode::FORBIDDEN, "another zone");
+        assert_eq!(ask(&write, "POST", &hosts, new).await.0, StatusCode::OK);
+        assert_eq!(ask(&write, "DELETE", &format!("{hosts}/{id}"), Value::Null).await.0, StatusCode::OK);
+        assert_eq!(st.store.items::<crate::custom_hostnames::CustomHostname>(&alice_zone).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn the_request_log_answers_per_zone_and_needs_the_logs_permission() {
         use crate::edge::reqlog::sample;
         let dir = std::env::temp_dir().join(format!("fucf-api-reqlog-{}", uuid::Uuid::new_v4().simple()));
@@ -4978,7 +5125,7 @@ mod tests {
 
         // every kind of zone path answers another user's zone as if it were not there
         let reads = ["", "/dns_records", "/dns_records/export", "/settings", "/settings/ssl", "/dnssec", "/rulesets", "/firewall/rules", "/rate_limits",
-            "/cache_rules", "/workers/routes", "/email", "/email/rules", "/waiting_rooms", "/ssl/certificate_packs", "/custom_certificates",
+            "/cache_rules", "/workers/routes", "/email", "/email/rules", "/waiting_rooms", "/ssl/certificate_packs", "/custom_certificates", "/custom_hostnames",
             "/security/events", "/logs/requests"];
         for path in reads {
             for zone in [&theirs, &unowned] {

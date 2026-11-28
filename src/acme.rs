@@ -75,7 +75,7 @@ fn parse_time(text: &str) -> Option<i64> {
 
 /// Seconds to wait after the `attempts`-th failure in a row: 10 minutes,
 /// doubling up to a day (CAs limit failed validations per name and hour).
-fn backoff(attempts: u32) -> i64 {
+pub(crate) fn backoff(attempts: u32) -> i64 {
     (600i64 << attempts.saturating_sub(1).min(8)).min(86400)
 }
 
@@ -371,12 +371,33 @@ impl Acme {
 
     /// Obtain a certificate for the names of `pack`: `(chain PEM, key PEM)`.
     async fn issue(&self, pack: &CertificatePack) -> Result<(String, String), String> {
+        let zone = self.edge.store.get_zone(&pack.meta.zone_id).map_err(|_| "its zone no longer exists")?;
+        let (method, zone_kind) = (pack.validation_method.clone(), zone.kind);
+        self.issue_fleet(&pack.meta.id, &pack.hosts, false, move |host, wildcard| (challenge_kind(&method, wildcard, &zone_kind), host.to_string())).await
+    }
+
+    /// Obtain a certificate for `hosts`, the challenges answered by the whole
+    /// fleet through its configuration (published under `owner`, the id of
+    /// the pack or custom hostname they are for). `prove` picks, for each name
+    /// to validate and whether it is a wildcard, the challenge type and the
+    /// name its answer is published at (the validated name itself, except for
+    /// a custom hostname's DNS-01 delegation, see crate::custom_hostnames).
+    ///
+    /// `fresh`: every name has to be proven by this order. A CA keeps the
+    /// authorizations it validated for an account for weeks and lets later
+    /// orders of the same account use them; for a name another zone proved
+    /// before, that would hand its certificate to whoever orders it next, so
+    /// such an authorization is withdrawn and the attempt fails (the next one
+    /// gets a new authorization to validate).
+    pub(crate) async fn issue_fleet<F>(&self, owner: &str, hosts: &[String], fresh: bool, prove: F) -> Result<(String, String), String>
+    where
+        F: Fn(&str, bool) -> (&'static str, String) + Send + Sync,
+    {
         let store = &self.edge.store;
-        let zone = store.get_zone(&pack.meta.zone_id).map_err(|_| "its zone no longer exists")?;
         let mut session = self.session().await?;
         let thumbprint = session.thumbprint();
 
-        let identifiers: Vec<Value> = pack.hosts.iter().map(|h| json!({ "type": "dns", "value": h })).collect();
+        let identifiers: Vec<Value> = hosts.iter().map(|h| json!({ "type": "dns", "value": h })).collect();
         let reply = session.post(&session.url("newOrder")?, Some(json!({ "identifiers": identifiers }))).await?;
         let order_url = reply.header("location").ok_or("the CA did not name the order")?;
         let order = reply.json()?;
@@ -387,21 +408,26 @@ impl Acme {
         for authz_url in order["authorizations"].as_array().ok_or("the order lists no authorizations")? {
             let authz_url = text(authz_url, "an authorization URL")?;
             let authz = session.post(&authz_url, None).await?.json()?;
+            if authz["status"] == "valid" && fresh {
+                let host = authz["identifier"]["value"].as_str().unwrap_or("a name").to_string();
+                session.post(&authz_url, Some(json!({ "status": "deactivated" }))).await?;
+                return Err(format!("the CA remembered an earlier validation of {host}; it was withdrawn, the next attempt validates afresh"));
+            }
             if authz["status"] == "valid" {
                 continue; // proven recently, the CA remembers
             }
             let host = text(&authz["identifier"]["value"], "the name to validate")?.to_ascii_lowercase();
-            let kind = challenge_kind(&pack.validation_method, authz["wildcard"] == true, &zone.kind);
+            let (kind, at) = prove(&host, authz["wildcard"] == true);
             let offered = authz["challenges"].as_array().and_then(|list| list.iter().find(|c| c["type"] == kind));
             let challenge = offered.ok_or_else(|| format!("the CA offers no {kind} challenge for {host}"))?;
             let token = text(&challenge["token"], "a challenge token")?;
             if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
                 return Err("the CA sent a malformed challenge token".into());
             }
-            pending.push((authz_url, text(&challenge["url"], "a challenge URL")?, host.clone()));
+            pending.push((authz_url, text(&challenge["url"], "a challenge URL")?, host));
             challenges.push(AcmeChallenge {
-                pack_id: pack.meta.id.clone(),
-                host,
+                pack_id: owner.to_string(),
+                host: at,
                 kind: kind.to_string(),
                 key_authorization: format!("{token}.{thumbprint}"),
                 token,
@@ -410,7 +436,7 @@ impl Acme {
         }
 
         if !challenges.is_empty() {
-            store.set_challenges_async(Some(&pack.meta.id), challenges).await.map_err(|e| format!("cannot publish the challenges: {e:?}"))?;
+            store.set_challenges_async(Some(owner), challenges).await.map_err(|e| format!("cannot publish the challenges: {e:?}"))?;
             self.wait_for_fleet().await;
             for (_, challenge_url, _) in &pending {
                 session.post(challenge_url, Some(json!({}))).await?;
@@ -425,7 +451,7 @@ impl Acme {
         }
 
         // Every name is proven: send the key to certify and collect the result.
-        let hosts = pack.hosts.clone();
+        let hosts = hosts.to_vec();
         let (key_pem, csr_der) = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
             let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
             let mut params = rcgen::CertificateParams::new(hosts).map_err(|e| e.to_string())?;
@@ -553,21 +579,8 @@ impl Acme {
             if !due(&pack, unix_now()) {
                 continue;
             }
-            let claim_ms = crate::sync::clock::unix_ms();
-            let cur_lease = store.acme_lease().unwrap_or_default();
-            if !cur_lease.can_claim(&me, &preferred, claim_ms) {
+            if !self.claim(&me, &preferred, &pack.meta.id).await {
                 return;
-            }
-            let lease = crate::sync::acme_lease::AcmeLease {
-                holder: me.clone(),
-                acquired_ms: claim_ms,
-                expires_ms: claim_ms + crate::sync::acme_lease::LEASE_TTL_MS,
-                pack_id: Some(pack.meta.id.clone()),
-                sync: Default::default(),
-            };
-            let _ = store.set_acme_lease_async(lease).await;
-            if let Some(sync) = &self.sync {
-                sync.push_now_bounded(Duration::from_millis(300)).await;
             }
             let names = pack.hosts.join(", ");
             let names_log = names.clone();
@@ -601,10 +614,38 @@ impl Acme {
             if let Err(e) = updated {
                 tracing::warn!("ACME: cannot record the outcome for {names}: {e:?}");
             }
-            let _ = store.set_acme_lease_async(crate::sync::acme_lease::AcmeLease::default()).await;
-            if let Some(sync) = &self.sync {
-                sync.push_now_bounded(Duration::from_millis(300)).await;
-            }
+            self.release().await;
+        }
+        crate::custom_hostnames::issue_due(self, &me, &preferred).await;
+    }
+
+    /// Take the fleet's ACME lease for one order (`what`: the id of what it
+    /// is for), unless another node holds it; false: leave the work to it.
+    pub(crate) async fn claim(&self, me: &str, preferred: &str, what: &str) -> bool {
+        let store = &self.edge.store;
+        let claim_ms = crate::sync::clock::unix_ms();
+        if !store.acme_lease().unwrap_or_default().can_claim(me, preferred, claim_ms) {
+            return false;
+        }
+        let lease = crate::sync::acme_lease::AcmeLease {
+            holder: me.to_string(),
+            acquired_ms: claim_ms,
+            expires_ms: claim_ms + crate::sync::acme_lease::LEASE_TTL_MS,
+            pack_id: Some(what.to_string()),
+            sync: Default::default(),
+        };
+        let _ = store.set_acme_lease_async(lease).await;
+        if let Some(sync) = &self.sync {
+            sync.push_now_bounded(Duration::from_millis(300)).await;
+        }
+        true
+    }
+
+    /// Give the lease back after an order.
+    pub(crate) async fn release(&self) {
+        let _ = self.edge.store.set_acme_lease_async(crate::sync::acme_lease::AcmeLease::default()).await;
+        if let Some(sync) = &self.sync {
+            sync.push_now_bounded(Duration::from_millis(300)).await;
         }
     }
 
@@ -641,7 +682,7 @@ mod tests {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::SeqCst};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -754,6 +795,12 @@ mod tests {
         state: Mutex<CaState>,
         /// Names whose `_acme-challenge` is a CNAME into the edge's base domain.
         delegated: Vec<&'static str>,
+        /// Further CNAMEs on the internet the CA follows, by name: what owners
+        /// of custom hostnames add (crate::custom_hostnames).
+        cnames: Mutex<HashMap<String, String>>,
+        /// Like a real CA, start a new order's authorization as valid when
+        /// the account proved that name before.
+        remember: AtomicBool,
         reject: AtomicBool,
         bad_nonce_once: AtomicBool,
         /// Days until the certificates issued next expire (of 90).
@@ -819,6 +866,7 @@ mod tests {
                         true => format!("_acme-challenge.{host}.cdn.test"),
                         false => format!("_acme-challenge.{host}"),
                     };
+                    let name = self.cnames.lock().unwrap().get(&name).cloned().unwrap_or(name);
                     let peer = "127.0.0.1".parse().unwrap();
                     let reply = self.resolver.handle(&query(1, &name, rtype::TXT, false), false, peer).ok_or("no DNS reply")?;
                     let expected = b64(&digest);
@@ -922,17 +970,18 @@ mod tests {
                     let payload = payload.ok_or(bad("payload required"))?;
                     let identifiers = payload["identifiers"].as_array().ok_or(bad("identifiers"))?;
                     let hosts: Vec<String> = identifiers.iter().filter_map(|i| i["value"].as_str().map(String::from)).collect();
+                    let mut state = self.state.lock().unwrap();
+                    let remembered = |h: &str| self.remember.load(SeqCst) && state.validated.iter().any(|v| v.split_once(' ').is_some_and(|(_, name)| name == h));
                     let authz = hosts
                         .iter()
                         .map(|h| Authz {
                             host: h.trim_start_matches("*.").to_string(),
                             wildcard: h.starts_with("*."),
                             token: format!("tok-{}", uuid::Uuid::new_v4().simple()),
-                            status: "pending",
+                            status: if remembered(h) { "valid" } else { "pending" },
                             error: String::new(),
                         })
                         .collect();
-                    let mut state = self.state.lock().unwrap();
                     state.orders.push(Order { hosts, authz, certificate: None });
                     let i = state.orders.len() - 1;
                     Ok((201, Some(format!("{}/order/{i}", self.base)), self.order_json(&state.orders[i], i)))
@@ -945,7 +994,12 @@ mod tests {
                 }
                 "authz" => {
                     let (i, j) = (index(1)?, index(2)?);
-                    let state = self.state.lock().unwrap();
+                    let mut state = self.state.lock().unwrap();
+                    if payload == Some(json!({ "status": "deactivated" })) {
+                        let host = state.orders.get(i).and_then(|o| o.authz.get(j)).map(|a| a.host.clone()).ok_or(bad("no such authorization"))?;
+                        state.orders[i].authz[j].status = "deactivated";
+                        state.validated.retain(|v| v.split_once(' ').is_none_or(|(_, name)| name != host));
+                    }
                     let authz = state.orders.get(i).and_then(|o| o.authz.get(j)).ok_or(bad("no such authorization"))?;
                     Ok((200, None, self.authz_json(authz, i, j)))
                 }
@@ -1084,6 +1138,8 @@ mod tests {
             ca_pem,
             state: Mutex::default(),
             delegated: vec!["partial.net"],
+            cnames: Mutex::default(),
+            remember: AtomicBool::new(false),
             reject: AtomicBool::new(false),
             bad_nonce_once: AtomicBool::new(false),
             days_left: AtomicI64::new(90),
@@ -1283,6 +1339,84 @@ mod tests {
         offline.tick().await;
         let p = env.pack(&other);
         assert!(p.status == "failed" && p.error.contains("cannot reach http://127.0.0.1:9/dir"), "{}", p.error);
+    }
+
+    #[tokio::test]
+    async fn a_custom_hostname_gets_a_certificate_only_through_its_owners_delegation_to_it() {
+        use crate::custom_hostnames::{mark_seen, CustomHostname};
+        let env = setup().await;
+        let get = |h: &CustomHostname| env.store.item::<CustomHostname>(&h.meta.zone_id, &h.meta.id).unwrap();
+        let retry_now = async |h: &CustomHostname| {
+            env.store.update_item_async::<CustomHostname, _>(&h.meta.zone_id, &h.meta.id, |h| h.next_attempt.take().is_some()).await.unwrap();
+        };
+        let shop = env.store.save_item::<CustomHostname>(&env.full, None, json!({ "hostname": "shop.example.net" }), true).unwrap();
+
+        // created, and nobody asked for it yet: the CA is left alone
+        env.acme.tick().await;
+        assert_eq!(env.orders(), 0);
+        // a visitor's handshake for a name nobody created changes nothing; one for it lets it be ordered
+        let version = env.store.version();
+        let _ = presented(env.https_port, "unknown.example.net", b"h2").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(env.store.version(), version);
+        let _ = presented(env.https_port, "shop.example.net", b"h2").await;
+        for _ in 0..100 {
+            if get(&shop).seen_at.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(get(&shop).seen_at.is_some(), "the handshake was noted");
+
+        // the name's owner has not delegated its challenge here: the order fails and waits
+        env.acme.tick().await;
+        let p = get(&shop);
+        assert_eq!((p.status.as_str(), p.attempts, env.orders()), ("failed", 1, 1));
+        assert!(p.error.contains("no TXT record"), "{}", p.error);
+        assert!(p.last_attempt.is_some() && p.next_attempt.is_some());
+        env.acme.tick().await;
+        assert_eq!(env.orders(), 1, "backing off");
+        assert_eq!(env.store.pending_challenges(), 0);
+
+        // delegated to this custom hostname: the CA validates, the edge serves it
+        let at = format!("_acme-challenge.{}.example.com", shop.verify_txt);
+        env.ca.cnames.lock().unwrap().insert("_acme-challenge.shop.example.net".into(), at);
+        retry_now(&shop).await;
+        env.acme.tick().await;
+        let p = get(&shop);
+        assert_eq!((p.status.as_str(), p.attempts, p.error.as_str()), ("active", 0, ""), "{}", p.error);
+        assert!(env.ca.state.lock().unwrap().validated.contains(&"dns-01 shop.example.net".to_string()));
+        assert_eq!(presented(env.https_port, "shop.example.net", b"h2").await.unwrap().0, leaf_of(&p.certificate));
+        assert_eq!(env.store.pending_challenges(), 0);
+        env.acme.tick().await;
+        assert_eq!(env.orders(), 2, "nothing more to do");
+
+        // the name changes hands to another zone, whose order the CA would
+        // answer from what it remembers: that is withdrawn, and the owner's
+        // delegation still names the first custom hostname, so no certificate
+        env.ca.remember.store(true, SeqCst);
+        env.store.delete_item::<CustomHostname>(&env.full, &shop.meta.id).unwrap();
+        let taken = env.store.save_item::<CustomHostname>(&env.partial, None, json!({ "hostname": "shop.example.net" }), true).unwrap();
+        mark_seen(&env.store, &env.partial, &taken.meta.id).await.unwrap();
+        env.acme.tick().await;
+        let p = get(&taken);
+        assert_eq!((p.status.as_str(), p.certificate.as_str()), ("failed", ""));
+        assert!(p.error.contains("remembered an earlier validation"), "{}", p.error);
+        retry_now(&taken).await;
+        env.acme.tick().await;
+        let p = get(&taken);
+        assert!(p.status == "failed" && p.error.contains("no TXT record"), "{}", p.error);
+
+        // its owner delegates to it (a zone hosted elsewhere: under the CNAME base)
+        let at = format!("_acme-challenge.{}.partial.net.cdn.test", taken.verify_txt);
+        env.ca.cnames.lock().unwrap().insert("_acme-challenge.shop.example.net".into(), at);
+        retry_now(&taken).await;
+        env.acme.tick().await;
+        assert_eq!(get(&taken).status, "active", "{}", get(&taken).error);
+    }
+
+    fn leaf_of(chain: &str) -> Vec<u8> {
+        CertificateDer::pem_slice_iter(chain.as_bytes()).next().unwrap().unwrap().to_vec()
     }
 
     #[tokio::test]

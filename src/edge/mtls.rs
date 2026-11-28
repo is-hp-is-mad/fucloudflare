@@ -39,7 +39,7 @@ fn refused(mtls: Option<&str>, panel: bool, verified: bool) -> bool {
 pub fn check(edge: &Edge, host: &str, extensions: &hyper::http::Extensions) -> Result<(), EdgeError> {
     let snap = edge.store.snapshot();
     // any name of the zone, served or not: the zone's setting covers all of them
-    let mtls = snap.find_zone(host).map(|zone| zone.zone.settings.mtls.as_str());
+    let mtls = snap.host_zone(host).map(|zone| zone.zone.settings.mtls.as_str());
     let panel = edge.panel.get().is_some_and(|(panel_host, _)| panel_host == host);
     if refused(mtls, panel, verified(extensions)) {
         return Err(EdgeError::new(403, "Forbidden", "this site takes only visitors with a valid client certificate"));

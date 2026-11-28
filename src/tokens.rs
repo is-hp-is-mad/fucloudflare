@@ -118,8 +118,8 @@ groups! {
     "e17beae8b8cb423a99b1730f21238bed" "Cache Purge" CachePurge true "Purge the cache";
     "4ec32dfcb35641c5bb32d5ef1ab963b4" "Firewall Services Read" Firewall false "Read firewall rules, rate limits and security events";
     "43137f8d07884d3198dc0ee77ca6e79b" "Firewall Services Write" Firewall true "Change firewall rules (human check included) and rate limits";
-    "7b7216b327b04b8fbc8f524e1f9b7531" "SSL and Certificates Read" Ssl false "Read certificate packs and custom certificates";
-    "c03055bc037c4ea9afb9a9f104b7b721" "SSL and Certificates Write" Ssl true "Order, retry and upload certificates";
+    "7b7216b327b04b8fbc8f524e1f9b7531" "SSL and Certificates Read" Ssl false "Read certificate packs, custom certificates and custom hostnames";
+    "c03055bc037c4ea9afb9a9f104b7b721" "SSL and Certificates Write" Ssl true "Order, retry and upload certificates; add custom hostnames";
     "a6b3a2d2b9f04d7f8ad2f54b7b5bd1a1" "Origin Rules Read" OriginRules false "Read origin rules";
     "b7c4b3e3cae14e8f9be3e65c8c6ce2b2" "Origin Rules Write" OriginRules true "Change origin rules";
     "c8d5c4f4dbf2408fa0f4f76d9d7df3c3" "Dynamic Redirect Read" RedirectRules false "Read redirect rules";
@@ -198,7 +198,7 @@ pub fn need(path: &str) -> Need {
                 "settings" | "dnssec" => Area::ZoneSettings,
                 "purge_cache" => Area::CachePurge,
                 "firewall" | "rate_limits" | "security" => Area::Firewall,
-                "ssl" | "custom_certificates" | "origin_ca" => Area::Ssl,
+                "ssl" | "custom_certificates" | "custom_hostnames" | "origin_ca" => Area::Ssl,
                 "origin_rules" => Area::OriginRules,
                 "redirect_rules" => Area::RedirectRules,
                 "transform_rules" => Area::TransformRules,
@@ -478,6 +478,9 @@ mod tests {
         assert_eq!(need("/zones/z1/waiting_rooms"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/zones/z1/waiting_rooms/w1"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/waiting_rooms"), Need::Closed);
+        assert_eq!(need("/zones/z1/custom_hostnames"), Need::Zone(Area::Ssl, Some("z1".into())));
+        assert_eq!(need("/zones/z1/custom_hostnames/h1"), Need::Zone(Area::Ssl, Some("z1".into())));
+        assert_eq!(need("/custom_hostnames"), Need::Closed);
     }
 
     #[test]

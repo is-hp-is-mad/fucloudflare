@@ -236,7 +236,11 @@ impl ResolvesServerCert for CertResolver {
             return Some(c);
         }
         // Only mint certificates for zones we host (bounded by configuration).
-        let Some(zone) = snap.find_zone(&sni) else { return Some(self.default.clone()) };
+        let Some(zone) = snap.find_zone(&sni) else {
+            // a custom hostname still without its certificate: its first visitor lets it be ordered
+            crate::custom_hostnames::saw(&self.store, &snap, &sni);
+            return Some(self.default.clone());
+        };
         if let Some(c) = self.generated.read().unwrap().get(&zone.zone.name) {
             return Some(c.clone());
         }

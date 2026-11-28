@@ -65,7 +65,7 @@ impl Edge {
         if endpoint == "challenge-platform/ticket" {
             // a ticket for the injected script to pass the check in the background
             let snap = self.store.snapshot();
-            let Some(zone) = snap.find_zone(host).filter(|z| Self::serves(z, host)) else { return Err(not_found()) };
+            let Some(zone) = snap.edge_zone(host) else { return Err(not_found()) };
             let ua = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or_default();
             let level = super::challenge::Level::of(&zone.zone.settings.security_level);
             return Ok(super::challenge::ticket_answer(&self.waf, &zone.zone.id, ip, ua, level));
@@ -96,7 +96,7 @@ impl Edge {
         let (_, limit) = self.limits.own();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let snap = self.store.snapshot();
-        let zone = snap.find_zone(host).filter(|z| Self::serves(z, host)).map_or("-", |z| z.zone.name.as_str());
+        let zone = snap.edge_zone(host).map_or("-", |z| z.zone.name.as_str());
         let http = match req.version() {
             _ if req.extensions().get::<super::front::ViaFront>().is_some() => "http/3",
             hyper::Version::HTTP_3 => "http/3",

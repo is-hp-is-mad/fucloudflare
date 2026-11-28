@@ -221,6 +221,9 @@ pub struct Tombstones {
     /// (Left out while empty, like alert channels.)
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub challenge_widgets: BTreeMap<String, SyncMeta>,
+    /// (Left out while empty, like alert channels.)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_hostnames: BTreeMap<String, SyncMeta>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -245,6 +248,10 @@ pub struct Data {
     /// waiting rooms compute.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
+    /// Other people's names served as one of the zones (crate::custom_hostnames);
+    /// left out while empty, like waiting rooms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_hostnames: Vec<crate::custom_hostnames::CustomHostname>,
     pub nodes: Vec<EdgeNode>,
     pub steering: Vec<SteerRule>,
     pub local_proxy_rules: Vec<LocalProxyRule>,
@@ -311,11 +318,18 @@ pub struct ZoneSnap {
     pub waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
     /// Compiled DNSSEC signer when DNSSEC is enabled on this zone.
     pub dnssec: Option<Arc<crate::dns::dnssec::DnssecSigner>>,
+    /// The zone's active custom hostnames (outside the zone, see
+    /// crate::custom_hostnames) and the host of the zone whose records
+    /// serve each of them.
+    pub custom_origins: HashMap<String, String>,
 }
 
 impl ZoneSnap {
     /// Records stored at `host`, or at the wildcard covering it (RFC 4592).
+    /// For one of the zone's custom hostnames, those of the host it is
+    /// served from: no name of the zone itself is ever one of them.
     pub fn records_for(&self, host: &str) -> &[Record] {
+        let host = self.custom_origins.get(host).map_or(host, String::as_str);
         if self.nodes.contains(host) {
             return self.names.get(host).map(Vec::as_slice).unwrap_or(&[]);
         }
@@ -360,7 +374,7 @@ pub fn reserve_names(names: Vec<String>) {
     let _ = RESERVED.set(names.into_iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).filter(|n| !n.is_empty()).collect());
 }
 
-fn reserved(host: &str) -> bool {
+pub(crate) fn reserved(host: &str) -> bool {
     RESERVED.get().is_some_and(|names| names.iter().any(|n| host == n || host.strip_suffix(n.as_str()).is_some_and(|rest| rest.ends_with('.'))))
 }
 
@@ -390,6 +404,9 @@ pub struct Snapshot {
     /// Enabled local reverse-proxy rules, ordered by `(priority, !exact_path, Reverse(path_prefix.len()))`.
     pub local_proxy_rules: Vec<LocalProxyRule>,
     pub purges: Vec<PurgeOp>,
+    /// Custom hostnames by name: which zone serves the active ones, which
+    /// ones wait for their first visitor (crate::custom_hostnames).
+    pub custom_hostnames: crate::custom_hostnames::Index,
 }
 
 /// Enabled rules of one zone, compiled, sorted by `key`. `$name` in an
@@ -439,6 +456,7 @@ impl Snapshot {
                     email_rules: data.email_rules.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
                     waiting_rooms: data.waiting_rooms.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
                     dnssec: z.dnssec.as_ref().and_then(|cfg| crate::dns::dnssec::DnssecSigner::from_config(&z.name, cfg)),
+                    custom_origins: HashMap::new(),
                 };
                 (id, snap)
             })
@@ -474,6 +492,7 @@ impl Snapshot {
                 }
             }
         }
+        let custom_hostnames = crate::custom_hostnames::index(data, &mut by_id, &mut certs);
         let (mut acme_dns, mut acme_tls, mut acme_http) = (HashMap::<String, Vec<String>>::new(), HashMap::new(), HashMap::new());
         for c in &data.acme_challenges {
             match c.kind.as_str() {
@@ -537,6 +556,7 @@ impl Snapshot {
                 rules
             },
             purges: data.purges.clone(),
+            custom_hostnames,
         }
     }
 
@@ -758,6 +778,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         email_rules,
         log_jobs,
         waiting_rooms,
+        custom_hostnames,
     );
     macro_rules! bump_tombs {
         ($($field:ident),* $(,)?) => {
@@ -793,6 +814,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         ip_lists,
         alert_channels,
         challenge_widgets,
+        custom_hostnames,
     );
     sync_telemetry_projections(d);
     clock.advance_floor(max_ver.0, max_ver.1);
@@ -824,6 +846,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.email_rules, durable_ttl_ms);
     prune(&mut d.tombstones.log_jobs, durable_ttl_ms);
     prune(&mut d.tombstones.waiting_rooms, durable_ttl_ms);
+    prune(&mut d.tombstones.custom_hostnames, durable_ttl_ms);
     prune(&mut d.tombstones.nodes, durable_ttl_ms);
     prune(&mut d.tombstones.steering, durable_ttl_ms);
     prune(&mut d.tombstones.local_proxy_rules, durable_ttl_ms);
@@ -870,6 +893,8 @@ struct ConfigDeltaPayload {
     log_jobs: Vec<crate::edge::reqlog::LogJob>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     waiting_rooms: Vec<crate::edge::waiting::WaitingRoom>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    custom_hostnames: Vec<crate::custom_hostnames::CustomHostname>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     nodes: Vec<EdgeNode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1559,6 +1584,31 @@ impl Store {
         let (z, id_owned) = (zone_id.to_string(), id.map(str::to_string));
         self.mutate_async(move |d, clock, sync_node| apply_save_item::<T>(d, clock, sync_node, &z, id_owned.as_deref(), body, replace))
             .await
+    }
+
+    /// Change one item where it stands, as the server's own bookkeeping (not
+    /// a user's edit, so no validation): `change` sees the item as it is at
+    /// that moment and says whether it changed it. Nothing is written when it
+    /// did not (`Err(Conflict)`), so a change that is no longer wanted does
+    /// not stamp a newer version over what another node wrote.
+    pub async fn update_item_async<T, F>(&self, zone_id: &str, id: &str, change: F) -> Result<T, StoreError>
+    where
+        T: Item,
+        F: FnOnce(&mut T) -> bool + Send + 'static,
+    {
+        let (z, id_owned) = (zone_id.to_string(), id.to_string());
+        self.mutate_async(move |d, clock, sync_node| {
+            let idx = T::vec(d).iter().position(|i| i.meta().id == id_owned && i.meta().zone_id == z).ok_or(StoreError::NotFound)?;
+            if !change(&mut T::vec_mut(d)[idx]) {
+                return Err(StoreError::Conflict("unchanged".into()));
+            }
+            let meta = stamp_next(d, clock, sync_node, false);
+            let item = &mut T::vec_mut(d)[idx];
+            item.meta_mut().modified_on = now();
+            item.meta_mut().sync = meta;
+            Ok(item.clone())
+        })
+        .await
     }
 
     pub fn delete_item<T: Item>(&self, zone_id: &str, id: &str) -> Result<(), StoreError> {
@@ -2492,8 +2542,10 @@ fn apply_delete_zone(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str) 
     cascade_items!(log_jobs);
     cascade_items!(waiting_rooms);
     cascade_items!(certificate_packs);
+    cascade_items!(custom_hostnames);
 
-    let packs: HashSet<String> = d.certificate_packs.iter().map(|p| p.meta.id.clone()).collect();
+    // challenges belong to a pack or to a custom hostname (by its id)
+    let packs: HashSet<String> = d.certificate_packs.iter().map(|p| p.meta.id.clone()).chain(d.custom_hostnames.iter().map(|h| h.meta.id.clone())).collect();
     let mut rm_chal = Vec::new();
     d.acme_challenges.retain(|c| {
         if packs.contains(&c.pack_id) {
@@ -2625,6 +2677,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
         email_rules: d.email_rules.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         log_jobs: d.log_jobs.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         waiting_rooms: d.waiting_rooms.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
+        custom_hostnames: d.custom_hostnames.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         nodes: d.nodes.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         steering: d.steering.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         local_proxy_rules: d.local_proxy_rules.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
@@ -2657,6 +2710,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             email_rules: filter_tombs(&d.tombstones.email_rules, since),
             log_jobs: filter_tombs(&d.tombstones.log_jobs, since),
             waiting_rooms: filter_tombs(&d.tombstones.waiting_rooms, since),
+            custom_hostnames: filter_tombs(&d.tombstones.custom_hostnames, since),
             nodes: filter_tombs(&d.tombstones.nodes, since),
             steering: filter_tombs(&d.tombstones.steering, since),
             local_proxy_rules: filter_tombs(&d.tombstones.local_proxy_rules, since),
@@ -2862,6 +2916,7 @@ fn merge_delta_data(
     merge_items!(email_rules);
     merge_items!(log_jobs);
     merge_items!(waiting_rooms);
+    merge_items!(custom_hostnames);
 
     changed |= merge_collection(&mut rev, clock, &mut d.workers, &mut d.tombstones.workers, payload.workers, payload.tombstones.workers, |w| w.name.clone(), |w| &w.sync, |w| &mut w.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.nodes, &mut d.tombstones.nodes, payload.nodes, payload.tombstones.nodes, |n| n.id.clone(), |n| &n.sync, |n| &mut n.sync);
@@ -2992,6 +3047,7 @@ fn merge_delta_data(
         cascade_tomb!(log_jobs);
         cascade_tomb!(waiting_rooms);
         cascade_tomb!(certificate_packs);
+        cascade_tomb!(custom_hostnames);
     }
 
     // Bump SOA serial locally when records changed without the zone itself changing.

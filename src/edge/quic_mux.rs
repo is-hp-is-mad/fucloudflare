@@ -378,7 +378,7 @@ fn is_cdn_sni(sni: &str, store: &Store, panel_host: Option<&str>, cname_base: Op
             return true;
         }
     }
-    store.snapshot().find_zone(sni).is_some()
+    store.snapshot().host_zone(sni).is_some()
 }
 
 /// Bind a public UDP socket shared between `fucf`'s native multi-domain HTTP/3
