@@ -25,13 +25,16 @@ for (const [mode, scheme] of [["light", "light"], ["dark", "dark"]]) {
     // signed in
     await page.evaluate(t => localStorage.setItem("fucf_token", t), token);
     for (const [name, hash] of views) {
+      // a change of the #hash alone is no navigation: load the page afresh
       await page.goto(panel + hash, { waitUntil: "networkidle" });
+      await page.reload({ waitUntil: "networkidle" });
       await page.waitForTimeout(400);
       await page.screenshot({ path: `${out}/${mode}-${vp}-${name}.png`, fullPage: vp === "desktop" });
     }
     if (vp === "desktop") {
       // a primary button while hovered and an open drawer
       await page.goto(panel + "#/zones", { waitUntil: "networkidle" });
+      await page.reload({ waitUntil: "networkidle" });
       const pri = page.locator("button.pri").first();
       if (await pri.count()) {
         await pri.hover(); await page.waitForTimeout(300);
