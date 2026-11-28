@@ -385,6 +385,73 @@ curl -s -X POST $BASE/zones/$ZONE/redirect_rules -H "Authorization: Bearer $TOKE
 }'
 ```
 
+### Rulesets
+
+The same rules as Cloudflare rulesets, for Terraform's `cloudflare_ruleset`, cf-terraforming and
+scripts written for Cloudflare. Nothing is stored twice: each phase's entrypoint ruleset is a view of
+one of the lists above, its id is derived from the zone and the phase (the same on every node, for
+good), and a rule's id is the id of the object behind it.
+
+```
+GET    /zones/{id}/rulesets                                   the phases that have rules (without the rules)
+POST   /zones/{id}/rulesets                                   {"phase", "kind": "zone", "name", "rules": [...]}: a phase without rules yet
+GET    /zones/{id}/rulesets/phases/{phase}/entrypoint         one phase (an empty one answers with no rules)
+PUT    /zones/{id}/rulesets/phases/{phase}/entrypoint         {"rules": [...]}: the phase becomes these rules, in this order
+GET    /zones/{id}/rulesets/{ruleset_id}
+PUT    /zones/{id}/rulesets/{ruleset_id}                      as the entrypoint PUT
+DELETE /zones/{id}/rulesets/{ruleset_id}                      the phase loses all its rules
+POST   /zones/{id}/rulesets/{ruleset_id}/rules                one rule, last unless "position" says otherwise
+PATCH  /zones/{id}/rulesets/{ruleset_id}/rules/{rule_id}      the top-level fields given change, the rest stays
+DELETE /zones/{id}/rulesets/{ruleset_id}/rules/{rule_id}
+```
+
+Changes answer with the whole ruleset. In a PATCH, an `action_parameters` given replaces the old one
+whole, and a new `action` starts without the old action's parameters. `position` is `{"before": id}` (`""` for the top), `{"after": id}`
+(`""` for the bottom) or `{"index": n}` (from 1).
+
+| Phase | List | Actions and parameters |
+| --- | --- | --- |
+| `http_request_firewall_custom` | firewall rules | `block`, `js_challenge`, `managed_challenge`, `log`, `skip` |
+| `http_ratelimit` | rate limits | `block`, `log`; `ratelimit`: `requests_per_period`, `period`, `mitigation_timeout`, `characteristics` `["cf.colo.id", "ip.src"]` |
+| `http_request_dynamic_redirect` | redirect rules | `redirect`; `action_parameters.from_value`: `target_url.value`, `status_code` (required), `preserve_query_string` |
+| `http_request_transform` | transform rules (path) | `rewrite`; `action_parameters.uri.path.value` |
+| `http_request_late_transform` | transform rules (request headers) | `rewrite`; `action_parameters.headers.{name}`: `{"operation": "set", "value"}` or `{"operation": "remove"}` |
+| `http_response_headers_transform` | transform rules (response headers) | as above |
+| `http_request_cache_settings` | cache rules | `set_cache_settings`; `action_parameters.cache` (required), `edge_ttl`: `{"mode": "override_origin", "default"}` or `{"mode": "respect_origin"}` |
+| `http_request_origin` | origin rules | `route`; `action_parameters`: `host_header`, `origin.host`, `origin.port`, `sni.value` |
+
+- Whatever a rule says that this server cannot do is refused with a 400 that names the field
+  (`rules[2].action_parameters.uri.query is not supported by this server`), never dropped. A PUT
+  either lands whole or not at all.
+- An expression of `true` is every request (stored as an empty expression, shown as `true`).
+- A `skip` here skips the remaining custom rules, the security level, rate limits and the managed rules,
+  so its `action_parameters` must say at least `"ruleset": "current"`, `"phases": ["http_ratelimit",
+  "http_request_firewall_managed"]` and `"products": ["securityLevel"]` (or be left out). A narrower
+  skip is refused rather than widened.
+- A transform rule with a path, request headers and response headers shows in all three transform
+  phases. A change through one phase touches only its part; the expression, description and
+  `enabled` are shared, so changing them through one phase is refused while the rule is in others
+  (change them with `/transform_rules`). Reordering one phase can change the order of a shared rule
+  in the others, since the rule has one priority.
+- Rate limits run in the order they were made: new ones can be added last, reordering is refused.
+- The automatic firewall's rules are not shown and never replaced. An origin rule's `origin_node` and
+  `origin_scheme` have no Cloudflare words: they are not shown and stay as they are.
+- The ruleset's `name` and `description` are accepted and not kept (every entrypoint is `default`);
+  `version` is always `"1"`, and a rule's `ref` is its id.
+- Tokens: a path that names a phase (by name or by ruleset id) needs that phase's permission
+  (Firewall Services for the first two, then Dynamic Redirect, Transform Rules, Cache Rules, Origin
+  Rules); the list and `POST /rulesets` need Firewall Services, and the POST also the phase's own.
+
+```sh
+curl -s -X PUT $BASE/zones/$ZONE/rulesets/phases/http_request_late_transform/entrypoint \
+  -H "Authorization: Bearer $TOKEN" -d '{
+  "rules": [{
+    "expression": "starts_with(http.request.uri.path, \"/api/\")", "action": "rewrite",
+    "action_parameters": { "headers": { "x-from-edge": { "operation": "set", "value": "1" } } }
+  }]
+}'
+```
+
 ### Security events
 
 ```

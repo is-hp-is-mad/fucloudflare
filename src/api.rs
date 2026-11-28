@@ -198,6 +198,11 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<CacheRule>("/zones/{zone_id}/cache_rules"))
         .route("/zones/{zone_id}/email", get(email_zone))
         .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
+        .route("/zones/{zone_id}/rulesets", get(list_rulesets).post(create_ruleset))
+        .route("/zones/{zone_id}/rulesets/phases/{phase}/entrypoint", get(get_entrypoint).put(put_entrypoint))
+        .route("/zones/{zone_id}/rulesets/{ruleset_id}", get(get_ruleset).put(put_ruleset).delete(delete_ruleset))
+        .route("/zones/{zone_id}/rulesets/{ruleset_id}/rules", post(add_ruleset_rule))
+        .route("/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}", axum::routing::patch(patch_ruleset_rule).delete(delete_ruleset_rule))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -1927,6 +1932,61 @@ async fn delete_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, 
     ok(json!({ "id": id }))
 }
 
+// ------------------------------------------------------------ rulesets ----
+
+/// Cloudflare's Rulesets API over the existing rule types (crate::rulesets).
+async fn list_rulesets(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(crate::rulesets::list(&st.store, &zone_id)?)
+}
+
+async fn create_ruleset(State(st): St, Extension(who): Who, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: Value = body(&bytes)?;
+    let phase = crate::rulesets::phase_in(&b)?;
+    // the path (no phase in it) only asks a token for the firewall permission;
+    // what is created needs the phase's own as well
+    if who.via == Via::Token {
+        let path = format!("/zones/{zone_id}/rulesets/phases/{phase}/entrypoint");
+        if !who.grant.as_ref().is_some_and(|g| g.allows("PUT", &path, who.user_id.as_deref().unwrap_or_default())) {
+            return Err(ApiError(StatusCode::FORBIDDEN, 9109, "Unauthorized to access requested resource".into()));
+        }
+    }
+    ok(crate::rulesets::create(&st.store, &zone_id, b).await?)
+}
+
+async fn get_entrypoint(State(st): St, Path((zone_id, phase)): Path<(String, String)>) -> ApiResult {
+    ok(crate::rulesets::entrypoint(&st.store, &zone_id, crate::rulesets::phase_named(&phase)?)?)
+}
+
+async fn put_entrypoint(State(st): St, Path((zone_id, phase)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    let phase = crate::rulesets::phase_named(&phase)?;
+    ok(crate::rulesets::put_entrypoint(&st.store, &zone_id, phase, body(&bytes)?).await?)
+}
+
+async fn get_ruleset(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    ok(crate::rulesets::get(&st.store, &zone_id, &id)?)
+}
+
+async fn put_ruleset(State(st): St, Path((zone_id, id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    ok(crate::rulesets::put_ruleset(&st.store, &zone_id, &id, body(&bytes)?).await?)
+}
+
+async fn delete_ruleset(State(st): St, Path((zone_id, id)): Path<(String, String)>) -> ApiResult {
+    crate::rulesets::delete_ruleset(&st.store, &zone_id, &id).await?;
+    ok(Value::Null)
+}
+
+async fn add_ruleset_rule(State(st): St, Path((zone_id, id)): Path<(String, String)>, bytes: Bytes) -> ApiResult {
+    ok(crate::rulesets::add_rule(&st.store, &zone_id, &id, body(&bytes)?).await?)
+}
+
+async fn patch_ruleset_rule(State(st): St, Path((zone_id, id, rule_id)): Path<(String, String, String)>, bytes: Bytes) -> ApiResult {
+    ok(crate::rulesets::update_rule(&st.store, &zone_id, &id, &rule_id, body(&bytes)?).await?)
+}
+
+async fn delete_ruleset_rule(State(st): St, Path((zone_id, id, rule_id)): Path<(String, String, String)>) -> ApiResult {
+    ok(crate::rulesets::delete_rule(&st.store, &zone_id, &id, &rule_id).await?)
+}
+
 // ------------------------------------------------ managed certificates ----
 
 /// A pack as the API shows it. `dns_delegation` lists the CNAME records with
@@ -3369,6 +3429,103 @@ mod tests {
             push_body,
         ).await;
         assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn rulesets_answer_on_cloudflare_paths_and_tokens_need_the_phase_permission() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-rulesets-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let session = match st.accounts.login("admin@example.com", "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => token,
+            _ => panic!("expected signed in"),
+        };
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let as_session = format!("Bearer {session}");
+        let z = zone.id.clone();
+        let base = format!("/client/v4/zones/{z}/rulesets");
+
+        // the fleet's own token can do everything
+        let fw = json!({ "phase": "http_request_firewall_custom", "kind": "zone", "name": "default",
+            "rules": [{ "action": "block", "expression": "ip.src eq 192.0.2.1" }] });
+        let (sc, b) = call(&mut app, "POST", &base, fw.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let fw_id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let rule_id = json_of(&b)["result"]["rules"][0]["id"].as_str().unwrap().to_string();
+        assert_eq!(st.store.items::<FirewallRule>(&z).unwrap()[0].meta.id, rule_id);
+        let (sc, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(json_of(&b)["result"][0]["id"], json!(fw_id));
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/phases/http_request_firewall_custom/entrypoint"), vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"]["id"].clone()), (StatusCode::OK, json!(fw_id)));
+        let (sc, b) = call(&mut app, "PATCH", &format!("{base}/{fw_id}/rules/{rule_id}"), br#"{"action":"log"}"#.to_vec()).await;
+        assert_eq!((sc, json_of(&b)["result"]["rules"][0]["action"].clone()), (StatusCode::OK, json!("log")));
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/phases/http_request_firewall_managed/entrypoint"), vec![]).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/zones/{}/rulesets/{fw_id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "a ruleset id belongs to one zone");
+        let (sc, b) = call(&mut app, "PUT", &format!("{base}/{fw_id}"), br#"{"rules":[{"action":"nonsense","expression":"true"}]}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        assert!(json_of(&b)["errors"][0]["message"].as_str().unwrap().contains("rules[0].action"));
+        let (sc, _) = call(&mut app, "PUT", &format!("{base}/{fw_id}"), b"not json".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+
+        // a token for the firewall of this zone only
+        let spec = json!({
+            "name": "firewall only",
+            "policies": [{
+                "effect": "allow",
+                "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" },
+                "permission_groups": [{ "name": "Firewall Services Write" }],
+            }],
+        });
+        let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", vec![("authorization", &as_session), ("content-type", "application/json")], spec.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let bearer = format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap());
+        let auth = || vec![("authorization", bearer.as_str()), ("content-type", "application/json")];
+        let transform = json!({ "phase": "http_request_late_transform",
+            "rules": [{ "action": "rewrite", "expression": "true", "action_parameters": { "headers": { "x-a": { "operation": "set", "value": "1" } } } }] });
+
+        let (sc, _, _) = call_raw(&mut app, "GET", &base, auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "DELETE", &format!("{base}/{fw_id}/rules/{rule_id}"), auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "POST", &base, auth(), transform.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "creating a transform ruleset needs the transform permission too");
+        let (sc, _, _) = call_raw(&mut app, "PUT", &format!("{base}/phases/http_request_late_transform/entrypoint"), auth(), json!({ "rules": [] }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let late = crate::rulesets::ruleset_id(&z, "http_request_late_transform");
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("{base}/{late}"), auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "by id too");
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{}/rulesets", other.id), auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "another zone");
+        assert!(st.store.items::<TransformRule>(&z).unwrap().is_empty());
+
+        // a token for transform rules only: its phase yes, creating through the firewall-only path no
+        let spec = json!({
+            "name": "transform only",
+            "policies": [{
+                "effect": "allow",
+                "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" },
+                "permission_groups": [{ "name": "Transform Rules Write" }],
+            }],
+        });
+        let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", vec![("authorization", &as_session), ("content-type", "application/json")], spec.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let bearer2 = format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap());
+        let auth2 = || vec![("authorization", bearer2.as_str()), ("content-type", "application/json")];
+        let (sc, _, _) = call_raw(&mut app, "POST", &base, auth2(), transform.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, _, b) = call_raw(&mut app, "PUT", &format!("{base}/phases/http_request_late_transform/entrypoint"), auth2(), transform.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("{base}/{fw_id}"), auth2(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        assert_eq!(st.store.items::<TransformRule>(&z).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

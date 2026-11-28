@@ -95,7 +95,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 只做能静态确定的修正：对照 `src/api.rs` 改路径常量；响应头名 `cf-*` 改成 `fcf-*`（`cf-connecting-ip` 除外，它仍然发给源站）。
 - 不要动 `scripts/e2e.py` 里的 baseline 部分。其余失败原因留给能运行的人，在交接记录里列出你看到的疑点。
 
-### [ ] T3 Rulesets API（Terraform / cf-terraforming 兼容）
+### [x] T3 Rulesets API（Terraform / cf-terraforming 兼容）
 
 - 目标：在现有规则类型上加一层 Cloudflare Rulesets API 的映射，不引入新的存储。新文件 `src/rulesets.rs`。
 - 阶段与现有类型的对应（字段以 `src/items.rs` 里的结构体为准）：
@@ -195,7 +195,9 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - ARC 封装作为第二步，DKIM 部分完成并记录后再做。
 - 测试：两种规范化对照 RFC 6376 的例子；用测试密钥签名后再用 `ring` 验证通过；没配置密钥时邮件不变。
 
-### [ ] T11 Access
+### [-] T11 Access（已取消）
+
+- 已取消：仓库所有者决定不做，OAuth Worker 已经覆盖了这个需求。
 
 - 目标：在站点前面加登录。**这是安全功能：宁可少做，不可放宽任何现有检查。**
 - 域名下的对象 `AccessApp { host, path_prefix, allow_emails, allow_email_domains, session_hours, enabled, … }`。
@@ -240,6 +242,14 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - `tier1_features.py` / `tier2_boundaries.py`：浏览器里直接写的 D1 路径、`/account/passkeys/finish`（实际是 `POST /account/passkeys`）、T1-025 读的 `/schedules`（实际在 `GET …/settings` 的 `crons`）；`tier2` 里调 `/replication/sync` 时去掉了 `prefix=""`（路由在 `/client/v4` 下）。
 - 响应头：分层测试里已经全是 `fcf-*`；射线头实际是 `fucf-ray`（`src/edge/mod.rs`），测试写的也是它，没改；顺手把 README 里写成 `fcf-ray` 的一处改正。
 - 疑点（没改，留给能运行的人）：`OAUTH_CLIENTS_PATH = "/oauth/clients"` 在 `src/api.rs` 里没有这条路由，OAuth 客户端是 `workers/auth/` 那个 Worker 自己管的（D1 表 `oauth_clients`），T1-08x 和 T2 里注册客户端的几个测试应该改走 Worker 的管理接口；`PANEL_HOST` / `AUTH_HOST` 用的不是示例域名；`tier2` 里 `scheduledTime` / `dedup` 这两个请求体字段 `trigger_worker_scheduled` 不认识（它只读 `cron`）。
+
+### T3
+
+- `src/rulesets.rs`：八个阶段各是一种现有规则的另一种写法，不新增存储；规则集 id 是 SHA-256(域名 id、阶段) 的前 16 字节。整阶段替换走新加的 `Store::batch_items_async`（`src/store.rs`，在一次写入里做完，失败就全部不生效）。
+- 除了任务里列的接口，为了 Terraform 的建、改、删还加了 `POST /rulesets`、`PUT` / `DELETE /rulesets/{id}`。`POST /rulesets` 路径里没有阶段，`need()` 按任务要求给 `Area::Firewall`，处理函数里另外用令牌按请求体里的阶段再查一次权限。
+- 为了不放宽：只跳过一部分的 `skip` 被拒（这里的 skip 会跳过安全级别、限速和托管规则）；限速只按 `cf.colo.id` + `ip.src` 计数，别的 characteristics、`counting_expression`、`requests_to_origin` 都拒。自动防火墙的规则不显示也不会被替换。
+- 拿不准、留给能连 Cloudflare 的人核对：重定向的 `status_code` 现在是必填（没查到 Cloudflare 的默认值，宁可要求写明）；规则集的 `version` 恒为 `"1"`、`name` 不保存，Terraform 是否在意没法在这里验证；共享的改写规则经一个阶段重排会影响它在别的阶段里的顺序；限速不能重排。
+- 面板：域名的"规则"页最下面有 Rulesets 卡片，每个阶段可以按 Cloudflare JSON 查看和整体替换。
 
 ## 5. 部署（通过 Komari）
 

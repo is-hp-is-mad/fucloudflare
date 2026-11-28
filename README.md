@@ -381,6 +381,37 @@ DNS 记录的 Cloudflare 兼容补充：
 - `GET /zones/{id}/dns_records/export`：BIND 文件（已代理的带 `cf_tags=cf-proxied:true`）；`POST /zones/{id}/dns_records/import`：multipart 字段 `file`（或直接把文件当请求体），`proxied=true` 把能代理的都代理
 - 代理（`proxied`）和自定义回源（`origin`：端口、SNI、Host、协议、节点内回源）照常可用，见上面的“高级回源”
 
+## Rulesets API（兼容 Cloudflare）
+
+已有的规则也能按 Cloudflare 的 Rulesets API 读写，Terraform 的 `cloudflare_ruleset`、cf-terraforming 和照 Cloudflare 写的脚本可以直接用。
+不另存一份：每个阶段的入口规则集就是下面这张表里那种规则的另一种写法；规则集 id 由域名和阶段算出来（各节点一样、永远不变），
+规则 id 就是原来那条规则的 id。
+
+| 阶段 | 对应 |
+|---|---|
+| `http_request_firewall_custom` | 防火墙规则 |
+| `http_ratelimit` | 限速 |
+| `http_request_dynamic_redirect` | 重定向规则 |
+| `http_request_transform` / `http_request_late_transform` / `http_response_headers_transform` | 改写规则的路径 / 请求头 / 响应头 |
+| `http_request_cache_settings` | 缓存规则 |
+| `http_request_origin` | 回源规则 |
+
+```
+/zones/{id}/rulesets                                  GET 有规则的阶段；POST 新建（该阶段还没有规则时）
+/zones/{id}/rulesets/phases/{phase}/entrypoint        GET；PUT {"rules": [...]} 整体替换，顺序即优先级
+/zones/{id}/rulesets/{ruleset_id}                     GET PUT DELETE（DELETE 清空该阶段）
+/zones/{id}/rulesets/{ruleset_id}/rules[/{rule_id}]   POST 加一条（可带 position）；PATCH 只改给出的字段；DELETE
+```
+
+- 这里做不到的字段或动作一律 400，并说明是哪个字段（如 `rules[2].action_parameters.uri.query`），不会悄悄丢掉；一次 PUT 要么全部生效，要么都不生效。
+- `skip` 在这里会跳过其余自定义规则、安全级别、限速和托管规则，所以 `action_parameters` 至少要写 `ruleset: current`、
+  `phases: [http_ratelimit, http_request_firewall_managed]`、`products: [securityLevel]`（或者不写）；只跳过一部分的 skip 会被拒绝，不会被放宽。
+- 一条同时改路径、请求头、响应头的改写规则会出现在三个阶段里；经某个阶段修改只动那一部分，但表达式、描述和开关是共用的，
+  它还在别的阶段时经单个阶段改这几项会被拒绝（请用 `/transform_rules`）。
+- 限速没有优先级，按创建顺序执行：可以在最后追加，不能重排。自动防火墙的规则不显示、不会被替换；回源规则的 `origin_node`、`origin_scheme`
+  在 Cloudflare 里没有对应写法，不显示，修改时保持原样。
+- 令牌：带阶段的路径（阶段名或规则集 id）要该阶段对应的权限；列表和 `POST /rulesets` 要 Firewall Services，POST 另外还要该阶段的权限。
+
 ## 自动防火墙
 
 区域设置 `auto_firewall`（面板：域名 → 安全 → 自动防火墙，默认关）：每 30 秒看一次最近的安全事件——托管规则命中（拦截或记录）、防火墙拦截、限速——

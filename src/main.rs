@@ -21,6 +21,7 @@ mod mail;
 mod node;
 mod release;
 mod reports;
+mod rulesets;
 mod spectrum;
 mod store;
 mod site_acme;

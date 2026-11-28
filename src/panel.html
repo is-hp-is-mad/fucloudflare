@@ -728,6 +728,19 @@ async function ruleSection(zid, key) {
     table(cols, rows, r => rowActs("ruleEdit", "ruleDel", { key, id: r.id }), R.empty));
 }
 
+// Cloudflare's Rulesets API over the same rules: each phase as Cloudflare JSON, to read, paste or copy into Terraform.
+const PHASES = [
+  ["http_request_firewall_custom", "防火墙规则"], ["http_ratelimit", "限速规则"], ["http_request_dynamic_redirect", "重定向规则"],
+  ["http_request_transform", "改写规则 · 路径"], ["http_request_late_transform", "改写规则 · 请求头"], ["http_response_headers_transform", "改写规则 · 响应头"],
+  ["http_request_cache_settings", "缓存规则"], ["http_request_origin", "回源规则"]];
+async function rulesetSection(zid) {
+  const have = new Set((await api("GET", `/zones/${zid}/rulesets`)).map(r => r.phase));
+  const rows = PHASES.map(([phase, label]) => ({ phase, label, used: have.has(phase) }));
+  const cols = [{ k: "label", label: "对应规则" }, { k: "phase", label: "阶段", fmt: r => `<code>${esc(r.phase)}</code>` }, { k: "used", label: "有规则" }];
+  return card("Rulesets（Cloudflare 格式）", "", `<p class="hint">与上面是同一批规则，按 Cloudflare Rulesets API 的写法查看或整体替换，可直接用于 Terraform 的 cloudflare_ruleset。这里写不了的字段会报错，不会被忽略。</p>` +
+    table(cols, rows, r => lk("rulesetEdit", "查看 / 编辑 JSON", { phase: r.phase })));
+}
+
 // ---------------------------------------------------------------- views ----
 const zh = tab => `#/zone/${esc(S.zone)}/${tab}`;
 const protoChips = s => chips(["HTTP/1.1", s.http2 && "HTTP/2", s.http3 && "HTTP/3"].filter(Boolean));
@@ -927,6 +940,7 @@ const ZONE = {
   async rules(z) {
     let body = "";
     for (const key of ["origin", "redirect", "transform", "cache"]) body += await ruleSection(z.id, key);
+    body += await rulesetSection(z.id);
     return { sub: "按表达式改写回源目标、跳转请求、修改请求与响应、控制缓存。每类规则按优先级从小到大执行。", body };
   },
   async network(z) {
@@ -1669,6 +1683,13 @@ const A = {
       v => api(d.id ? "PUT" : "POST", `/zones/${S.zone}/${R.path}` + (d.id ? "/" + d.id : ""), R.save ? R.save(v) : v));
   },
   ruleDel: d => del(`/zones/${S.zone}/${RULES[d.key].path}/${d.id}`, "这条规则"),
+  rulesetEdit: async d => {
+    const rs = await api("GET", `/zones/${S.zone}/rulesets/phases/${d.phase}/entrypoint`);
+    openForm("Ruleset · " + d.phase, [
+      { type: "html", html: '<p class="hint">保存会把这个阶段整体替换成下面的规则（顺序即优先级）；带 id 的是原有规则，去掉的会被删除。</p>' },
+      { k: "rules", label: "rules (JSON)", type: "json", defJson: [] }], { rules: rs.rules },
+      v => api("PUT", `/zones/${S.zone}/rulesets/phases/${d.phase}/entrypoint`, { rules: v.rules }), true);
+  },
   emailDns: async () => {
     const e = await api("GET", `/zones/${S.zone}/email`);
     for (const r of e.needed_records || []) await api("POST", `/zones/${S.zone}/dns_records`, r);

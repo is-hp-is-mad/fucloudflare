@@ -567,6 +567,15 @@ pub fn rfc3339(secs: i64) -> String {
         .unwrap_or_default()
 }
 
+/// One step of [`Store::batch_items_async`].
+pub enum ItemOp {
+    /// Create (`id` None) or update an item, as [`Store::save_item_async`]
+    /// does. `at` names where the body came from (`rules[2]`), so that a
+    /// rejected value says which one it was.
+    Save { id: Option<String>, body: serde_json::Value, replace: bool, at: String },
+    Delete(String),
+}
+
 fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
@@ -1374,6 +1383,38 @@ impl Store {
         let (z, id_owned) = (zone_id.to_string(), id.to_string());
         self.mutate_async(move |d, clock, sync_node| apply_delete_item::<T>(d, clock, sync_node, &z, &id_owned))
             .await
+    }
+
+    /// Save and delete several items of one kind as one change: `plan` sees
+    /// the zone's items as they are at that moment and says what to do, and
+    /// either every step lands or, if one fails, none does. The Rulesets API
+    /// (crate::rulesets) replaces a whole phase this way, so a bad rule in
+    /// the middle of a list never leaves the phase half rewritten.
+    pub async fn batch_items_async<T, F>(&self, zone_id: &str, plan: F) -> Result<(), StoreError>
+    where
+        T: Item,
+        F: FnOnce(Vec<T>) -> Result<Vec<ItemOp>, StoreError> + Send + 'static,
+    {
+        let z = zone_id.to_string();
+        self.mutate_async(move |d, clock, sync_node| {
+            if !d.zones.iter().any(|zone| zone.id == z) {
+                return Err(StoreError::ZoneNotFound);
+            }
+            let current: Vec<T> = T::vec(d).iter().filter(|i| i.meta().zone_id == z).cloned().collect();
+            for op in plan(current)? {
+                match op {
+                    ItemOp::Save { id, body, replace, at } => {
+                        apply_save_item::<T>(d, clock, sync_node, &z, id.as_deref(), body, replace).map_err(|e| match e {
+                            StoreError::Invalid(m) if !at.is_empty() => StoreError::Invalid(format!("{at}: {m}")),
+                            other => other,
+                        })?;
+                    }
+                    ItemOp::Delete(id) => apply_delete_item::<T>(d, clock, sync_node, &z, &id)?,
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     // ---- zone settings ----

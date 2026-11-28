@@ -180,6 +180,7 @@ pub fn need(path: &str) -> Need {
                 "redirect_rules" => Area::RedirectRules,
                 "transform_rules" => Area::TransformRules,
                 "cache_rules" => Area::CacheRules,
+                "rulesets" => crate::rulesets::area(z, &segs[3..]),
                 "workers" => Area::WorkersRoutes,
                 "email" => Area::EmailRouting,
                 "spectrum" => Area::Spectrum,
@@ -433,6 +434,11 @@ mod tests {
         assert_eq!(need("/replication/sync"), Need::Closed);
         assert_eq!(need("/user/tokens/verify"), Need::Open);
         assert_eq!(need("/zones/z1/whatever"), Need::Closed);
+        assert_eq!(need("/zones/z1/rulesets"), Need::Zone(Area::Firewall, Some("z1".into())));
+        assert_eq!(
+            need("/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint"),
+            Need::Zone(Area::CacheRules, Some("z1".into()))
+        );
     }
 
     #[test]
