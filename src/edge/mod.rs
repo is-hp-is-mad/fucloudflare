@@ -2120,7 +2120,9 @@ impl Edge {
                 }
                 Verdict::Challenge { click } => {
                     let ip = info.ip.unwrap_or(IpAddr::from([0, 0, 0, 0]));
-                    Some(challenge::page(&self.waf, &zone.zone.id, ip, info.header("user-agent"), click, ray, page_lang, &self.here().colo))
+                    let (ua, colo, ray) = (info.header("user-agent").to_string(), self.here().colo, ray.to_string());
+                    let page = challenge::page(&self.waf, &zone.zone.id, ip, &ua, click, &ray, page_lang, &colo);
+                    Some(page)
                 }
             };
             if let Some(mut resp) = stopped {
