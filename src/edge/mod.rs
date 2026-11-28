@@ -148,6 +148,7 @@ pub const ORIGIN_TLS: Reason = Reason { zh: "与源站的 TLS 握手失败", en:
 pub const ORIGIN_BAD_RESPONSE: Reason = Reason { zh: "源站的响应无效或中途断开", en: "bad gateway" };
 pub const ORIGIN_NOT_CONFIGURED: Reason = Reason { zh: "这个主机名没有配置源站", en: "no origin configured" };
 pub const ORIGIN_UNRESOLVED: Reason = Reason { zh: "源站地址无法解析", en: "origin DNS error" };
+pub const ORIGIN_NO_H2: Reason = Reason { zh: "源站不支持 gRPC 所需的 HTTP/2", en: "the origin does not offer HTTP/2, which gRPC needs" };
 pub const ORIGIN_MISCONFIGURED: Reason = Reason { zh: "源站配置有误", en: "origin misconfigured" };
 
 /// Dashboard note for an origin that is this very edge node.
@@ -161,6 +162,7 @@ impl From<UpstreamError> for EdgeError {
             UpstreamError::Down(d) => EdgeError::origin(521, ORIGIN_DOWN, d),
             UpstreamError::Timeout => EdgeError::origin(522, ORIGIN_TIMEOUT, "the origin did not respond in time"),
             UpstreamError::Tls(d) => EdgeError::origin(525, ORIGIN_TLS, d),
+            UpstreamError::Other(d) if d.contains("does not offer HTTP/2") => EdgeError::origin(502, ORIGIN_NO_H2, d),
             UpstreamError::Other(d) => EdgeError::origin(502, ORIGIN_BAD_RESPONSE, d),
         }
     }
