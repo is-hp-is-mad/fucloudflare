@@ -950,7 +950,9 @@ const ZONE = {
         setRow(z.paused ? "恢复域名" : "暂停域名", z.paused ? "域名已暂停：已代理的记录直接解析到源站。" : "停止代理，已代理的记录直接解析到源站，不经过 CDN 与 WAF。", btn("zonePause", z.paused ? "恢复" : "暂停")))}` };
   },
   async dns(z) {
-    const [recs, ds] = await Promise.all([api("GET", `/zones/${z.id}/dns_records?per_page=5000`), api("GET", `/zones/${z.id}/dnssec`)]);
+    const [recs, ds, qa] = await Promise.all([api("GET", `/zones/${z.id}/dns_records?per_page=5000`), api("GET", `/zones/${z.id}/dnssec`),
+      api("GET", `/zones/${z.id}/dns_analytics`).catch(e => ({ error: e.message }))]);
+    const ro = me.role === "viewer" ? " disabled" : "", axfr = Array.isArray(z.settings.dns_transfer_to) ? z.settings.dns_transfer_to : [];
     C.records = recs;
     const base = sys.cname_base;
     const how = z.type === "full"
@@ -974,7 +976,10 @@ const ZONE = {
         { label: "代理状态", fmt: r => (r.proxied ? '<span class="st px">已代理</span>' : '<span class="st">仅 DNS</span>') },
         { label: "TTL", fmt: r => (r.ttl === 1 ? "自动" : esc(r.ttl)), cls: "num" }, { k: "comment", label: "备注" },
       ], recs, r => rowActs("recEdit", "recDel", { id: r.id }), "<b>还没有记录</b>添加 A、AAAA 或 CNAME 记录，并选择是否经 CDN 代理。", "records")) +
-      card("DNSSEC", btn("dnssecToggle", dsActive ? "关闭 DNSSEC" : "启用 DNSSEC", { enable: dsActive ? "0" : "1" }, dsActive ? "danger" : "pri"), dsBody) };
+      card("DNSSEC", btn("dnssecToggle", dsActive ? "关闭 DNSSEC" : "启用 DNSSEC", { enable: dsActive ? "0" : "1" }, dsActive ? "danger" : "pri"), dsBody) +
+      card("区域传送（AXFR）", "", setRow("允许的辅助名称服务器", "这些地址或网段（地址/前缀，逗号分隔，最多 16 个）可以经 TCP 传送整个区域，区域变更时向其中的单个地址发 NOTIFY。开启了 DNSSEC 的区域不传送。留空为不允许。",
+        `<input data-set="dns_transfer_to" data-list value="${esc(axfr.join(", "))}" placeholder="192.0.2.53, 2001:db8::/48" spellcheck="false" aria-label="允许区域传送的地址"${ro}>`)) +
+      dnsStatsCard(qa) };
   },
   async ssl(z) {
     const s = z.settings;
@@ -983,7 +988,7 @@ const ZONE = {
         sel("ssl", s.ssl, [["flexible", "flexible：HTTP 回源"], ["full", "full：HTTPS，不验证"], ["strict", "strict：HTTPS，验证证书"]], "回源加密")) +
         setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS")) +
         setRow("源站健康检查", "一个主机名有多条代理 A/AAAA 记录时，每个节点定期用这个路径请求每个源站地址；连续两次失败（无应答或 4xx/5xx）的地址排到最后，恢复后自动回来。留空为不检查。", `<input data-set="origin_check_path" value="${esc(s.origin_check_path || "")}" placeholder="/healthz" spellcheck="false" aria-label="源站健康检查路径">`) +
-        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) + await ruleSection(z.id, "cert") };
+        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) + await originHealthCard(z) + await ruleSection(z.id, "cert") };
   },
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
@@ -1020,10 +1025,16 @@ const ZONE = {
       await ruleSection(z.id, "spectrum") + await ruleSection(z.id, "waiting") };
   },
   async caching(z) {
+    const tier = String(z.settings.cache_tier_node || ""), ro = me.role === "viewer" ? " disabled" : "";
+    const nodes = await api("GET", "/nodes").catch(() => []), names = (Array.isArray(nodes) ? nodes : []).map(n => n && n.name).filter(Boolean);
+    const unknown = tier.trim() && names.length && !names.some(n => n.toLowerCase() === tier.trim().toLowerCase());
     return { sub: "边缘缓存的开关与清除。缓存哪些内容由“规则”里的缓存规则决定。", body:
       card("缓存", "", setRow("开发模式", "临时绕过边缘缓存，所有请求直接回源。", sw("development_mode", z.settings.development_mode, "开发模式")) +
         setRow("清除全部缓存", "清除这个域名在所有节点上的缓存对象；其余节点随配置同步清除。", btn("purge", "清除全部缓存")) +
-        setRow("按 URL 清除", "每行一个完整 URL。", `<textarea id="purgeUrls" placeholder="https://${esc(z.name)}/app.js" spellcheck="false" aria-label="要清除的 URL"></textarea>${btn("purgeFiles", "清除这些 URL")}`, "stack")) };
+        setRow("按 URL 清除", "每行一个完整 URL。", `<textarea id="purgeUrls" placeholder="https://${esc(z.name)}/app.js" spellcheck="false" aria-label="要清除的 URL"></textarea>${btn("purgeFiles", "清除这些 URL")}`, "stack")) +
+      card("分层缓存", "", setRow("上层节点", "其他节点的 GET / HEAD 请求经这个节点回源（回源规则另指了源站的除外），它的缓存供全机群共用，源站只被它请求；它刚失败过时各节点改为直接回源。建议选离源站近的节点。留空为不分层，每个节点各自回源。",
+        `<input data-set="cache_tier_node" value="${esc(tier)}" list="tierNodes" placeholder="节点名" spellcheck="false" aria-label="分层缓存的上层节点"${ro}><datalist id="tierNodes">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>` +
+        (unknown ? '<span class="hint">没有这个名字的节点：各节点照常直接回源。</span>' : ""))) };
   },
   async workers(z) {
     return { sub: "把匹配的请求交给 Worker 脚本处理。脚本本身在账户主页的 Workers 里管理。", acts: '<a class="btn" href="#/workers">管理脚本</a>', body: await ruleSection(z.id, "route") };
@@ -1099,8 +1110,68 @@ async function viewZone() {
   return { ...v, title: nav[0] === "overview" ? `${esc(z.name)} ${stateTag(z)}` : nav[1] };
 }
 
+// Read-only tables of what the nodes measure. Each takes the API's answer as it comes (or
+// { error } when the request failed) and copes with missing fields, so a node that answers
+// with less than expected, or nothing yet, shows an empty state rather than breaking the page.
+const isObj = v => !!v && typeof v === "object" && !Array.isArray(v);
+const agoText = s => (Number(s) > 0 ? dur(s) + "前" : "刚刚");
+// GET /zones/{id}/origins/health: [{ name, address, healthy, failures, checked_at, detail }]
+async function originHealthCard(z) {
+  const r = await api("GET", `/zones/${z.id}/origins/health`).catch(e => ({ error: e.message }));
+  const list = Array.isArray(r) ? r.filter(isObj) : [];
+  const state = o => (!o.checked_at ? '<span class="st">等待检查</span>'
+    : o.healthy === false ? `<span class="st bad">不可用</span><span class="sub">连续失败 ${num(o.failures)} 次，请求排到最后</span>`
+    : Number(o.failures) > 0 ? `<span class="st warn">失败 ${num(o.failures)} 次</span>` : '<span class="st ok">正常</span>');
+  const empty = isObj(r) && typeof r.error === "string" ? `<b>读不到检查结果</b>${esc(r.error)}`
+    : !z.settings.origin_check_path ? "<b>没有开启健康检查</b>在上面填写检查路径后，每个节点定期检查已代理的 A / AAAA 记录的每个源站地址。"
+    : "<b>还没有检查结果</b>只检查已代理的 A / AAAA 记录（通配记录除外）；第一次结果在几秒内出现。";
+  return card(`源站健康 <span class="cnt">${list.length}</span>`, "", `<p class="hint" style="padding:0 16px">应答这个页面的节点自己的检查结果；每个节点各自检查，结果不在节点之间同步。</p>` + table([
+    { label: "主机名", fmt: o => `<b>${esc(o.name || "—")}</b>` }, { label: "源站地址", fmt: o => `<span class="mono">${esc(o.address || "—")}</span>` },
+    { label: "状态", fmt: state }, { label: "最近检查", fmt: o => (o.checked_at ? when(o.checked_at) : '<span class="hint">—</span>') },
+    { label: "结果", fmt: o => (o.detail ? `<span class="mono">${esc(o.detail)}</span>` : '<span class="hint">—</span>') },
+  ], list, null, empty, "originHealth"));
+}
+// GET /zones/{id}/dns_analytics: { total, by_type: { A: n, ... }, by_rcode: { NOERROR: n, ... } }
+function dnsStatsCard(qa) {
+  const total = isObj(qa) ? Number(qa.total) || 0 : 0;
+  const counts = m => Object.entries(isObj(m) ? m : {}).map(([k, n]) => ({ k, n: Number(n) || 0 })).filter(x => x.n > 0).sort((a, b) => b.n - a.n || a.k.localeCompare(b.k));
+  const types = counts(qa && qa.by_type), rcodes = counts(qa && qa.by_rcode);
+  const pct = n => (total ? (n / total * 100).toFixed(1) + "%" : "—");
+  const RC = { NOERROR: "正常", NXDOMAIN: "名字不存在", REFUSED: "拒绝" };
+  const head = "本节点自启动以来为这个域名应答的 DNS 查询（重启清零，各节点各自计数）。";
+  if (isObj(qa) && typeof qa.error === "string") return card("查询统计", "", `<div class="empty"><b>读不到查询统计</b>${esc(qa.error)}</div>`);
+  if (!total && !types.length) return card("查询统计", "", `<div class="empty"><b>还没有查询</b>${head}</div>`);
+  return card(`查询统计 <span class="cnt">${num(total)}</span>`, "", `<p class="hint" style="padding:0 16px">${head}</p>` +
+    (rcodes.length ? `<div class="cb">${rcodes.map(x => `<span class="tag ${x.k === "NOERROR" ? "ok" : x.k === "REFUSED" ? "bad" : x.k === "NXDOMAIN" ? "warn" : ""}">${esc(x.k)}${RC[x.k] ? "（" + RC[x.k] + "）" : ""} ${num(x.n)}</span>`).join(" ")}</div>` : "") +
+    table([{ label: "查询类型", fmt: x => `<span class="tag blue">${esc(x.k)}</span>` }, { label: "次数", fmt: x => num(x.n), cls: "num" }, { label: "占比", fmt: x => pct(x.n), cls: "num" }],
+      types, null, "<b>没有按类型的计数</b>", "dnsStats"));
+}
+// GET /steering/measured: { network: { node: { ms, samples, age } } }, shown one row per node and
+// network, grouped by node; where several nodes measured a network, the fastest is marked.
+function measuredCard(m) {
+  const rows = [], best = {}, seen = {};
+  for (const [net, byNode] of Object.entries(isObj(m) ? m : {})) {
+    for (const [node, v] of Object.entries(isObj(byNode) ? byNode : {})) {
+      if (!isObj(v) || typeof v.ms !== "number" || !isFinite(v.ms)) continue;
+      rows.push({ net, node, ms: v.ms, samples: Number(v.samples) || 0, age: Number(v.age) || 0 });
+      best[net] = net in best ? Math.min(best[net], v.ms) : v.ms;
+      seen[net] = (seen[net] || 0) + 1;
+    }
+  }
+  rows.sort((a, b) => a.node.localeCompare(b.node) || a.ms - b.ms || a.net.localeCompare(b.net));
+  const nodes = new Set(rows.map(r => r.node)).size;
+  const empty = isObj(m) && typeof m.error === "string" ? `<b>读不到实测数据</b>${esc(m.error)}` : "<b>还没有实测数据</b>节点在访客经 TLS 1.3 或 QUIC 握手时记录一次往返时间，按网络汇总并随上报同步；只列一天以内的数据。";
+  return card(`实测延迟 <span class="cnt">${nodes} 个节点 · ${new Set(rows.map(r => r.net)).size} 个网络</span>`,
+    rows.length ? `<input type="search" placeholder="搜索节点或网络" data-filter="measured" value="${esc(F.measured || "")}" aria-label="搜索实测延迟">` : "",
+    `<p class="hint" style="padding:0 16px">“实测最快”规则按这些数据选节点。访客网络从精确到粗略，如 <code>CN-JS/4134</code>（国家-省份/运营商 AS 号）、<code>CN/4134</code>、<code>CN-JS</code>、<code>CN</code>。</p>` + table([
+      { label: "节点", fmt: r => `<b>${esc(r.node)}</b>` }, { label: "访客网络", fmt: r => `<span class="mono">${esc(r.net)}</span>` },
+      { label: "往返", fmt: r => `${(Math.round(r.ms * 10) / 10).toFixed(1)} ms` + (seen[r.net] > 1 && r.ms === best[r.net] ? ' <span class="tag ok">最快</span>' : ""), cls: "num" },
+      { label: "样本", fmt: r => num(r.samples), cls: "num" }, { label: "更新", fmt: r => agoText(r.age) },
+    ], rows, null, empty, "measured"));
+}
+
 async function viewSteer() {
-  const [rules, nodes] = await Promise.all([api("GET", "/steering"), api("GET", "/nodes")]);
+  const [rules, nodes, measured] = await Promise.all([api("GET", "/steering"), api("GET", "/nodes"), api("GET", "/steering/measured").catch(e => ({ error: e.message }))]);
   C.steer = rules.sort((a, b) => a.priority - b.priority);
   C.nodes = nodes;
   C.nodeNames = nodes.map(n => n.name);
@@ -1120,7 +1191,7 @@ async function viewSteer() {
       { label: "动作", fmt: r => (r.action === "block" ? '<span class="tag bad">屏蔽解析</span>' : (r.action === "fastest" ? '<span class="tag pri">实测最快</span> ' + (r.nodes.length ? "" : '<span class="hint">全部节点</span>') : "") +
         `<span class="flow flow-drop" data-drop-kind="steer-rule" data-rule-id="${esc(r.id)}">${r.nodes.map((n, i) => `<span class="tag pri fchip" ${admin ? `draggable="true" data-drag-kind="steer-node" data-rule-id="${esc(r.id)}" data-idx="${i}" data-drop-kind="steer-node"` : ""}>${esc(n)}${admin && r.nodes.length > 1 ? `<button type="button" class="x" data-act="steerNodeRm" data-rule-id="${esc(r.id)}" data-idx="${i}" title="从本规则移除">×</button>` : ""}</span>`).join('<span class="arr">→</span>')}</span>`) },
       { label: "状态", fmt: r => (r.enabled ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
-    ], C.steer, r => rowActs("steerEdit", "steerDel", { id: r.id }), `<b>还没有调度规则</b>访客目前只按节点负责的大洲分配。<br><br>${btn("steerEdit", "添加规则", {}, "pri")}`)) };
+    ], C.steer, r => rowActs("steerEdit", "steerDel", { id: r.id }), `<b>还没有调度规则</b>访客目前只按节点负责的大洲分配。<br><br>${btn("steerEdit", "添加规则", {}, "pri")}`)) + measuredCard(measured) };
 }
 
 // -------------------------------------------- Workers, KV, D1 & Cron (R1) ----
@@ -2204,7 +2275,8 @@ document.addEventListener("change", e => {
   if (el.id === "zsw") return go(el.value ? `#/zone/${el.value}/${S.view === "zone" ? S.tab : "overview"}` : "#/zones");
   const key = el.dataset && el.dataset.set;
   if (!key) return;
-  const value = "multi" in el.dataset ? [...document.querySelectorAll(`[data-set="${key}"]:checked`)].map(x => x.value) : el.type === "checkbox" ? el.checked : "num" in el.dataset ? Number(el.value) : el.value;
+  const value = "multi" in el.dataset ? [...document.querySelectorAll(`[data-set="${key}"]:checked`)].map(x => x.value) : el.type === "checkbox" ? el.checked : "num" in el.dataset ? Number(el.value)
+    : "list" in el.dataset ? el.value.split(/[,\s]+/).filter(Boolean) : el.value;
   run(async () => {
     try { await api("PATCH", `/zones/${S.zone}/settings/${key}`, { value }); toast("已保存"); }
     finally { render(); }

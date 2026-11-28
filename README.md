@@ -139,8 +139,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `browser_cache_ttl` | 秒（默认 0） | 边缘会缓存的内容，浏览器缓存时间不足该值时提到该值；0 表示不改源站的 `Cache-Control` |
 | `hsts_max_age` / `hsts_include_subdomains` | 秒（默认 0）/ bool | HTTPS 响应带 `Strict-Transport-Security`；0 表示不发 |
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
-| `origin_check_path` / `origin_check_interval` | 路径（默认空）/ 秒（默认 30） | 源站主动健康检查：每个节点定期请求每个源站地址的这个路径，连续两次失败（无应答或状态码不是 2xx/3xx）的地址排到最后；`GET /zones/{id}/origins/health` 查看本节点的检查结果 |
-| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点 |
+| `origin_check_path` / `origin_check_interval` | 路径（默认空）/ 秒（默认 30） | 源站主动健康检查：每个节点定期请求每个源站地址的这个路径，连续两次失败（无应答或状态码不是 2xx/3xx）的地址排到最后；`GET /zones/{id}/origins/health` 查看本节点的检查结果（面板：域名 → SSL/TLS → 源站健康） |
+| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点（面板：域名 → 缓存 → 分层缓存） |
 | `session_affinity` | bool（默认关） | 会话保持：同一访客 IP 始终回到同一个源站地址（记录的 `origin.weight`，1–100，决定各地址分到的请求比例） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
 | `decoy_subdomains` | bool（默认关） | 伪装子域：没有记录的名字也能解析，但边缘不应答（见"伪装子域"） |
@@ -197,10 +197,10 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 ### DNS：更多记录类型、辅助名称服务器、查询统计
 
 - 记录类型增加 `HTTPS`、`SVCB`（内容如 `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1`）、`TLSA`、`SSHFP`、`DS`（委派出去的子域的 DS）、`NAPTR`、`URI`。
-- 区域设置 `dns_transfer_to`：允许做区域传送（AXFR，仅 TCP）的辅助名称服务器地址或网段；区域变更时向其中的单个地址发 NOTIFY。
+- 区域设置 `dns_transfer_to`：允许做区域传送（AXFR，仅 TCP）的辅助名称服务器地址或网段；区域变更时向其中的单个地址发 NOTIFY。面板：域名 → DNS 记录 → 区域传送（逗号分隔，留空为不允许）。
   传给辅助服务器的内容同样隐藏源站：代理的名字给出全部边缘节点的地址（辅助服务器上没有按访客调度）。开启了 DNSSEC 的区域不传送（签名是按查询在线做的）。
   把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
-- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
+- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分；面板：域名 → DNS 记录 → 查询统计。
 
 ### 回源时出示客户端证书
 
@@ -243,7 +243,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   每个节点记录访客 TLS 1.3 / QUIC 握手的一次往返时间，按网络（国家、省或州、运营商 AS 号，如 `CN-JS/4134`、`CN/4134`、`CN-JS`、`CN`）
   取滑动平均，随上报传给其他节点；DNS 用最精确且至少两个候选节点都有足够样本（5 次握手、一天以内）的那一级来比较。
   `nodes` 是候选节点，留空为全部。数据不足时在候选里轮流分配，另有 5% 的应答随机分给其他候选，以便持续测量。
-  `GET /steering/measured` 返回全部实测数据；面板的"定位"会显示某个地址所在网络的实测排名。
+  `GET /steering/measured` 返回全部实测数据（网络 → 节点 → 往返毫秒、样本数、多少秒前更新），面板"调度与 DNS 屏蔽"页下方的"实测延迟"表按节点列出；"定位"会显示某个地址所在网络的实测排名。
   （TLS 1.2 的握手是两次往返，不计入；经 HTTP/3 前置进来的连接量不到访客的往返时间。）
 - 指向边缘的应答的 TTL 由 `--edge-ttl`（`FUCF_EDGE_TTL`，默认 300 秒）决定，代理记录最多 300 秒：调小后节点故障或超量时访客更快换走，代价是解析次数更多。
 - TLS 会话票据的密钥由机群令牌和时间（每 12 小时一换）导出，所有节点相同：访客被 DNS 换到另一个节点、或节点重启后，

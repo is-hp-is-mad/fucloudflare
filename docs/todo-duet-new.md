@@ -42,7 +42,7 @@
 - 校验与面板照抄 `ignore_query` 的全部接线处；表单加两个逗号分隔输入框。
 - 单元测试：不同头值进不同条目；未配置时行为不变。
 
-### [ ] N3 新功能的面板界面
+### [x] N3 新功能的面板界面
 
 `src/panel.html` 很大（187 KB），只许按锚点搜片段、不许整读。锚点：`function card(`、`steerTest`、`setRow`、`async function api(`。
 
@@ -139,3 +139,9 @@
 - 校验：各最多 8 个、名字 1–64 字符、不能重复；头名限字母数字 `-` `_` 并存成小写，Cookie 名用 RFC 6265 token 字符、保留大小写。缺失按空值；同名 Cookie 取第一个。加了这些值后键超过 2048 字节的请求不查也不存（`BYPASS`），上限只对加了这些字段的规则生效。额外放宽：源站 `Vary` 指向键里已有的头时照常缓存。
 - Rulesets：映射到 `action_parameters.cache_key.custom_key.header.include` / `cookie.include`，`check_presence` 只接受空，`exclude_origin` 等其他字段一律 400；`ignore_query` 仍不映射、经 Rulesets 修改时保留。
 - 没把握：滚动升级期间旧节点不认识新字段，会不区分取值地缓存（按 Cookie 区分个人内容时可能串给别人，升级完之前不要这样用）；头名存成小写，Terraform 写大写可能一直显示差异；Terraform provider 若总是带 `exclude_origin: false`，PUT 会失败。
+
+### N3
+- 面板（`src/panel.html`）：调度页下方加"实测延迟"表（`/steering/measured`，网络 → 节点 → `ms/samples/age`，按节点分组，同一网络多个节点时标出最快）；域名 SSL/TLS 页加"源站健康"表（`/origins/health`，`name/address/healthy/failures/checked_at/detail`）；DNS 记录页加"区域传送（AXFR）"输入框和"查询统计"（`/dns_analytics`，`total/by_type/by_rcode`）；缓存页加"分层缓存"上层节点输入框（附节点名候选）。
+- 接口形状以代码为准，和任务单写的不同；三个表都只反映应答面板的那个节点，卡片里写明了。
+- `dns_transfer_to` 用新的 `data-list` 标记，change 处理里按逗号或空白拆成数组发送，留空发 `[]`；只读角色看到的两个输入框是禁用的，表格谁都能看。
+- 每个表都有空态，接口失败、字段缺失、类型不对都不报错（用 node 跑过各种异常输入）。没在浏览器里实际看过；调度页原有的"添加规则"对非管理员仍可见（服务端会拒），未改。
