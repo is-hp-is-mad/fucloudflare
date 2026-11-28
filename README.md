@@ -55,7 +55,21 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--mail-host` | 无 | 本节点在 SMTP 问候语与 MX 建议里使用的主机名（可逗号分隔多个，第一个用于 banner） |
 | `--mail-relay` | 无 | 外发邮件中继（`smtp://[user:pass@]host[:587]` 强制 STARTTLS，或 `smtps://[user:pass@]host[:465]` 隐式 TLS）；出方向 25 端口受限的云主机必须配置 |
 | `--cache-mb` | `512` | 边缘缓存上限 |
+| `--cache-disk-mb` / `--cache-disk-dir` | `150` / `<数据目录>/cache` | 边缘缓存的磁盘层大小（MiB，`0` 为只用内存）和目录：放内存里放不下的、以及重启前缓存的对象 |
 | `--data-dir` | `data` | 配置 `state.json`、`api_token`、分析数据 `analytics.json`、安全事件 `events.json`、ACME 账户 `acme_account.json`、本节点流量计数 `usage.json` |
+| `--api-token` | 自动生成 | 机群自己的 API 令牌（节点之间、运维脚本用，拥有全部权限）；不给时生成一个存进 `<数据目录>/api_token` |
+| `--ns` | `ns1.fucf.local,ns2.fucf.local` | 本部署的名称服务器主机名，分配给新建的区域 |
+| `--ip-reputation` | `true` | 按公开黑名单给访客地址打威胁分（每 12 小时拉取），供安全级别和 `fcf.threat_score` 使用；`false` 关闭 |
+| `--tls-cert-dir` | 无 | 别的工具签发、续期的证书所在目录（acme.sh、certbot、Caddy 的存储，或手写的 `名字.crt` + `名字.key`），可逗号分隔多个；配置里没有证书的名字用它们，每分钟重新看一次 |
+| `--tls-default-sni` | 无 | TLS 客户端不带 SNI（按 IP 连接）时当作的服务器名，例如本节点的公网地址 |
+| `--acme-webroot` | 无 | 外部 ACME HTTP-01 质询的 webroot 目录（`<目录>/.well-known/acme-challenge/<令牌>`），让 fucf 自己占 80 端口而不用 Caddy / nginx |
+| `--export-domains` | 无 | 域名列表变化时把全部托管域名（加面板主机名和 CNAME 基础域名）每行一个写进这个文件（给 HAProxy 的 `-m dom -f` 用） |
+| `--quic-fallback` / `--quic-fallback-sni` | 无 | 与另一个 QUIC 服务（如 Hysteria 2）共用 UDP 443：按 QUIC Initial 里的 SNI 分流，不属于托管区域（或在 `--quic-fallback-sni` 里列出）的转到这个本地地址，见"原生反向代理、Hysteria 2 回落、`/cdn-cgi/*` 与节点内回源" |
+| `--warp-upstream` | 无 | `/cdn-cgi/fucf-warp` 的本地流式后端（如 `h2c://127.0.0.1:10002/ray`） |
+| `--proxy-listen` / `--proxy-tls-listen` / `--proxy-h3-listen` | 无 | 原生反向代理的监听（HTTP/1.1 + h2c，`ip:port[=标签]`；TLS + HTTP/2；QUIC / HTTP/3），可逗号分隔多个，规则见 `/proxy/rules` |
+| `--file-root-allow` | 无 | 带 `file_root` 的反代规则可以提供文件的目录（含其下所有内容），可逗号分隔多个；不配置时一个文件都不提供 |
+| `--backup-dir` / `--backup-every-hours` / `--backup-keep` | `<数据目录>/backups` / `6` / `28` | 本节点备份的位置、间隔（小时，`0` 为不备份）和保留份数，见"备份与恢复" |
+| `--restore-from` | 无 | 启动时并入这份备份（这里更新的保留），用于从备份恢复机群 |
 
 所有参数都有 `FUCF_*` 环境变量，见 `fucf --help`。
 
@@ -91,7 +105,9 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/origin_rules[/{id}]          CRUD             {"expression", "origin_host", "origin_port", "origin_scheme", "host_header", "sni", "priority"}
 /zones/{id}/redirect_rules[/{id}]        CRUD             {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
 /zones/{id}/transform_rules[/{id}]       CRUD             {"expression", "rewrite_path", "set_request_headers", "remove_request_headers", "set_response_headers", "remove_response_headers"}
-/zones/{id}/cache_rules[/{id}]           CRUD             {"expression", "cache": true|false, "edge_ttl", "ignore_query", "priority"}
+/zones/{id}/cache_rules[/{id}]           CRUD             {"expression", "cache": true|false, "edge_ttl", "ignore_query", "cache_key_headers", "cache_key_cookies", "priority"}
+/zones/{id}/dnssec                       GET PATCH        {"status": "active|disabled"}；GET 返回给注册商的 DS 记录
+/zones/{id}/custom_hostnames[/{id}]      GET POST PATCH DELETE   {"hostname", "custom_origin_server"}，没有 PUT，见"自定义主机名（SSL for SaaS）"
 /zones/{id}/origins/health               GET              本节点对这个区域各源站地址的健康检查结果（区域设置 origin_check_path）
 /zones/{id}/dns_analytics                GET              本节点自启动以来为这个区域应答的 DNS 查询数：{"total", "by_type", "by_rcode"}
 /zones/{id}/email                        GET PATCH        区域邮件路由开关、规则、当前 MX/SPF/DKIM 及缺失的建议 DNS 记录；PATCH {"dkim_selector", "dkim_private_key"}
@@ -103,7 +119,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/spectrum/apps[/{id}]         CRUD             {"protocol":"tcp/2222", "dns":{"name":"ssh"}, "origin_direct":["tcp://192.0.2.1:22"], "proxy_protocol":"off|v1"}
 /zones/{id}/workers/routes[/{id}]        CRUD             {"pattern":"example.com/api/*", "script":"name"}
 /workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码，或只含一个模块的 wrangler 式 multipart 上传，见“Workers”
-/workers/scripts/{name}/settings         GET PATCH        {"vars": {"KEY":"value"}}
+/workers/scripts/{name}/settings         GET PATCH        {"vars": {"KEY":"value"}, "kv_bindings": {"名字": 命名空间 id}, "d1_bindings": {"名字": 数据库 id}, "crons": ["*/5 * * * *"]}
+/workers/scripts/{name}/scheduled        POST             {"cron": "*/5 * * * *"}：立即运行一次 scheduled()
 ```
 
 ### 高级回源（记录上的 `origin`）
@@ -139,9 +156,9 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 |------|------|------|
 | `ssl` | `flexible`(默认) / `full` / `strict` | 回源用 HTTP / HTTPS 不验证书 / HTTPS 验证书 |
 | `mtls` | `off`(默认) / `on` | 只接受出示了有效客户端证书的访客，其余一律 403，见"访客客户端证书（mTLS）" |
-| `always_use_https` | bool | HTTP 301 到 HTTPS |
+| `always_use_https` | bool（默认关） | HTTP 301 到 HTTPS |
 | `waf` | `block`(默认) / `log` / `off` | 托管规则集模式 |
-| `development_mode` | bool | 绕过缓存 |
+| `development_mode` | bool（默认关） | 绕过缓存 |
 | `http2` | bool（默认开） | 向访客提供 HTTP/2；关闭后 TCP 上只有 HTTP/1.1 |
 | `http3` | bool（默认开） | 提供 HTTP/3 (QUIC)，通过 `Alt-Svc` 头和 HTTPS DNS 记录通告；关闭后两者都不再通告 |
 | `edge_nodes` | 节点名数组（默认空） | 只由这些节点服务该区域；空表示所有节点，按访客位置调度 |
@@ -160,6 +177,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
 | `decoy_subdomains` | bool（默认关） | 伪装子域：没有记录的名字也能解析，但边缘不应答（见"伪装子域"） |
 | `auto_firewall` 及 `auto_firewall_*` | 见"自动防火墙" | 按近期安全事件自动封禁地址、网络，或切到受攻击模式 |
+| `auto_level_restore` / `auto_level_until` | 字符串（默认空）/ unix 秒（默认 0） | 自动防火墙把区域切到受攻击模式期间自己记下的：恢复成哪个级别、到什么时候；不用手动设置 |
 | `error_pages` | 对象（默认 `{}`） | 自定义错误页：键为 `5xx` / `block` / `ratelimit` / `1xxx`，值为 HTML（见"自定义错误页"） |
 
 ### 规则表达式
@@ -413,7 +431,7 @@ curl https://<任意接入的主机名>/cdn-cgi/fucf-trace      # 看请求落�
 ## 证书
 
 - **上传**：`custom_certificates`，优先级最高。
-- **托管（自动签发）**：`POST /zones/{id}/ssl/certificate_packs`，不带参数即为区域的根域名加通配符。主节点向 CA 下单、完成验证、
+- **托管（自动签发）**：`POST /zones/{id}/ssl/certificate_packs`，不带参数即为区域的根域名加通配符。持有 ACME 租约的那台节点（在线节点中名字最小的优先，租约 2 分钟，过期 30 秒后由别的节点接手）向 CA 下单、完成验证、
   把证书写进配置（随配置同步到所有节点），剩余有效期不足三分之一时自动续期；失败按 10 分钟起、逐次翻倍（最长一天）重试，
   原因写在 `error` 里，`PATCH` 可立即重试。续期失败期间继续使用原证书。
 - 两者都没有时，为托管域名即时生成自签名证书。
@@ -426,8 +444,8 @@ curl https://<任意接入的主机名>/cdn-cgi/fucf-trace      # 看请求落�
 | `tls-alpn`（TLS-ALPN-01） | `auto` 对 CNAME 接入（partial）区域的普通主机名用它 | 该主机名的 443 最终到达本服务的 HTTPS 监听（按 SNI 透传的四层代理不影响） |
 | `http`（HTTP-01） | 手动指定 | 该主机名的 80 到达本服务的 HTTP 监听 |
 
-质询应答随配置同步到所有节点（CA 的多个验证点可能落在任何一个节点上），主节点等在线的副本都确认拿到之后才通知 CA 验证。
-ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--acme-directory` 指向 Let's Encrypt 的 staging 目录
+质询应答随配置同步到所有节点（CA 的多个验证点可能落在任何一个节点上），下单的节点等在线的其他节点都确认拿到之后才通知 CA 验证。
+ACME 账户密钥只保存在下单节点自己的数据目录里，不同步。测试时可把 `--acme-directory` 指向 Let's Encrypt 的 staging 目录
 `https://acme-staging-v02.api.letsencrypt.org/directory`，避免触发正式环境的频率限制。
 
 ### 自定义主机名（SSL for SaaS）
@@ -454,7 +472,7 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 
 ## 请求处理顺序
 
-`/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
+区域设置 `mtls`（没有经验证的客户端证书则 403，到此为止）→ `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
 
 - HTTP/3：与 HTTPS 同端口号的 UDP 上提供，HTTPS 响应带 `Alt-Svc` 头引导客户端升级；三种协议共用同一条处理链路。
 - 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli、zstd 或 gzip（源站已压缩的不动）。固定按 brotli → zstd → gzip 的顺序选，`q=0` 的不用；同时支持 br 和 zstd 的浏览器照旧拿 brotli，只支持 zstd 不支持 br 的才拿 zstd（级别 3）。zstd 用的是 C 库（zstd-sys），编译要有 C 编译器，静态（musl）构建照 aws-lc-rs 的设置用 `musl-gcc` 就够。
@@ -591,6 +609,7 @@ Terraform、各种 DDNS 脚本只要把 API 地址换掉就能用。
 /accounts[/{id}]                          GET              唯一的账户（Cloudflare 工具需要它的 id）
 /accounts/{id}/workers/scripts/...        同 /workers/scripts/...；/accounts/{id}/storage/kv/namespaces/... 同 /kv/namespaces/...；
 /accounts/{id}/d1/database/...            同 /d1/database/...；/accounts/{id}/tokens/... 同 /user/tokens/...
+/accounts/{id}/audit_logs                同 /audit；/accounts/{id}/rules/lists/... 和 /accounts/{id}/challenges/widgets/... 同名映射；其他路径 404（code 7000），别的账户 id 404（code 7003）
 /account/api_key                          POST             {"password", "remove": false}：生成（或删除）自己的 Global API Key
 ```
 
@@ -701,9 +720,10 @@ DNS 记录的 Cloudflare 兼容补充：
 
 区域设置 `auto_firewall`（面板：域名 → 安全 → 自动防火墙，默认关）：每 30 秒看一次最近的安全事件——托管规则命中（拦截或记录）、防火墙拦截、限速——
 在 `auto_firewall_window` 秒（默认 600）内攻击达到 `auto_firewall_threshold` 次（默认 10）的地址，被加进这个域名的一条自动规则
-（`managed_by: auto_firewall`，表达式 `ip.src in {...}`，优先级 1000，动作 `auto_firewall_action`：block 或 managed_challenge），
+（`managed_by: auto_firewall`，表达式 `ip.src in {...}`，优先级 1000，动作 `auto_firewall_action`：block、managed_challenge 或 js_challenge），
 封 `auto_firewall_ban` 秒（默认 86400）；期间继续攻击会续期，到期自动移出，空了规则就删掉。IPv6 按 /64 封；机群节点自己的地址和内网地址从不封；
-最多 1000 个地址（保留最晚到期的）。在主节点上运行（它有全机群的安全事件），规则随配置同步到所有节点。
+最多 1000 个地址（保留最晚到期的）。只在面板所在的节点（没有 `--panel-origin` 的对等节点，每个对等节点都有全机群的安全事件）上运行，保证规则只有一个写入者，规则随配置同步到所有节点。
+取值范围：`auto_firewall_threshold` 1–100000，`auto_firewall_window` 60–86400 秒，`auto_firewall_ban` 60–2592000 秒，`auto_firewall_network_ips` 2–100000，`auto_firewall_surge` 0 或 5–1000000。
 
 另外两条自动维护的规则：
 - 按网络：同一个 ASN 里有 `auto_firewall_network_ips`（默认 10）个机房 / VPN / 黑名单地址在攻击时，整个 ASN 的访客先点一下人机验证
@@ -762,7 +782,7 @@ DNS 记录的 Cloudflare 兼容补充：
 
 ## 安全级别、IP 纯净度与页面内人机验证
 
-- `security_level`：`off` / `low`（简易：威胁分 ≥ 80 要验证）/ `medium`（中等：≥ 50）/ `high`（严格：≥ 25，含机房 IP）/ `under_attack`（受攻击模式：所有人）。
+- `security_level`：`off`（`essentially_off` 在这里与它相同）/ `low`（简易：威胁分 ≥ 80 要验证）/ `medium`（中等：≥ 50）/ `high`（严格：≥ 25，含机房 IP）/ `under_attack`（受攻击模式：所有人）。
   级别越高，验证要做的计算越多（17 / 18 / 19 位），对可疑环境越不宽容。`/.well-known/acme-challenge/` 和 `/cdn-cgi/` 永远不验证。
 - 威胁分（0–100，规则里写 `cf.threat_score` 或 `fcf.threat_score`）：每个节点每 12 小时拉一次 FireHOL level1/level2、Tor 出口、VPN 与机房网段
   （存在 `<数据目录>/reputation`，`FUCF_IP_REPUTATION=false` 关闭），加上按 AS 名称识别的云厂商、本机群自动封禁过的地址；内网、机群自己的地址、
@@ -1023,7 +1043,7 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 
 工具版本都钉死（Terraform 和 ddclient 校验 SHA-256，Go 模块经校验和数据库，npm 包经 registry 的完整性哈希），
 示例数据只用 `example.com` / `example.net` / `*.test` 和文档地址段。这份工作流是在没有运行过的情况下写的，
-第一次实际运行后还要按日志调整（各作业的日志作为 artifact 上传）；已知 wrangler 和 ddclient 用到的个别接口 fucf 目前可能还不支持。
+第一次实际运行后还要按日志调整（各作业的日志作为 artifact 上传）。已知会失败的两处：wrangler 上传前要读 `/accounts/{id}/workers/services/{name}`，fucf 还没有这个接口；ddclient 请求的 `/zones/?name=…` 带结尾斜杠，fucf 不认，两处都返回 404。
 
 ## 已知限制
 

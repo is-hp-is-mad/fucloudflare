@@ -84,7 +84,7 @@ by `id` or by `name`:
 | DNS Read / DNS Write | zone | `/zones/{id}/dns_records…` |
 | Cache Purge | zone | `/zones/{id}/purge_cache` |
 | Firewall Services Read / Write | zone | firewall rules, rate limits, security events |
-| SSL and Certificates Read / Write | zone | certificate packs, custom certificates, `/zones/{id}/origin_ca…` |
+| SSL and Certificates Read / Write | zone | certificate packs, custom certificates, `/zones/{id}/custom_hostnames…`, `/zones/{id}/origin_ca…` |
 | Origin Rules, Dynamic Redirect, Transform Rules, Cache Rules Read / Write | zone | the rule lists of those names |
 | Workers Routes Read / Write | zone | `/zones/{id}/workers/routes` |
 | Email Routing Rules Read / Write | zone | `/zones/{id}/email…` |
@@ -98,11 +98,15 @@ by `id` or by `name`:
 | Account Analytics Read, Audit Logs Read | account | `/analytics`, `/audit` |
 | Backup Read | account | `GET /backup` (everything, secrets included: guard such a token) |
 | Account Filter Lists Read / Write | account | `/rules/lists…` (IP lists) |
+| Turnstile Sites Read / Write | account | `/challenges/widgets…` (human-check widgets) |
 | API Tokens Read / Write | user | `/user/tokens…` |
 
 Cloudflare's account-level paths work too: `/accounts/{account id}/workers/scripts/…`,
 `/accounts/{account id}/storage/kv/namespaces/…`, `/accounts/{account id}/d1/database/…`,
-`/accounts/{account id}/tokens/…`, `/accounts/{account id}/rules/lists/…`.
+`/accounts/{account id}/tokens/…`, `/accounts/{account id}/rules/lists/…`,
+`/accounts/{account id}/challenges/widgets/…`, and `/accounts/{account id}/audit_logs` (the same as `/audit`).
+Any other path under `/accounts/{account id}/` answers `404` (code `7000`), and an account id that is
+not this one `404` (code `7003`).
 
 ## Zones and DNS records
 
@@ -194,7 +198,7 @@ Settings that belong here:
 
 | Setting | Values |
 | --- | --- |
-| `security_level` | `off`, `low` (threat score ≥ 80 is challenged), `medium` (≥ 50), `high` (≥ 25: data centres too), `under_attack` (everybody). Higher levels also ask for more work and tolerate less doubt. |
+| `security_level` | `off` (also `essentially_off`, the same here), `low` (threat score ≥ 80 is challenged), `medium` (≥ 50), `high` (≥ 25: data centres too), `under_attack` (everybody). Higher levels also ask for more work and tolerate less doubt. |
 | `challenge_script` | `true`: the fcf script goes into the site's HTML pages. It passes the check quietly in the background, and settles challenged `fetch` requests in place (a click box over the page, then the request is sent again: no reload). |
 | `waf` | managed ruleset: `block`, `log`, `off` |
 | `auto_firewall` | ban addresses from recent security events (see below) |
@@ -243,7 +247,7 @@ firewall blocks, rate limit hits) are counted, and the zone's own rules are kept
 
 | Rule | When | Does |
 | --- | --- | --- |
-| addresses (`managed_by: auto_firewall`) | `auto_firewall_threshold` attacks (default 10) within `auto_firewall_window` seconds (600) | `auto_firewall_action` (`block` or `managed_challenge`) for `auto_firewall_ban` seconds (86400), extended while it goes on; IPv6 by /64 |
+| addresses (`managed_by: auto_firewall`) | `auto_firewall_threshold` attacks (default 10) within `auto_firewall_window` seconds (600) | `auto_firewall_action` (`block`, `managed_challenge` or `js_challenge`) for `auto_firewall_ban` seconds (86400), extended while it goes on; IPv6 by /64 |
 | networks (`managed_by: auto_firewall_networks`) | `auto_firewall_networks` on and at least `auto_firewall_network_ips` (10) data centre / VPN / listed addresses of one ASN attacked | `managed_challenge` for the whole ASN (the fleet's own addresses excepted); home ISPs are never taken as a whole |
 | security level | `auto_firewall_surge` (50; 0 off) different attackers within the window | `under_attack` for an hour after the surge was last seen, then back to the level before |
 
@@ -381,7 +385,8 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `grpc` | `true`, `false` |
 | `email_routing` | `false`, `true` |
 | `decoy_subdomains` | `false`, `true` |
-| `auto_firewall` | `false`, `true`, with `auto_firewall_threshold` (10), `auto_firewall_window` (600), `auto_firewall_ban` (86400), `auto_firewall_action` (`block`, `managed_challenge`, `js_challenge`), `auto_firewall_networks` (`true`), `auto_firewall_network_ips` (10), `auto_firewall_surge` (50; 0 off) |
+| `auto_firewall` | `false`, `true`, with `auto_firewall_threshold` (10), `auto_firewall_window` (600), `auto_firewall_ban` (86400), `auto_firewall_action` (`block`, `managed_challenge`, `js_challenge`), `auto_firewall_networks` (`true`), `auto_firewall_network_ips` (10), `auto_firewall_surge` (50; 0 off); ranges: threshold 1 to 100000, window 60 to 86400 s, ban 60 to 2592000 s, network ips 2 to 100000, surge 0 or 5 to 1000000 |
+| `auto_level_restore`, `auto_level_until` | `""`, `0`: kept by the automatic firewall while it holds the zone in `under_attack` (the level to go back to, and until when in unix seconds); not meant to be set by hand |
 | `error_pages` | `{}`, or HTML templates by key: see "Custom error pages" below |
 | `origin_check_path` | `""` (no checks), or a path such as `/healthz` (at most 256 bytes): see [Origins](#origins-health-checks-weights-and-session-affinity) |
 | `origin_check_interval` | `30`: 10 to 3600 seconds between two checks of an address |

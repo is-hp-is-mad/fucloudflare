@@ -192,8 +192,9 @@ jobs:
           echo "$RUNNER_TEMP/wrangler-bin/node_modules/.bin" >> "$GITHUB_PATH"
       # Expect: a dry run makes no API call and writes what deploy would
       # upload (kept as an artifact, to compare with what fucf received).
-      # --no-bundle: fucf turns `export default` into its own form and may not
-      # read esbuild's `export { x as default }`, so the file goes up as written.
+      # --no-bundle: the one file goes up as written. fucf also reads esbuild's
+      # closing `export { x as default };` (docs/api.md, Workers), but a real
+      # wrangler bundle (with its middleware facade) has not been tried yet.
       - name: wrangler deploy --dry-run
         working-directory: e2e/compat/wrangler
         run: |
@@ -204,11 +205,13 @@ jobs:
       # and treats only Cloudflare's codes 10007 / 10090 as "not there yet";
       # the upload is multipart/form-data (metadata + module). The debug log
       # lists every request it made.
-      # Known to fail against fucf as of this draft (tried by hand on a local
-      # build): /workers/services/{name} has no route (404, code 7000, which
-      # wrangler does not take for "not found"), and PUT /workers/scripts/{name}
-      # takes the raw body as the script, so a multipart upload is refused
-      # with a syntax error. Both need src/api.rs.
+      # Known to fail against fucf as of this draft: /workers/services/{name}
+      # has no route (404, code 7000, which wrangler does not take for "not
+      # found"), so wrangler stops before the upload; that needs src/api.rs.
+      # The upload itself is taken: PUT /workers/scripts/{name} reads a
+      # multipart body with a metadata part and one JavaScript module
+      # (src/workers/upload.rs) and stores the module; an upload with a
+      # non-empty bindings list, several modules or assets is refused (400).
       - name: wrangler deploy
         working-directory: e2e/compat/wrangler
         env:

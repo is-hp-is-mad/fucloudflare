@@ -122,7 +122,7 @@
 - 单元测试：上下文复用不串状态、字节体读取。
 - HTMLRewriter、Cache API、WebSocket、密钥绑定**不做**，等引擎选型后统一弄。
 
-### [ ] N13 收尾自查
+### [x] N13 收尾自查
 
 - 全部任务完成后：通读 `docs/todo-duet.md` 与本文档，逐项核对交接记录；把 `docs/api.md`、README 与代码最终对齐一遍；交接里列出"集成阶段最可能编译失败的 5 个地方"供另一方优先修。
 
@@ -200,3 +200,9 @@
 - 字节体：`request.arrayBuffer()` / `bytes()`，`new Response(ArrayBuffer | Uint8Array | DataView …)`，经新的宿主函数 `__bodyBytes` / `__bodyPut` / `__textBytes` 走，不经字符串或 base64；0..=255 加非法 UTF-8 逐字节往返；单个 16 MiB、一次执行合计 64 MiB。
 - 多文件：新文件 `src/workers/upload.rs` 解析 wrangler 的 multipart（`metadata` + 恰好一个 JS 模块），`put_worker` 按 `Content-Type` 分流；多个模块、wasm、source map、非空 `bindings`、`assets` 一律 400。`transform` 认 esbuild 的 `export { x as default };`。文档写明先 `wrangler deploy --dry-run --outdir dist` 打包再用 curl 上传。
 - 留待能跑 wrangler 的人：`/accounts/{id}/workers/services/{name}` 还没有（wrangler 认 10007 或 10090），之后还要 secrets 检查、`/subdomain`、`/schedules`；`compat.yml` 里 wrangler 作业的注释已部分过时；没拿真实的 esbuild 打包产物（带 middleware facade 的）试过。
+
+### N13
+- 对照 T1..T13、N1..N12 的交接逐条核对代码。过时的：T3（限速现在接受 asnum/country/host/path/header/cookie 和 counting_expression，只拒 requests_to_origin）、T6（auto_firewall_action 还有 js_challenge）、T13（multipart 上传已由 N12 支持，缺的只是 /workers/services/{name} 和 ddclient 的 `/zones/` 结尾斜杠，放进 T14）。其余常量、函数都与代码一致。
+- docs/api.md、README.md 补齐了 router 的全部路由、Settings 全部字段（默认值和范围）、main.rs 全部参数；请求处理顺序加上 mtls；证书一节改为“持有 ACME 租约的节点下单，账户密钥不同步”；compat.yml 只改了注释。
+- 没改 Rust 代码。留待以后：src/auth.rs 顶部注释过时；accelerate 节点的 full_resync 不保留各条目集合（custom_hostnames、waiting_rooms 等，放进 T14）；ci.yml 打包步骤的 `|| true` 会掩盖跑不起来的二进制；README 的节点限流、滚动更新、机群部署三节仍按主节点/副本描述。
+- 集成和上线最可能出问题的 5 处：1) musl 静态包里 aws-lc-sys / zstd-sys 的 C 编译（CI 日志看用的是哪个构建器，`file` 确认静态链接并真的跑一下）；2) Windows 上 `cargo check --tests` 也要跑这两个构建脚本，需要 MSVC；3) 滚动升级时旧节点写回会丢新字段（owner、mtls、origin_ca、cache_key_cookies 等，丢 mtls 是安全降级，丢缓存键字段可能串内容），新字段等全部节点升完再开；4) 回源先报 X25519MLKEM768，ClientHello 变成约 1.5 KB，不耐受的源站或中间设备可能回 525；5) 访客 ClientHello 变大后，慢链路上 JA4 可能取不到（Bot 分 -25），和 Hysteria 共用 UDP 443 的节点要用 Chrome 实测 h3。
