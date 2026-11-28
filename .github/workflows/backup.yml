@@ -1,0 +1,62 @@
+name: backup
+
+# A copy of everything the fleet replicates, away from every node: pulled
+# from the panel's API, encrypted to an age public key (only whoever holds
+# the private key can read it), kept as a workflow artifact.
+#
+# Set up (nothing happens until all three are there):
+#   secret   FUCF_BACKUP_URL            e.g. https://panel.example.com/client/v4/backup
+#   secret   FUCF_BACKUP_TOKEN          an API token with only "Backup Read"
+#   variable FUCF_BACKUP_AGE_RECIPIENT  an age public key (age1...); keep the private key offline
+# Restore: age -d -i key.txt fucf-backup-*.json.gz.age > b.json.gz, then start a
+# node with --restore-from b.json.gz (see README, "备份与恢复").
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: check the setup
+        id: setup
+        env:
+          URL: ${{ secrets.FUCF_BACKUP_URL }}
+          TOKEN: ${{ secrets.FUCF_BACKUP_TOKEN }}
+          RECIPIENT: ${{ vars.FUCF_BACKUP_AGE_RECIPIENT }}
+        run: |
+          if [ -z "$URL" ] || [ -z "$TOKEN" ] || [ -z "$RECIPIENT" ]; then
+            echo "backup is not set up (FUCF_BACKUP_URL, FUCF_BACKUP_TOKEN, FUCF_BACKUP_AGE_RECIPIENT): nothing to do"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: fetch and encrypt
+        if: steps.setup.outputs.ready == 'true'
+        env:
+          URL: ${{ secrets.FUCF_BACKUP_URL }}
+          TOKEN: ${{ secrets.FUCF_BACKUP_TOKEN }}
+          RECIPIENT: ${{ vars.FUCF_BACKUP_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq age >/dev/null
+          umask 077
+          name="fucf-backup-$(date -u +%Y%m%dT%H%M%SZ).json.gz"
+          # never on disk unencrypted
+          curl -fsS --retry 3 -H "Authorization: Bearer $TOKEN" "$URL" | age -r "$RECIPIENT" -o "$name.age"
+          size=$(stat -c %s "$name.age")
+          [ "$size" -gt 200 ] || { echo "the backup is suspiciously small ($size bytes)"; exit 1; }
+          echo "NAME=$name.age" >> "$GITHUB_ENV"
+          echo "encrypted backup: $name.age ($size bytes)"
+      - uses: actions/upload-artifact@v4
+        if: steps.setup.outputs.ready == 'true'
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}
+          retention-days: 90
+          if-no-files-found: error

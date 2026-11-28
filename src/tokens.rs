@@ -67,13 +67,14 @@ pub enum Area {
     Fleet,
     AccountAnalytics,
     AuditLogs,
+    Backup,
     Tokens,
 }
 
 impl Area {
     fn scope(self) -> Scope {
         match self {
-            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs => Scope::Account,
+            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup => Scope::Account,
             Area::Tokens => Scope::User,
             _ => Scope::Zone,
         }
@@ -131,6 +132,7 @@ groups! {
     "6c7d6e3f5a9c4ad6e3f8a4b5c6d7e8f9" "Fleet Write" Fleet true "Change nodes, steering and local proxy rules; act on nodes; roll out releases";
     "b89a480218d04ceb98b4fe57ca29dc1f" "Account Analytics Read" AccountAnalytics false "Read account-wide analytics";
     "b05b28e839c54467a7d6cba5d3abb5a3" "Audit Logs Read" AuditLogs false "Read the audit log";
+    "7d8e7f405b0d4be7f4a9b5c6d7e8f9a0" "Backup Read" Backup false "Download a full backup (everything, secrets included: guard the token)";
     "0cc3a61731504c89b99ec1be78b77aa0" "API Tokens Read" Tokens false "List your API tokens";
     "686d18d5ac6c441c867cbf6771e58a0a" "API Tokens Write" Tokens true "Create, change, roll and delete your API tokens";
 }
@@ -190,6 +192,7 @@ pub fn need(path: &str) -> Need {
         ["kv", ..] => Need::Account(Area::WorkersKv),
         ["d1", ..] => Need::Account(Area::D1),
         ["audit", ..] => Need::Account(Area::AuditLogs),
+        ["backup"] => Need::Account(Area::Backup),
         ["analytics", ..] => Need::Account(Area::AccountAnalytics),
         ["fleet", ..] | ["nodes", ..] | ["steering", ..] | ["proxy", ..] | ["system", ..] | ["releases", ..] | ["warp", ..] | ["email", "status"] => {
             Need::Account(Area::Fleet)

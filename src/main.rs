@@ -1,6 +1,7 @@
 mod acme;
 mod api;
 mod auth;
+mod backup;
 mod dns;
 mod edge;
 mod expr;
@@ -254,6 +255,23 @@ struct Args {
     /// Host names of this deployment's nameservers, assigned to new zones.
     #[arg(long = "ns", env = "FUCF_NS", value_delimiter = ',', default_value = "ns1.fucf.local,ns2.fucf.local")]
     name_servers: Vec<String>,
+
+    /// Where this node keeps its backups (default: `<data dir>/backups`).
+    #[arg(long, env = "FUCF_BACKUP_DIR")]
+    backup_dir: Option<PathBuf>,
+
+    /// Hours between backups (0: none).
+    #[arg(long, env = "FUCF_BACKUP_EVERY_HOURS", default_value_t = 6)]
+    backup_every_hours: u64,
+
+    /// How many backups are kept.
+    #[arg(long, env = "FUCF_BACKUP_KEEP", default_value_t = 28)]
+    backup_keep: usize,
+
+    /// Merge this backup in at start (what is newer here stays): bringing
+    /// a fleet back from a backup.
+    #[arg(long, env = "FUCF_RESTORE_FROM")]
+    restore_from: Option<PathBuf>,
 
     /// Public IPs of the edge proxy nodes; proxied records resolve to these
     /// instead of their origin. Without any, proxied records resolve to the origin.
@@ -520,6 +538,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         workers::db::D1Store::open(args.data_dir.join("d1"), store.clock(), sync_node_id.clone())?
     };
+    let replicated: Vec<Arc<dyn sync::SyncProvider>> = vec![store.clone(), accounts.clone(), kv_store.clone(), d1_store.clone()];
+    if let Some(path) = &args.restore_from {
+        let bundle = backup::read(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let changed = backup::restore(&bundle, &replicated, &store.clock()).map_err(|e| anyhow::anyhow!("restoring {}: {e}", path.display()))?;
+        tracing::warn!("restored {} (taken {} on {}): changed {:?}", path.display(), bundle.created, bundle.node, changed);
+        if !accel {
+            accounts.flush_blocking();
+        }
+    }
+    if args.backup_every_hours > 0 {
+        let dir = args.backup_dir.clone().unwrap_or_else(|| args.data_dir.join("backups"));
+        let every = std::time::Duration::from_secs(args.backup_every_hours * 3600);
+        backup::spawn(dir, every, args.backup_keep, replicated.clone(), fleet::self_name(&store, &args.edge_ips, args.node_name.as_deref()));
+    }
     let _ = edge.kv.set(kv_store.clone());
     let _ = edge.d1.set(d1_store.clone());
     edge.stats = telemetry.stats.clone();

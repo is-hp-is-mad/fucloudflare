@@ -113,6 +113,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/accounts", get(list_accounts))
         .route("/accounts/{account_id}", get(get_account))
         .route("/system", get(system))
+        .route("/backup", get(get_backup))
         .route("/replication/state", get(replication_state))
         .route("/replication/report", post(replication_report).layer(axum::extract::DefaultBodyLimit::max(32 << 20)))
         .route(
@@ -401,6 +402,7 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
         || under("/oauth")
         || under("/audit")
         || under("/replication")
+        || under("/backup")
         || path.starts_with("/releases/")
         || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || path.contains("/spectrum/apps")));
     match role {
@@ -1160,6 +1162,21 @@ async fn verify_token(State(st): St, axum::Extension(who): Who) -> ApiResult {
         }
         None => ok(json!({ "status": "active" })),
     }
+}
+
+/// `GET /backup`: everything the fleet replicates, as this node has it
+/// (see crate::backup), to keep somewhere else.
+async fn get_backup(State(st): St) -> Result<Response, ApiError> {
+    let mut providers: Vec<Arc<dyn SyncProvider>> = vec![st.store.clone(), st.accounts.clone()];
+    providers.extend(st.providers.iter().cloned());
+    let node = st.node();
+    let bytes = tokio::task::spawn_blocking(move || crate::backup::take(&providers, &node))
+        .await
+        .map_err(|e| bad(e.to_string()))?
+        .map_err(bad)?;
+    let name = format!("attachment; filename=\"fucf-backup-{}.json.gz\"", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let headers = [(header::CONTENT_TYPE, "application/gzip".to_string()), (header::CONTENT_DISPOSITION, name), (header::CACHE_CONTROL, "no-store".to_string())];
+    Ok((headers, bytes).into_response())
 }
 
 /// `/user`: who the credentials belong to.
