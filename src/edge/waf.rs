@@ -589,6 +589,15 @@ impl Waf {
             }
         }
 
+        // 1b. API Shield's own actions (crate::edge::apishield), after the
+        // custom rules so that one of them can skip or act on the fields first
+        if let Some((rule_id, what, action)) = super::apishield::mitigation(&zone.zone.settings, info) {
+            self.log(zone, info, ray, "api_shield", (rule_id, &what), action);
+            if action == "block" {
+                return Verdict::Block { rule_id: rule_id.to_string() };
+            }
+        }
+
         // 2. the security level: by the threat score of the visitor's address
         // (under attack: everybody), a challenge unless already passed
         let level = super::challenge::Level::of(&zone.zone.settings.security_level);

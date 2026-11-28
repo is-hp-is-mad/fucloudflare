@@ -97,6 +97,7 @@ by `id` or by `name`:
 | Analytics Read | zone | `/zones/{id}/analytics`, `/zones/{id}/dns_analytics`, `/zones/{id}/origins/health` |
 | Logs Read / Logs Write | zone | `/zones/{id}/logs/requests` (visitor addresses included), `/zones/{id}/logpush/jobs` (Write: change jobs) |
 | Waiting Rooms Read / Write | zone | `/zones/{id}/waiting_rooms` |
+| API Gateway Read / Write | zone | `/zones/{id}/api_gateway/…` (API Shield: operations, its settings, OpenAPI uploads) |
 | Workers Scripts, Workers KV Storage, D1 Read / Write | account | `/workers/scripts…`, `/kv/…`, `/d1/…` |
 | Fleet Read / Write | account | nodes, fleet actions, steering, local proxy rules, releases |
 | Notifications Read / Write | account | `/alerts…` (alert channels, test messages, active alerts) |
@@ -196,7 +197,8 @@ language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.use
 `cf.bot_management.ja4`: the JA4 fingerprint of the visitor's TLS ClientHello, empty over plain HTTP
 and HTTP/3; `/cdn-cgi/fucf-trace` shows it as `ja4=`), `cf.tls_client_auth.cert_verified` (also
 `fcf.client_cert_verified`: whether the visitor presented a client certificate the node verified,
-see [Visitor client certificates](#visitor-client-certificates-mtls)), with `eq ne lt le gt ge contains
+see [Visitor client certificates](#visitor-client-certificates-mtls)), `cf.api_gateway.request_violates_schema`
+and `cf.api_gateway.fallthrough_detected` (see [API Shield](#api-shield)), with `eq ne lt le gt ge contains
 matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
@@ -412,6 +414,8 @@ PATCH  /zones/{id}/settings/{name}        {"value": …}
 | `cache_chunking` | `0` (off), or `524288` to `33554432` bytes: objects of at least this size are cached in 512 KiB chunks, see [Cache](#large-objects-in-chunks) |
 | `early_hints_links` | `[]`, or at most 16 `Link` header entries added to the zone's HTML pages: see [Preload hints](#preload-hints-instead-of-early-hints) |
 | `image_resizing` | `false`, `true`: `/cdn-cgi/image/<options>/<path>` serves the zone's own images resized, see [Image resizing](#image-resizing) |
+| `api_shield_schema_action` | `none`, `log`, `block`: what to do with a request whose body breaks its API operation's schema, see [API Shield](#api-shield) |
+| `api_shield_fallthrough_action` | `none`, `log`, `block`: the same for a request to a host with API operations that matches none of them |
 | `dns_transfer_to` | `[]`, or at most 16 addresses or networks (`192.0.2.53`, `2001:db8:53::/48`) that may transfer the zone: see [Zone transfers](#zone-transfers-axfr) |
 
 ```sh
@@ -1021,7 +1025,7 @@ whole, and a new `action` starts without the old action's parameters. `position`
   expression and the response code, `<expression> and http.response.code in {401 403}` (bracketed
   when the expression has an `or` or `xor`; the code alone for a rule of every request); it becomes
   `status_codes`. `requests_to_origin` is refused.
-- A `skip` here skips the remaining custom rules, the security level, rate limits and the managed rules,
+- A `skip` here skips the remaining custom rules, API Shield's actions, the security level, rate limits and the managed rules,
   so its `action_parameters` must say at least `"ruleset": "current"`, `"phases": ["http_ratelimit",
   "http_request_firewall_managed"]` and `"products": ["securityLevel"]` (or be left out). A narrower
   skip is refused rather than widened.
@@ -1409,6 +1413,129 @@ security rules and redirects, and before transform rules, Workers, the cache and
 ```json
 { "name": "launch", "host": "www.example.com", "path_prefix": "/shop", "total_active_users": 500, "new_users_per_minute": 100, "session_minutes": 10 }
 ```
+
+### API Shield
+
+```
+GET    /zones/{id}/api_gateway/operations                    the zone's API operations (paginated, per_page up to 5000)
+POST   /zones/{id}/api_gateway/operations                    add: one operation, or a list of 1 to 2000 (all or none)
+DELETE /zones/{id}/api_gateway/operations                    delete several: [{"operation_id": "..."}] or ["..."] (all or none)
+GET|PUT|PATCH|DELETE /zones/{id}/api_gateway/operations/{operation_id}
+GET|PUT|PATCH /zones/{id}/api_gateway/settings/schema_validation   {"validation_default_mitigation_action", "fallthrough_mitigation_action"}
+POST   /zones/{id}/api_gateway/openapi?host=                 import an OpenAPI 3 document (JSON, at most 2 MiB)
+```
+
+API Shield keeps an inventory of a zone's API: operations of one method, one host and one path template
+each, optionally with a JSON schema for the request body. Every request to a host that has operations is
+matched against them before the security rules run, and what that finds is there for the rules and for
+the zone's two API Shield actions.
+
+| Field | Meaning |
+|---|---|
+| `method` | `GET` `HEAD` `POST` `PUT` `PATCH` `DELETE` `OPTIONS` `TRACE` `CONNECT` (case does not matter) |
+| `host` | one host name of the zone, no wildcard; not one that a more specific zone serves |
+| `endpoint` | the path template: starts with `/`, at most 512 bytes and 32 segments, written decoded (no `%`, `?`, `#`, spaces, `.` or `..` segments). A parameter is a whole segment `{name}` (name: 1 to 64 of `A-Z a-z 0-9 _ . -`); `/files/{name}.json` is refused. Empty segments and a trailing `/` are dropped when stored |
+| `request_body_schema` | optional: the JSON schema of the request body, see below. Without one the body is not checked |
+| `request_body_required` | default `false`; with a schema, an empty body breaks it |
+
+Answers carry `id` (also as `operation_id`), `zone_id`, `created_on`, `modified_on` (also as
+`last_updated`) and the fields above, the schema as fucf stores it.
+
+- Matching is per host and method. A `{name}` segment matches exactly one non-empty segment; any other
+  segment only itself (case-sensitive). Where several templates match, the one with a literal segment at
+  the first place they differ wins: `/users/me` before `/users/{id}`, `/users/{id}/posts` before
+  `/{a}/{b}/posts`. The request path is compared percent-decoded, with empty and `.` segments dropped and
+  `..` taking away the segment before it, so `/api//users/`, `/%61pi/users` and `/api/x/../users` are all
+  `/api/users`. Two operations that match the same requests (`/u/{id}` and `/u/{name}`) cannot both exist:
+  the second is a 409, and `POST .../operations` answers it with the one already there instead.
+- At most 2000 operations per zone. A schema is at most 64 KiB and nested at most 32 deep, the schemas of
+  a zone at most 2 MiB together; an `enum` holds at most 256 values.
+- **Fallthrough**: a request to a host that has operations, matching none of them by method and path, is a
+  fallthrough. Hosts without operations are not covered, and neither are `/cdn-cgi/` and
+  `/.well-known/acme-challenge/` (they are never acted on).
+- **Schema validation** runs for the operations with a schema. The request breaks the schema when its body
+  - is empty while `request_body_required` is set (an empty body passes otherwise);
+  - is not JSON: its `Content-Type` is not `application/json` or `*/*+json` (`application/problem+json`),
+    or it does not parse (serde_json, nested at most 128 deep);
+  - has a `Content-Encoding` other than `identity` (it is not decoded to be checked);
+  - was not read whole: the security checks buffer at most 1 MiB of a body. A larger (or streamed) body
+    cannot be checked and counts as breaking the schema, so that padding a body cannot carry it past the
+    check. This is stricter than skipping the check; an API that takes larger JSON bodies should leave
+    that operation without a schema;
+  - or does not keep to the schema.
+  The body still goes to the origin unchanged; nothing is consumed.
+- The schema language is this subset of JSON Schema: `type` (a name or a list of `object array string
+  number integer boolean null`; `nullable: true` as in OpenAPI 3.0), `properties`, `required`,
+  `additionalProperties` (`true`, `false` or a schema), `items` (one schema), `enum`, `const`,
+  `minLength`, `maxLength` (in characters), `minItems`, `maxItems`, `minimum`, `maximum`,
+  `exclusiveMinimum`, `exclusiveMaximum` (numbers, or OpenAPI 3.0's `true` next to `minimum` /
+  `maximum`). As in JSON Schema each keyword applies only to values of its kind, `1.0` is an integer and
+  equals `1`, and integers are compared exactly. Annotations are dropped when stored: `title`,
+  `description`, `default`, `example(s)`, `deprecated`, `readOnly`, `writeOnly`, `xml`, `externalDocs`,
+  `$comment`, `$schema`, `$id`, `$anchor`, `format` (not checked), `contentMediaType`, `discriminator`
+  and every `x-` key. A schema given through this API that uses anything else (`pattern`, `oneOf`,
+  `$ref`, ...) is a 400; an imported one has those parts left out, see below.
+- Security events of API Shield have the source `api_shield` and the rule id `schema_validation` or
+  `fallthrough`. The description names the operation and where the body broke the schema
+  (`$.items[2].name: expected string`), never a value from the body.
+
+The two actions (zone settings `api_shield_schema_action` and `api_shield_fallthrough_action`, also under
+[Zone settings](#zone-settings)) are `none` (the default: the findings only feed the rule fields), `log`
+or `block` (403). Through `.../settings/schema_validation`, `validation_default_mitigation_action` is
+Cloudflare's name for the first; `fallthrough_mitigation_action` is fucf's own name for the second. A PUT
+or PATCH may name either or both; an unknown field or value is a 400 and changes nothing. The actions run
+right after the [custom firewall rules](#rules), so a rule can act first and a `skip` rule skips them
+too, and before the security level, rate limits and managed rules. In rules,
+`cf.api_gateway.request_violates_schema` and `cf.api_gateway.fallthrough_detected` are booleans of the
+two findings (both `false` where the host has no operations):
+
+```
+cf.api_gateway.fallthrough_detected and http.request.uri.path contains "/admin"
+```
+
+**OpenAPI.** `POST .../openapi` takes an OpenAPI 3 document as the raw request body. It must be JSON: fucf
+has no YAML parser, so convert a YAML document first (a YAML body is a 400 saying so). Of the document
+fucf reads:
+
+- `servers`: each `http(s)` url on a host of the zone gives a host and a base path (`https://api.example.com/v1`
+  puts `/v1` in front of every path); variables stand for their `default`; relative urls (`/v1`) are on
+  `?host=` or the zone's apex. With `?host=`, only the servers on that host are used. A document without
+  servers is on `?host=` or the apex. Servers outside the zone are left out (a 400 when none is left);
+  servers of single paths or operations are not read.
+- `paths` and their methods (`get put post delete options head patch trace`); a path with a partial
+  template (`/files/{name}.json`) or a path item `$ref` is left out.
+- each operation's `requestBody` (also as a `$ref`): `required`, and the schema of `application/json`, or
+  else of the first `*/*+json` media type. Local `$ref`s (`#/components/...`) are followed; schemas nested
+  deeper than 32 are cut there (the cut part accepts anything). An operation with a JSON media type but no
+  schema accepts any JSON body. Bodies of the operation's other media types break the schema; an operation
+  without a JSON media type gets no schema.
+- Left out, and named in `upload_details.warnings`: parameters (API Shield checks bodies only), schema
+  keywords outside the subset (each only makes the check looser: `pattern`, `oneOf`, `allOf`, ...;
+  `patternProperties` also drops `additionalProperties` of its schema), schemas over 64 KiB in the subset
+  or the import's budget of 200 000 schema nodes (references followed) for the whole document (the
+  operation is added without a schema), everything above. At most 200 warnings are listed, then a count.
+
+An upload adds the operations that are not there and updates (replaces) those that are, by method, host
+and template; it never deletes one. All of them land or none does (over 2000 in the zone, a host another
+zone serves, ...: a 400).
+
+```json
+{ "operations": [ { "id": "…", "operation_id": "…", "method": "POST", "host": "api.example.com", "endpoint": "/v1/users", "request_body_schema": { "type": "object", "required": ["name"] }, "request_body_required": true, "…": "…" } ],
+  "created": 1, "updated": 0,
+  "upload_details": { "warnings": [ { "message": "POST /users: $.properties.email: \"pattern\" is not supported (…)" } ] } }
+```
+
+```sh
+curl -s -X POST "$BASE/zones/$ZONE/api_gateway/openapi" -H "Authorization: Bearer $TOKEN" --data-binary @openapi.json
+curl -s -X PATCH "$BASE/zones/$ZONE/api_gateway/settings/schema_validation" -H "Authorization: Bearer $TOKEN" \
+  -d '{"validation_default_mitigation_action": "block", "fallthrough_mitigation_action": "log"}'
+```
+
+Differences from Cloudflare: operations are added as plain JSON (no multipart upload, no saved "user
+schemas" to switch on and off: the inventory is the schema), there are no per-operation actions and no
+discovery of endpoints from traffic, and parameters, `format` and `pattern` are not checked. Tokens need
+`API Gateway Read` or `API Gateway Write` for the zone; the two settings can also be changed as zone
+settings (`Zone Settings Write`).
 
 ### The fleet
 

@@ -224,6 +224,9 @@ pub struct Tombstones {
     /// (Left out while empty, like alert channels.)
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_hostnames: BTreeMap<String, SyncMeta>,
+    /// (Left out while empty, like alert channels.)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub api_operations: BTreeMap<String, SyncMeta>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -252,6 +255,10 @@ pub struct Data {
     /// left out while empty, like waiting rooms.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_hostnames: Vec<crate::custom_hostnames::CustomHostname>,
+    /// A zone's API inventory (crate::edge::apishield); left out while
+    /// empty, like waiting rooms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_operations: Vec<crate::edge::apishield::ApiOperation>,
     pub nodes: Vec<EdgeNode>,
     pub steering: Vec<SteerRule>,
     pub local_proxy_rules: Vec<LocalProxyRule>,
@@ -322,6 +329,8 @@ pub struct ZoneSnap {
     /// crate::custom_hostnames) and the host of the zone whose records
     /// serve each of them.
     pub custom_origins: HashMap<String, String>,
+    /// The zone's API operations, ready to match requests against.
+    pub api_shield: crate::edge::apishield::Inventory,
 }
 
 impl ZoneSnap {
@@ -457,6 +466,7 @@ impl Snapshot {
                     waiting_rooms: data.waiting_rooms.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
                     dnssec: z.dnssec.as_ref().and_then(|cfg| crate::dns::dnssec::DnssecSigner::from_config(&z.name, cfg)),
                     custom_origins: HashMap::new(),
+                    api_shield: Default::default(),
                 };
                 (id, snap)
             })
@@ -493,6 +503,7 @@ impl Snapshot {
             }
         }
         let custom_hostnames = crate::custom_hostnames::index(data, &mut by_id, &mut certs);
+        crate::edge::apishield::attach(&data.api_operations, &mut by_id);
         let (mut acme_dns, mut acme_tls, mut acme_http) = (HashMap::<String, Vec<String>>::new(), HashMap::new(), HashMap::new());
         for c in &data.acme_challenges {
             match c.kind.as_str() {
@@ -779,6 +790,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         log_jobs,
         waiting_rooms,
         custom_hostnames,
+        api_operations,
     );
     macro_rules! bump_tombs {
         ($($field:ident),* $(,)?) => {
@@ -815,6 +827,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         alert_channels,
         challenge_widgets,
         custom_hostnames,
+        api_operations,
     );
     sync_telemetry_projections(d);
     clock.advance_floor(max_ver.0, max_ver.1);
@@ -847,6 +860,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.log_jobs, durable_ttl_ms);
     prune(&mut d.tombstones.waiting_rooms, durable_ttl_ms);
     prune(&mut d.tombstones.custom_hostnames, durable_ttl_ms);
+    prune(&mut d.tombstones.api_operations, durable_ttl_ms);
     prune(&mut d.tombstones.nodes, durable_ttl_ms);
     prune(&mut d.tombstones.steering, durable_ttl_ms);
     prune(&mut d.tombstones.local_proxy_rules, durable_ttl_ms);
@@ -896,6 +910,8 @@ struct ConfigDeltaPayload {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     custom_hostnames: Vec<crate::custom_hostnames::CustomHostname>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    api_operations: Vec<crate::edge::apishield::ApiOperation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     nodes: Vec<EdgeNode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     steering: Vec<SteerRule>,
@@ -929,7 +945,7 @@ struct ConfigDeltaPayload {
 /// whole truth for each of them: what is not in it was deleted, possibly so
 /// long ago that the sender no longer keeps the tombstone. Telemetry and the
 /// ACME lease are not among them: each is newest-wins by itself.
-const SNAPSHOT_COLLECTIONS: [&str; 25] = [
+const SNAPSHOT_COLLECTIONS: [&str; 26] = [
     "zones",
     "records",
     "firewall_rules",
@@ -947,6 +963,7 @@ const SNAPSHOT_COLLECTIONS: [&str; 25] = [
     "log_jobs",
     "waiting_rooms",
     "custom_hostnames",
+    "api_operations",
     "nodes",
     "steering",
     "local_proxy_rules",
@@ -1011,6 +1028,7 @@ fn reconcile_full_snapshot(d: &mut Data, p: &ConfigDeltaPayload) -> bool {
     keep!(log_jobs, |x| x.meta.id.clone());
     keep!(waiting_rooms, |x| x.meta.id.clone());
     keep!(custom_hostnames, |x| x.meta.id.clone());
+    keep!(api_operations, |x| x.meta.id.clone());
     keep!(nodes, |n| n.id.clone());
     keep!(steering, |s| s.id.clone());
     keep!(local_proxy_rules, |r| r.id.clone());
@@ -2647,6 +2665,7 @@ fn apply_delete_zone(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str) 
     cascade_items!(waiting_rooms);
     cascade_items!(certificate_packs);
     cascade_items!(custom_hostnames);
+    cascade_items!(api_operations);
 
     // challenges belong to a pack or to a custom hostname (by its id)
     let packs: HashSet<String> = d.certificate_packs.iter().map(|p| p.meta.id.clone()).chain(d.custom_hostnames.iter().map(|h| h.meta.id.clone())).collect();
@@ -2782,6 +2801,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
         log_jobs: d.log_jobs.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         waiting_rooms: d.waiting_rooms.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         custom_hostnames: d.custom_hostnames.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
+        api_operations: d.api_operations.iter().filter(|x| full_resync || x.meta.sync.local_rev > since).cloned().collect(),
         nodes: d.nodes.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         steering: d.steering.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         local_proxy_rules: d.local_proxy_rules.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
@@ -2816,6 +2836,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             log_jobs: filter_tombs(&d.tombstones.log_jobs, since),
             waiting_rooms: filter_tombs(&d.tombstones.waiting_rooms, since),
             custom_hostnames: filter_tombs(&d.tombstones.custom_hostnames, since),
+            api_operations: filter_tombs(&d.tombstones.api_operations, since),
             nodes: filter_tombs(&d.tombstones.nodes, since),
             steering: filter_tombs(&d.tombstones.steering, since),
             local_proxy_rules: filter_tombs(&d.tombstones.local_proxy_rules, since),
@@ -3006,6 +3027,7 @@ fn merge_delta_data(
     merge_items!(log_jobs);
     merge_items!(waiting_rooms);
     merge_items!(custom_hostnames);
+    merge_items!(api_operations);
 
     changed |= merge_collection(&mut rev, clock, &mut d.workers, &mut d.tombstones.workers, payload.workers, payload.tombstones.workers, |w| w.name.clone(), |w| &w.sync, |w| &mut w.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.nodes, &mut d.tombstones.nodes, payload.nodes, payload.tombstones.nodes, |n| n.id.clone(), |n| &n.sync, |n| &mut n.sync);
@@ -3137,6 +3159,7 @@ fn merge_delta_data(
         cascade_tomb!(waiting_rooms);
         cascade_tomb!(certificate_packs);
         cascade_tomb!(custom_hostnames);
+        cascade_tomb!(api_operations);
     }
 
     // Bump SOA serial locally when records changed without the zone itself changing.

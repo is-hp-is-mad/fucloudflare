@@ -43,6 +43,9 @@ pub struct ReqInfo {
     pub bot_score: i64,
     /// The visitor presented a client certificate the edge verified (see crate::edge::mtls).
     pub client_cert_verified: bool,
+    /// What API Shield found (see crate::edge::apishield); all false where
+    /// the host has no API operations.
+    pub api_gateway: crate::edge::apishield::Outcome,
 }
 
 impl ReqInfo {
@@ -81,6 +84,8 @@ enum Val {
     Threat,
     BotScore,
     CertVerified,
+    ApiSchemaViolation,
+    ApiFallthrough,
     Lower(Box<Val>),
     Upper(Box<Val>),
     UrlDecode(Box<Val>),
@@ -232,7 +237,7 @@ impl Val {
     fn ty(&self) -> Ty {
         match self {
             Val::IpSrc => Ty::Ip,
-            Val::Ssl | Val::CertVerified | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
+            Val::Ssl | Val::CertVerified | Val::ApiSchemaViolation | Val::ApiFallthrough | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
             Val::Len(_) | Val::Asn | Val::Threat | Val::BotScore => Ty::Int,
             _ => Ty::Str,
         }
@@ -408,6 +413,8 @@ impl Parser<'_> {
             "fcf.bot_score" | "cf.bot_management.score" => Val::BotScore,
             "ssl" => Val::Ssl,
             "cf.tls_client_auth.cert_verified" | "fcf.client_cert_verified" => Val::CertVerified,
+            "cf.api_gateway.request_violates_schema" => Val::ApiSchemaViolation,
+            "cf.api_gateway.fallthrough_detected" => Val::ApiFallthrough,
             _ => return Err(format!("unknown field '{word}'")),
         })
     }
@@ -490,6 +497,8 @@ impl Val {
             Val::Ja4 => V::S(Cow::Borrowed(&r.ja4)),
             Val::Ssl => V::B(r.ssl),
             Val::CertVerified => V::B(r.client_cert_verified),
+            Val::ApiSchemaViolation => V::B(r.api_gateway.violates_schema),
+            Val::ApiFallthrough => V::B(r.api_gateway.fallthrough),
             Val::Lower(v) => V::S(Cow::Owned(s(v).to_lowercase())),
             Val::Upper(v) => V::S(Cow::Owned(s(v).to_uppercase())),
             Val::UrlDecode(v) => V::S(Cow::Owned(url_decode(&s(v)))),
@@ -682,6 +691,24 @@ mod tests {
         assert!(at(r#"not cf.tls_client_auth.cert_verified and http.request.uri.path contains "/Admin""#, false));
         assert!(!req().client_cert_verified, "unknown means not verified");
         for bad in ["cf.tls_client_auth.cert_verified eq true", "cf.tls_client_auth.cert_verified eq \"1\"", "cf.tls_client_auth.cert_verified contains \"x\"", "cf.tls_client_auth.verified"] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn the_api_gateway_fields_are_booleans_of_what_api_shield_found() {
+        use crate::edge::apishield::Outcome;
+        let at = |src: &str, violates_schema: bool, fallthrough: bool| {
+            let e = Expr::parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            e.matches(&ReqInfo { api_gateway: Outcome { violates_schema, fallthrough, ..Default::default() }, ..req() })
+        };
+        assert!(at("cf.api_gateway.request_violates_schema", true, false));
+        assert!(!at("cf.api_gateway.request_violates_schema", false, true));
+        assert!(at("cf.api_gateway.fallthrough_detected", false, true));
+        assert!(at(r#"cf.api_gateway.fallthrough_detected and http.request.uri.path contains "/Admin""#, false, true));
+        assert!(at("not cf.api_gateway.request_violates_schema and not cf.api_gateway.fallthrough_detected", false, false));
+        assert_eq!(req().api_gateway, Outcome::default(), "a request API Shield did not look at is neither");
+        for bad in ["cf.api_gateway.request_violates_schema eq true", "cf.api_gateway.fallthrough_detected contains \"x\"", "cf.api_gateway.violates_schema", "cf.api_gateway"] {
             assert!(Expr::parse(bad).is_err(), "{bad} should fail");
         }
     }

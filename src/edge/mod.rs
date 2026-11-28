@@ -6,6 +6,7 @@ pub mod cachekey;
 pub mod chunked;
 pub mod certdir;
 pub mod cgi;
+pub mod apishield;
 pub mod autofw;
 pub mod banset;
 pub mod botscore;
@@ -22,6 +23,7 @@ pub mod front;
 pub mod h3;
 pub mod ja4;
 pub mod mtls;
+pub mod openapi;
 pub mod proxy;
 pub mod quic_mux;
 pub mod reqlog;
@@ -2282,6 +2284,11 @@ impl Edge {
         let mut worker = None;
         let mut admitted = Vec::new();
         if !zone.zone.paused {
+            // API Shield's findings, for the rules and its own actions in waf.check
+            if !zone.api_shield.is_empty() {
+                let seen = apishield::Body::of(&body, &headers, declared, &info.method);
+                info.api_gateway = apishield::assess(zone, &info, &headers, seen);
+            }
             let inspect = match (&body, &inspect_prefix) {
                 (ReqBody::Buffered(b), _) if !b.is_empty() => Some(&b[..]),
                 (_, Some(p)) if !p.is_empty() => Some(&p[..]),

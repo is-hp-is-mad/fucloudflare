@@ -239,6 +239,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
         .merge(crud::<crate::edge::waiting::WaitingRoom>("/zones/{zone_id}/waiting_rooms"))
         .merge(custom_hostname_routes())
+        .merge(api_gateway_routes())
         .route("/zones/{zone_id}/origins/health", get(origin_health))
         .route("/zones/{zone_id}/dns_analytics", get(dns_analytics))
         .route("/zones/{zone_id}/analytics", get(analytics))
@@ -2092,6 +2093,44 @@ async fn delete_item<T: Item>(State(st): St, Path((zone_id, id)): Path<(String, 
 // delegation its owner has to add (crate::custom_hostnames::view), a zone
 // whose DNS this fleet could not answer gets none, and there is no PUT (a
 // replace could only set what a PATCH sets).
+/// API Shield (crate::edge::apishield, crate::edge::openapi): the
+/// operations by Cloudflare's paths, its two actions, and OpenAPI uploads.
+fn api_gateway_routes() -> Router<Arc<ApiState>> {
+    use crate::edge::apishield::ApiOperation;
+    let path = "/zones/{zone_id}/api_gateway";
+    Router::new()
+        .route(&format!("{path}/operations"), get(list_items::<ApiOperation>).post(create_api_operations).delete(delete_api_operations))
+        .route(
+            &format!("{path}/operations/{{item_id}}"),
+            get(get_item::<ApiOperation>).put(put_item::<ApiOperation>).patch(patch_item::<ApiOperation>).delete(delete_item::<ApiOperation>),
+        )
+        .route(&format!("{path}/settings/schema_validation"), get(get_api_shield_settings).put(put_api_shield_settings).patch(put_api_shield_settings))
+        .route(
+            &format!("{path}/openapi"),
+            post(upload_openapi).layer(axum::extract::DefaultBodyLimit::max(crate::edge::openapi::MAX_DOCUMENT)),
+        )
+}
+
+async fn create_api_operations(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::edge::apishield::create(&st.store, &zone_id, body(&bytes)?).await?)
+}
+
+async fn delete_api_operations(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::edge::apishield::delete_many(&st.store, &zone_id, body(&bytes)?).await?)
+}
+
+async fn get_api_shield_settings(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    ok(crate::edge::apishield::settings_view(&st.store.get_zone(&zone_id)?))
+}
+
+async fn put_api_shield_settings(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::edge::apishield::update_settings(&st.store, &zone_id, body(&bytes)?).await?)
+}
+
+async fn upload_openapi(State(st): St, Path(zone_id): Path<String>, Query(q): Params, bytes: Bytes) -> ApiResult {
+    ok(crate::edge::openapi::upload(&st.store, &zone_id, &bytes, q.get("host").map(String::as_str)).await?)
+}
+
 fn custom_hostname_routes() -> Router<Arc<ApiState>> {
     let path = "/zones/{zone_id}/custom_hostnames";
     Router::new()
@@ -4232,6 +4271,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_shield_operations_settings_and_uploads_are_per_zone_and_need_the_api_gateway_permission() {
+        use crate::edge::apishield::ApiOperation;
+        let dir = std::env::temp_dir().join(format!("fucf-api-shield-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("viewer@example.com", Role::Viewer, Some("strong-pass-123"), "viewer@example.com", &Client::default()).unwrap();
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (admin, viewer) = (session("admin@example.com"), session("viewer@example.com"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let z = zone.id.clone();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let base = format!("/client/v4/zones/{z}/api_gateway");
+        let ops = format!("{base}/operations");
+
+        // a list in, a list out; one object in, one out; one that is there is not added twice
+        let list = json!([
+            { "method": "GET", "host": "api.example.com", "endpoint": "/users/{id}" },
+            { "method": "POST", "host": "api.example.com", "endpoint": "/users", "request_body_schema": { "type": "object", "required": ["name"] } },
+            { "method": "get", "host": "api.example.com", "endpoint": "/users/{other}/" },
+        ]);
+        let (sc, b) = call(&mut app, "POST", &ops, list.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let made = json_of(&b)["result"].clone();
+        assert_eq!(made.as_array().unwrap().len(), 3);
+        assert_eq!(made[0]["operation_id"], made[2]["operation_id"], "the duplicate is answered as the first");
+        let id = made[0]["operation_id"].as_str().unwrap().to_string();
+        assert!(made[0].get("sync").is_none() && made[0].get("schema_bytes").is_none());
+        let (sc, b) = call(&mut app, "POST", &ops, json!({ "method": "DELETE", "host": "example.com", "endpoint": "/x" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let single = json_of(&b)["result"]["operation_id"].as_str().unwrap().to_string();
+        for bad in [
+            b"not json".to_vec(),
+            b"[]".to_vec(),
+            b"7".to_vec(),
+            json!([{ "method": "GET", "host": "api.example.net", "endpoint": "/" }]).to_string().into_bytes(),
+            json!([{ "method": "GET", "host": "example.com", "endpoint": "/a" }, { "method": "GET", "host": "example.com", "endpoint": "/files/{n}.json" }]).to_string().into_bytes(),
+            json!({ "method": "POST", "host": "example.com", "endpoint": "/a", "request_body_schema": { "anyOf": [] } }).to_string().into_bytes(),
+        ] {
+            let (sc, b) = call(&mut app, "POST", &ops, bad).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        }
+        assert_eq!(st.store.items::<ApiOperation>(&z).unwrap().len(), 3, "a list with a bad entry adds nothing");
+        let (sc, _) = call(&mut app, "PUT", &format!("{ops}/{single}"), json!({ "method": "GET", "host": "api.example.com", "endpoint": "/users/{x}" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "another operation matches the same requests");
+        let (sc, b) = call(&mut app, "PATCH", &format!("{ops}/{single}"), json!({ "endpoint": "/y" }).to_string().into_bytes()).await;
+        assert_eq!((sc, json_of(&b)["result"]["method"].clone()), (StatusCode::OK, json!("DELETE")));
+        let (_, b) = call(&mut app, "GET", &ops, vec![]).await;
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().len(), 3);
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/zones/{}/api_gateway/operations/{id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "an operation belongs to one zone");
+        let (sc, _) = call(&mut app, "DELETE", &format!("/client/v4/zones/{}/api_gateway/operations", other.id), json!([{ "operation_id": id }]).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _) = call(&mut app, "GET", "/client/v4/zones/no-such-zone/api_gateway/operations", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // the two actions
+        let settings = format!("{base}/settings/schema_validation");
+        let (sc, b) = call(&mut app, "GET", &settings, vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(json_of(&b)["result"], json!({ "validation_default_mitigation_action": "none", "fallthrough_mitigation_action": "none" }));
+        let (sc, b) = call(&mut app, "PATCH", &settings, json!({ "validation_default_mitigation_action": "block" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert_eq!(json_of(&b)["result"]["validation_default_mitigation_action"], json!("block"));
+        let (sc, _) = call(&mut app, "PUT", &settings, json!({ "fallthrough_mitigation_action": "challenge" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        assert_eq!(st.store.get_zone(&z).unwrap().settings.api_shield_schema_action, "block");
+
+        // an OpenAPI document (JSON only)
+        let upload = format!("{base}/openapi");
+        let doc = json!({ "openapi": "3.0.3", "servers": [{ "url": "https://api.example.com/v2" }], "paths": { "/orders": { "post": { "requestBody": { "content": { "application/json": { "schema": { "type": "object", "x-y": 1, "oneOf": [] } } } } } } } });
+        let (sc, b) = call(&mut app, "POST", &upload, doc.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let r = json_of(&b)["result"].clone();
+        assert_eq!((r["created"].clone(), r["operations"][0]["endpoint"].clone()), (json!(1), json!("/v2/orders")));
+        assert!(r["upload_details"]["warnings"][0]["message"].as_str().unwrap().contains("oneOf"));
+        let (sc, _) = call(&mut app, "POST", &upload, b"openapi: 3.0.0".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "YAML is not read");
+        let (sc, _) = call(&mut app, "POST", &upload, vec![b' '; crate::edge::openapi::MAX_DOCUMENT + 1]).await;
+        assert_eq!(sc, StatusCode::PAYLOAD_TOO_LARGE);
+        let (sc, _) = call(&mut app, "POST", &format!("{upload}?host=www.example.net"), doc.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+
+        // bulk delete: all or none
+        let (sc, _) = call(&mut app, "DELETE", &ops, json!([{ "operation_id": id }, { "operation_id": "no-such-op" }]).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        assert_eq!(st.store.items::<ApiOperation>(&z).unwrap().len(), 4);
+        let (sc, b) = call(&mut app, "DELETE", &ops, json!([{ "operation_id": id }]).to_string().into_bytes()).await;
+        assert_eq!((sc, json_of(&b)["result"].clone()), (StatusCode::OK, json!({ "deleted": 1 })));
+
+        // panel roles: a viewer reads, does not write
+        give(&st, &z, "viewer@example.com").await;
+        let h = vec![("authorization", viewer.as_str()), ("content-type", "application/json")];
+        let (sc, _, _) = call_raw(&mut app, "GET", &ops, h.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "PATCH", &settings, h.clone(), br#"{"validation_default_mitigation_action":"none"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, _, _) = call_raw(&mut app, "POST", &upload, h, doc.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        // tokens: neither firewall nor zone settings will do; reading is not writing; one zone is not another
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let h = vec![("authorization", admin.as_str()), ("content-type", "application/json")];
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h, spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let firewall = token("Firewall Services Write").await;
+        let zone_settings = token("Zone Settings Write").await;
+        let read = token("API Gateway Read").await;
+        let write = token("API Gateway Write").await;
+        let mut as_token = async |bearer: &str, method: &str, path: &str, body: Vec<u8>| {
+            call_raw(&mut app, method, path, vec![("authorization", bearer), ("content-type", "application/json")], body).await.0
+        };
+        let new_op = json!({ "method": "GET", "host": "example.com", "endpoint": "/token" }).to_string();
+        for bearer in [&firewall, &zone_settings] {
+            assert_eq!(as_token(bearer, "GET", &ops, vec![]).await, StatusCode::FORBIDDEN);
+            assert_eq!(as_token(bearer, "POST", &ops, new_op.clone().into_bytes()).await, StatusCode::FORBIDDEN);
+            assert_eq!(as_token(bearer, "PUT", &settings, br#"{"fallthrough_mitigation_action":"none"}"#.to_vec()).await, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(as_token(&read, "GET", &ops, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "GET", &settings, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "POST", &ops, new_op.clone().into_bytes()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&read, "POST", &upload, doc.to_string().into_bytes()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&read, "DELETE", &ops, b"[]".to_vec()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&write, "GET", &format!("/client/v4/zones/{}/api_gateway/operations", other.id), vec![]).await, StatusCode::FORBIDDEN, "another zone");
+        assert_eq!(as_token(&write, "POST", &ops, new_op.clone().into_bytes()).await, StatusCode::OK);
+        assert_eq!(as_token(&write, "PATCH", &settings, br#"{"fallthrough_mitigation_action":"log"}"#.to_vec()).await, StatusCode::OK);
+        assert_eq!(st.store.get_zone(&z).unwrap().settings.api_shield_fallthrough_action, "log");
+        assert_eq!(st.store.items::<ApiOperation>(&z).unwrap().len(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn custom_hostnames_belong_to_one_zone_of_one_user_and_need_the_ssl_permission() {
         let dir = std::env::temp_dir().join(format!("fucf-api-custom-hosts-{}", uuid::Uuid::new_v4().simple()));
         let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
@@ -5341,7 +5523,7 @@ mod tests {
         // every kind of zone path answers another user's zone as if it were not there
         let reads = ["", "/dns_records", "/dns_records/export", "/settings", "/settings/ssl", "/dnssec", "/rulesets", "/firewall/rules", "/rate_limits",
             "/cache_rules", "/workers/routes", "/email", "/email/rules", "/waiting_rooms", "/ssl/certificate_packs", "/custom_certificates", "/custom_hostnames",
-            "/security/events", "/logs/requests"];
+            "/security/events", "/logs/requests", "/api_gateway/operations", "/api_gateway/settings/schema_validation"];
         for path in reads {
             for zone in [&theirs, &unowned] {
                 let (sc, b) = ask("alice", "GET", &format!("/zones/{zone}{path}"), Value::Null).await;
@@ -5357,6 +5539,10 @@ mod tests {
             ("PUT", "/rulesets/phases/http_request_firewall_custom/entrypoint", json!({ "rules": [] })),
             ("POST", "/purge_cache", json!({ "purge_everything": true })),
             ("PATCH", "/email", json!({ "dkim_selector": null })),
+            ("POST", "/api_gateway/operations", json!({ "method": "GET", "host": "example.com", "endpoint": "/" })),
+            ("DELETE", "/api_gateway/operations", json!([])),
+            ("PATCH", "/api_gateway/settings/schema_validation", json!({ "validation_default_mitigation_action": "block" })),
+            ("POST", "/api_gateway/openapi", json!({ "openapi": "3.0.0", "paths": { "/": { "get": {} } } })),
             ("PATCH", "", json!({ "paused": true })),
             ("DELETE", "", Value::Null),
         ];

@@ -3092,3 +3092,73 @@ async fn an_active_custom_hostname_is_served_as_its_zone_with_its_own_host_and_c
     env.store.delete_item::<CustomHostname>(&env.zone, &h.meta.id).unwrap();
     assert_eq!(get(&env, "store.example.net", "/hello").await.status, 404);
 }
+
+#[tokio::test]
+async fn api_shield_checks_bodies_and_unknown_endpoints_by_the_zone_settings() {
+    use crate::edge::apishield::ApiOperation;
+    let env = setup().await;
+    let save = |v| env.store.save_item::<ApiOperation>(&env.zone, None, v, true).unwrap();
+    let users = save(json!({
+        "method": "POST", "host": "example.com", "endpoint": "/api/users",
+        "request_body_schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string", "maxLength": 8 } } },
+        "request_body_required": true,
+    }));
+    save(json!({ "method": "GET", "host": "example.com", "endpoint": "/api/users/{id}" }));
+    let json_ct = "Content-Type: application/json\r\n";
+    let good = r#"{"name":"ann"}"#;
+
+    // by default the findings only feed the rules: nothing is stopped
+    assert_eq!(send(&env, "POST", "example.com", "/api/users", json_ct, "{}").await.status, 200);
+    assert_eq!(get(&env, "example.com", "/api/admin").await.status, 200);
+
+    env.store.update_setting(&env.zone, "api_shield_schema_action", json!("block")).unwrap();
+    env.store.update_setting(&env.zone, "api_shield_fallthrough_action", json!("log")).unwrap();
+    let before = env.hits.load(Ordering::SeqCst);
+    for (body, extra) in [("{}", json_ct), (r#"{"name":"far too long"}"#, json_ct), ("", json_ct), (good, "Content-Type: text/plain\r\n"), ("{\"name\":", json_ct)] {
+        let r = send(&env, "POST", "example.com", "/api/users", extra, body).await;
+        assert_eq!(r.status, 403, "{body:?} {extra:?}");
+        assert!(r.body.contains("schema_validation"), "{}", r.body);
+    }
+    assert_eq!(env.hits.load(Ordering::SeqCst), before, "a blocked request never reaches the origin");
+    // a good body is checked and still reaches the origin whole
+    let r = send(&env, "POST", "example.com", "/%61pi//users/", json_ct, good).await;
+    assert!(r.status == 200 && r.body.contains(&format!("body={good}")), "{} {}", r.status, r.body);
+    // a body over what the edge reads cannot be checked, so it does not pass
+    let padded = format!(r#"{{"name":"ann","pad":"{}"}}"#, "x".repeat(1_100_000));
+    let r = send(&env, "POST", "example.com", "/api/users", json_ct, &padded).await;
+    assert!(r.status == 403 && r.body.contains("schema_validation"), "{}", r.status);
+    // templates match one segment; other hosts and the edge's own paths are not covered
+    assert_eq!(get(&env, "example.com", "/api/users/42").await.status, 200);
+    assert_eq!(get(&env, "example.com", "/api/admin").await.status, 200, "a fallthrough is only logged");
+    assert_eq!(send(&env, "POST", "www.example.com", "/api/users", json_ct, "{}").await.status, 200, "no operations on www");
+
+    env.store.update_setting(&env.zone, "api_shield_fallthrough_action", json!("block")).unwrap();
+    let r = get(&env, "example.com", "/api/users/42/x").await;
+    assert!(r.status == 403 && r.body.contains("fallthrough"), "{}", r.status);
+    assert_eq!(send(&env, "DELETE", "example.com", "/api/users/42", "", "").await.status, 403, "matching is per method");
+    assert_ne!(get(&env, "example.com", "/cdn-cgi/trace").await.status, 403);
+
+    // a custom rule sees the fields first: a skip rule spares a client, a block rule needs no setting
+    env.store.update_setting(&env.zone, "api_shield_fallthrough_action", json!("none")).unwrap();
+    env.store.update_setting(&env.zone, "api_shield_schema_action", json!("none")).unwrap();
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "cf.api_gateway.fallthrough_detected and http.request.uri.path contains \"/admin\"", "action": "block" }), true)
+        .unwrap();
+    assert_eq!(get(&env, "example.com", "/api/admin").await.status, 403);
+    assert_eq!(get(&env, "example.com", "/api/other").await.status, 200);
+    env.store.update_setting(&env.zone, "api_shield_schema_action", json!("block")).unwrap();
+    env.store.save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "http.request.headers[\"x-internal\"] eq \"yes\"", "action": "skip", "priority": -1 }), true).unwrap();
+    assert_eq!(send(&env, "POST", "example.com", "/api/users", &format!("{json_ct}X-Internal: yes\r\n"), "{}").await.status, 200);
+
+    let events = env.edge.waf.events(&env.zone, 100);
+    let found = |rule: &str, action: &str| events.iter().any(|e| e.source == "api_shield" && e.rule_id == rule && e.action == action);
+    assert!(found("schema_validation", "block") && found("fallthrough", "log") && found("fallthrough", "block"));
+    let reason = events.iter().find(|e| e.rule_id == "schema_validation").map(|e| e.description.clone()).unwrap_or_default();
+    assert!(reason.contains(&users.meta.id) && !reason.contains("far too long"), "{reason}");
+
+    // deleting the operations ends the checks
+    for op in env.store.items::<ApiOperation>(&env.zone).unwrap() {
+        env.store.delete_item::<ApiOperation>(&env.zone, &op.meta.id).unwrap();
+    }
+    assert_eq!(send(&env, "POST", "example.com", "/api/users", json_ct, "{}").await.status, 200);
+}

@@ -234,7 +234,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - `--ban-export` 不写 IPv6：autofw 存的是 /64 封禁，banset 只收单个地址，导出时 IPv6 一项都没有。导出里写出 /64 前缀（或说明只导出 IPv4），并加测试。
 - 纯加速节点的 full_resync（`src/store.rs` 的 `merge_delta_data`）只保留区域、记录、Workers、节点、调度、IP 列表和 ACME 挑战，各条目集合（custom_hostnames、waiting_rooms、log_jobs、alert_channels、challenge_widgets、rules 等）会丢；老节点对新节点做 full_resync 时还会清空 ip_lists。改成全部保留，并加测试。
 
-### [ ] T15 API Shield
+### [x] T15 API Shield
 
 - 域名下的 API 端点清单（方法 + 路径模板，如 `GET /api/users/{id}`）；可选地上传 OpenAPI 3 文件生成清单（只取路径、方法、参数和请求体 schema，不支持的部分忽略并报告）。
 - 模式校验：请求体是 JSON 时按 schema 的子集（type、required、enum、长度与数值范围）校验；不在清单里的端点可设为记录或拦截。
@@ -405,6 +405,14 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 同名再部署要走 versions 接口，没有实现，回 400 并说明改用 curl PUT；workers.dev、自定义域名、secrets 都不支持；`last_deployed_from` 固定为 `api`，wrangler 会提示确认，`--strict` 下会中止。
 - 路径末尾的 `/` 在路由前统一去掉（KV 的 values 路径除外），租户检查看到的是同一路径；`--ban-export` 新增 `banned6net`（flags interval）导出 IPv6 /64，旧的两个集合声明不变，已加载旧文件的主机照样能 `nft -f`。
 - 纯加速节点全量重同步现在对齐全部 25 类集合，快照带 `collections` 列表；旧版本对端没列出的集合只在非空时对齐（老的六类除外），不会再清空 ip_lists。以后新增集合要记得加进 `SNAPSHOT_COLLECTIONS`，漏了只是不对齐（偏安全）。
+
+### T15
+
+- 每个域名登记 API 接口（方法 + 主机名 + 路径模板，`{x}` 占一段、固定段优先），可带请求体 JSON schema（子集：type/required/enum/长度/数值范围等）。接口 `/zones/{id}/api_gateway/...`，令牌权限 API Gateway Read / Write。
+- 请求在自定义防火墙规则之后、安全级别之前检查；`skip` 规则也会跳过它。规则字段 `cf.api_gateway.request_violates_schema`、`cf.api_gateway.fallthrough_detected`，区域设置 `api_shield_schema_action` / `api_shield_fallthrough_action`（none/log/block，默认 none）。
+- OpenAPI 只读 JSON（依赖里没有 YAML），最大 2 MiB，只增改不删，不支持的部分列在 warnings 里；参数不校验，只校验请求体。超过 1 MiB 或流式的请求体按不合规处理。
+- 上限：每域名 2000 个接口、单个 schema 64 KiB、合计 2 MiB、嵌套 32 层。接口条目加进了 T14 的 full_resync 集合清单。
+- 拿不准：两个动作也能经通用的 `/zones/{id}/settings/...` 用 Zone Settings 写令牌改；自定义主机名不受保护；每次配置变动都会重编译全部 schema；路径里的 `%2F` 当作分段。
 
 ## 5. 部署（通过 Komari）
 

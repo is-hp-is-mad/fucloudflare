@@ -65,6 +65,9 @@ pub enum Area {
     Logs,
     /// Waiting rooms (crate::edge::waiting): they decide who reaches the origin.
     WaitingRooms,
+    /// API Shield (crate::edge::apishield): the API inventory and what the
+    /// edge does with requests that break it.
+    ApiGateway,
     WorkersScripts,
     WorkersKv,
     D1,
@@ -139,6 +142,8 @@ groups! {
     "ddf5587f37134125868a20ce6a3f1420" "Logs Write" Logs true "Change the jobs that push the request log to another server";
     "a4ea74d0fb8545a0a16b1c15e6429a26" "Waiting Rooms Read" WaitingRooms false "Read waiting rooms";
     "f67470076141448daf90b83b8aeb1a3d" "Waiting Rooms Write" WaitingRooms true "Change waiting rooms, which decide who reaches the origin";
+    "45c4f56798224e3f9ba6d7ca4c24ca5e" "API Gateway Read" ApiGateway false "Read the API operations of API Shield and its settings";
+    "14528d5b247140e38a5be7baccbe95dd" "API Gateway Write" ApiGateway true "Change the API operations of API Shield (OpenAPI uploads included) and what it blocks";
     "1a71c399035b4950a1bd1466bbe4f420" "Workers Scripts Read" WorkersScripts false "Read Workers scripts and their settings";
     "e086da7e2179491d91ee5f35b3ca210a" "Workers Scripts Write" WorkersScripts true "Upload, configure, run and delete Workers scripts";
     "8b47d2786a534c08a1f94ee8f9f599ef" "Workers KV Storage Read" WorkersKv false "Read Workers KV namespaces and values";
@@ -210,6 +215,7 @@ pub fn need(path: &str) -> Need {
                 "analytics" | "origins" | "dns_analytics" => Area::Analytics,
                 "logs" | "logpush" => Area::Logs,
                 "waiting_rooms" => Area::WaitingRooms,
+                "api_gateway" => Area::ApiGateway,
                 _ => return Need::Closed,
             };
             Need::Zone(area, Some(z.to_string()))
@@ -478,6 +484,9 @@ mod tests {
         assert_eq!(need("/zones/z1/waiting_rooms"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/zones/z1/waiting_rooms/w1"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/waiting_rooms"), Need::Closed);
+        assert_eq!(need("/zones/z1/api_gateway/operations"), Need::Zone(Area::ApiGateway, Some("z1".into())));
+        assert_eq!(need("/zones/z1/api_gateway/settings/schema_validation"), Need::Zone(Area::ApiGateway, Some("z1".into())));
+        assert_eq!(need("/api_gateway/operations"), Need::Closed);
         assert_eq!(need("/zones/z1/custom_hostnames"), Need::Zone(Area::Ssl, Some("z1".into())));
         assert_eq!(need("/zones/z1/custom_hostnames/h1"), Need::Zone(Area::Ssl, Some("z1".into())));
         assert_eq!(need("/custom_hostnames"), Need::Closed);

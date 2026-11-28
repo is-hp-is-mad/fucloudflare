@@ -118,6 +118,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/logs/requests                GET              应答节点上这个区域最近的请求：?since=游标 &limit= &status=404|5xx &host= &path=前缀 &ip=，见“请求日志”
 /zones/{id}/logpush/jobs[/{id}]          CRUD             {"name", "destination": "https://...", "enabled", "status_min", "batch_seconds"}
 /zones/{id}/waiting_rooms[/{id}]         CRUD             {"name", "host", "path_prefix":"/shop", "total_active_users", "new_users_per_minute", "session_minutes", "enabled"}，见“等候室”
+/zones/{id}/api_gateway/operations[/{id}] CRUD            {"method", "host", "endpoint":"/users/{id}", "request_body_schema", "request_body_required"}；POST 可传数组，DELETE 可批量，见“API Shield”
+/zones/{id}/api_gateway/openapi          POST             请求体为 OpenAPI 3 文档（只读 JSON），?host=
 /zones/{id}/spectrum/apps[/{id}]         CRUD             {"protocol":"tcp/2222", "dns":{"name":"ssh"}, "origin_direct":["tcp://192.0.2.1:22"], "proxy_protocol":"off|v1"}
 /zones/{id}/workers/routes[/{id}]        CRUD             {"pattern":"example.com/api/*", "script":"name"}
 /workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码，或只含一个模块的 wrangler 式 multipart 上传，见“Workers”
@@ -175,6 +177,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `cache_chunking` | 字节（默认 0） | 大文件分片缓存：不小于这个大小的对象按 512 KiB 一片存进边缘缓存，Range 请求只读涉及的片；0 为关闭，否则 524288 到 33554432（见"缓存"里的"大文件分片"；面板：域名 → 缓存 → 大文件分片） |
 | `early_hints_links` | 字符串数组（默认空，最多 16 条） | 预加载提示：给这个域名的 HTML 页面（200 应答）加上 `Link` 头，见"预加载提示（代替 Early Hints）"（面板：域名 → 缓存 → 预加载提示） |
 | `image_resizing` | bool（默认关） | 图片缩放：`/cdn-cgi/image/<参数>/<路径>` 返回本站图片缩放、转换格式后的结果，见"图片缩放"（面板：域名 → 缓存 → 图片缩放） |
+| `api_shield_schema_action` / `api_shield_fallthrough_action` | `none`(默认) / `log` / `block` | 请求体不符合接口的 schema、请求不匹配任何登记的接口时怎么处理，见"API Shield" |
 | `session_affinity` | bool（默认关） | 会话保持：同一个访客地址总是从同一个源站地址开始（同名的地址不变时）；该地址检查失败或刚拒绝过连接时照常换下一个。各地址分到的比例由记录的 `origin.weight` 决定（见"高级回源"） |
 | `dns_transfer_to` | 地址或网段数组（默认空，最多 16 个） | 允许做区域传送（AXFR）的辅助名称服务器，如 `["192.0.2.53", "2001:db8:53::/48"]`，见"DNS：更多记录类型、辅助名称服务器、查询统计"（面板：域名 → DNS 记录 → 区域传送） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
@@ -198,12 +201,13 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   `ip.geoip.country` `ip.geoip.continent` `ip.geoip.asnum` `ip.geoip.as_org`（需要 GeoIP 库）
   `cf.threat_score`（或 `fcf.threat_score`，见"安全级别、IP 纯净度与页面内人机验证"）`fcf.ja4`（或 `cf.bot_management.ja4`，见"TLS 指纹（JA4）"）
   `cf.tls_client_auth.cert_verified`（或 `fcf.client_cert_verified`，访客出示了经节点验证的客户端证书，见"访客客户端证书（mTLS）"）
+  `cf.api_gateway.request_violates_schema` `cf.api_gateway.fallthrough_detected`（见"API Shield"）
 - 运算符：`eq ne contains matches in lt le gt ge`（及 `== != ~ < <= > >=`），`and or not`（及 `&& || !`）
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
 - IP 列表：`ip.src in $office`（见下面的"IP 列表"）。
 - 空表达式匹配所有请求。
 
-防火墙动作：`block`、`js_challenge`（人机验证，浏览器看起来可疑时才要点击）、`managed_challenge`（总是要点击一次）、`log`、`skip`（放行并跳过限速与托管规则）。按 `priority` 升序执行。
+防火墙动作：`block`、`js_challenge`（人机验证，浏览器看起来可疑时才要点击）、`managed_challenge`（总是要点击一次）、`log`、`skip`（放行并跳过 API Shield 的处理、限速与托管规则）。按 `priority` 升序执行。
 
 ## 面板、节点与调度
 
@@ -479,7 +483,7 @@ ACME 账户密钥只保存在下单节点自己的数据目录里，不同步。
 
 ## 请求处理顺序
 
-区域设置 `mtls`（没有经验证的客户端证书则 403，到此为止）→ `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
+区域设置 `mtls`（没有经验证的客户端证书则 403，到此为止）→ `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → API Shield → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
 
 - HTTP/3：与 HTTPS 同端口号的 UDP 上提供，HTTPS 响应带 `Alt-Svc` 头引导客户端升级；三种协议共用同一条处理链路。
 - 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli、zstd 或 gzip（源站已压缩的不动）。固定按 brotli → zstd → gzip 的顺序选，`q=0` 的不用；同时支持 br 和 zstd 的浏览器照旧拿 brotli，只支持 zstd 不支持 br 的才拿 zstd（级别 3）。zstd 用的是 C 库（zstd-sys），编译要有 C 编译器，静态（musl）构建照 aws-lc-rs 的设置用 `musl-gcc` 就够。
@@ -666,7 +670,7 @@ DNS 记录的 Cloudflare 兼容补充：
 ```
 
 - 这里做不到的字段或动作一律 400，并说明是哪个字段（如 `rules[2].action_parameters.uri.query`），不会悄悄丢掉；一次 PUT 要么全部生效，要么都不生效。
-- `skip` 在这里会跳过其余自定义规则、安全级别、限速和托管规则，所以 `action_parameters` 至少要写 `ruleset: current`、
+- `skip` 在这里会跳过其余自定义规则、API Shield 的处理、安全级别、限速和托管规则，所以 `action_parameters` 至少要写 `ruleset: current`、
   `phases: [http_ratelimit, http_request_firewall_managed]`、`products: [securityLevel]`（或者不写）；只跳过一部分的 skip 会被拒绝，不会被放宽。
 - 一条同时改路径、请求头、响应头的改写规则会出现在三个阶段里；经某个阶段修改只动那一部分，但表达式、描述和开关是共用的，
   它还在别的阶段时经单个阶段改这几项会被拒绝（请用 `/transform_rules`）。
@@ -730,6 +734,19 @@ DNS 记录的 Cloudflare 兼容补充：
 - 只有页面请求会排队；图片、脚本、接口请求和表单提交照常通过，`/cdn-cgi/` 和被防火墙 `skip` 规则放行的请求也不排队。
 - 状态只在内存里，有上限，过期的会话和不再刷新的排队票会被清掉；重启后会话计数和队伍清空（Cookie 和排队票的到达时间仍然有效）。
 - 令牌权限是 `Waiting Rooms Read` / `Waiting Rooms Write`。
+
+## API Shield
+
+登记一个域名的 API 接口，按接口检查请求（面板：域名 → 安全 → API Shield，接口 `/zones/{id}/api_gateway/...`，路径仿照 Cloudflare）。一个接口是一个方法、一个主机名和一个路径模板，如 `GET api.example.com /users/{id}`，可以带请求体的 JSON schema。
+
+- 匹配按主机名和方法分开。`{名字}` 必须占整段，匹配一段非空路径；其他段只匹配自己（区分大小写）。几个模板都能匹配时，最先出现不同的那一段是固定段的胜出：`/users/me` 先于 `/users/{id}`。请求路径先解码，去掉空段和 `.`，`..` 吃掉前一段，所以 `/api//users/`、`/%61pi/users` 都算 `/api/users`。匹配同一批请求的两个接口（`/u/{id}` 和 `/u/{name}`）不能同时存在。
+- 登记了接口的主机名，请求不匹配任何接口就是"未匹配"（规则字段 `cf.api_gateway.fallthrough_detected`）；没登记接口的主机名不受影响，`/cdn-cgi/` 和证书验证路径也不算。
+- 有 schema 的接口只收 JSON 请求体（`Content-Type` 为 `application/json` 或 `*/*+json`，不带 `Content-Encoding`），请求体要符合 schema，否则算不合规（规则字段 `cf.api_gateway.request_violates_schema`）。空请求体只在接口要求必须有请求体时不合规。**超过 1 MiB 的请求体**（安全检查最多缓冲这么多）没法完整检查，**一律算不合规**，免得靠填充绕过检查；收大 JSON 请求体的接口就别给它配 schema。请求体原样送到源站。
+- schema 支持 JSON Schema 的一个子集：`type`（含 OpenAPI 3.0 的 `nullable`）、`properties`、`required`、`additionalProperties`、`items`、`enum`、`const`、`minLength` / `maxLength`（按字符数）、`minItems` / `maxItems`、`minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum`。`description`、`example`、`format` 这类说明性的字段保存时直接去掉（`format` 不检查）；`pattern`、`oneOf`、`$ref` 等不支持，直接提交的 schema 用了就报错。
+- 上限：每个域名 2000 个接口；一个 schema 最大 64 KiB、最多嵌套 32 层，一个域名的 schema 合计最大 2 MiB；`enum` 最多 256 个值。
+- 两个区域设置决定 fucf 自己怎么处理：`api_shield_schema_action`（请求体不合规）和 `api_shield_fallthrough_action`（未匹配），取值 `none`（默认，只给规则用）、`log`、`block`（403）。也可以用 `PUT /zones/{id}/api_gateway/settings/schema_validation` 改，字段是 `validation_default_mitigation_action`（Cloudflare 的名字）和 `fallthrough_mitigation_action`（fucf 自己起的）。它们在自定义防火墙规则之后、安全级别之前执行，所以防火墙的 `skip` 规则能豁免，也可以不开这两个设置，直接写规则，如 `cf.api_gateway.fallthrough_detected and http.request.uri.path contains "/admin"`。安全事件的来源是 `api_shield`，说明里写哪个接口、请求体哪里不对（如 `$.items[2].name: expected string`），不会写出请求体里的值。
+- OpenAPI：`POST /zones/{id}/api_gateway/openapi` 的请求体就是 OpenAPI 3 文档，**只读 JSON**（依赖里没有 YAML 解析器，YAML 请先转换），最大 2 MiB。读 `servers`（得到主机名和路径前缀，相对地址和没有 servers 时用 `?host=` 或根域）、`paths` 和各方法、`requestBody`（`required` 和 JSON 媒体类型的 schema，跟随 `#/components/...` 引用）。参数不检查；schema 里不支持的部分、部分模板的路径（如 `/files/{name}.json`）、域名之外的 servers 都会跳过，并列在返回的 `upload_details.warnings` 里。跳过 schema 的部分只会让检查更宽松，不会误拦。已有的接口按方法、主机名和路径更新，导入不会删除接口；要么全部导入，要么一个也不导入。
+- 令牌权限是 `API Gateway Read` / `API Gateway Write`。和 Cloudflare 的区别：没有按流量自动发现接口，没有按接口单独设置的动作，不检查参数、`format` 和 `pattern`。
 
 ## 自动防火墙
 

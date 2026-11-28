@@ -206,6 +206,12 @@ pub struct Settings {
     /// Answer `/cdn-cgi/image/<options>/<path>` with the zone's own image at
     /// `<path>`, resized (crate::edge::images).
     pub image_resizing: bool,
+    /// What the edge does with a request whose body breaks its API
+    /// operation's schema (crate::edge::apishield): `none`, `log` or `block`.
+    pub api_shield_schema_action: String,
+    /// The same for a request to a host with API operations that matches
+    /// none of them.
+    pub api_shield_fallthrough_action: String,
 }
 
 impl Default for Settings {
@@ -246,6 +252,8 @@ impl Default for Settings {
             mtls: "off".into(),
             early_hints_links: Vec::new(),
             image_resizing: false,
+            api_shield_schema_action: "none".into(),
+            api_shield_fallthrough_action: "none".into(),
         }
     }
 }
@@ -257,6 +265,8 @@ impl Settings {
         one_of("security_level", &self.security_level, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
         one_of("auto_firewall_action", &self.auto_firewall_action, &["block", "managed_challenge", "js_challenge"])?;
         one_of("mtls", &self.mtls, &["off", crate::edge::mtls::ON])?;
+        one_of("api_shield_schema_action", &self.api_shield_schema_action, &crate::edge::apishield::ACTIONS)?;
+        one_of("api_shield_fallthrough_action", &self.api_shield_fallthrough_action, &crate::edge::apishield::ACTIONS)?;
         if !(1..=100_000).contains(&self.auto_firewall_threshold)
             || !(60..=86_400).contains(&self.auto_firewall_window)
             || !(60..=30 * 86_400).contains(&self.auto_firewall_ban)
