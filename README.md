@@ -36,6 +36,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--proxy-protocol` | 关 | 边缘 TCP 连接必须以 PROXY protocol v1 头开始（仅用于只经可信四层代理可达的监听） |
 | `--api-listen` | `127.0.0.1:8787` | 管理 API 与面板 |
 | `--geoip-db` / `--geoip-asn-db` | 无 | MaxMind GeoLite2 Country / ASN 库；启用按大洲、国家、运营商调度和 `ip.geoip.*` 规则字段 |
+| `--geoip-cn-db` | `--geoip-db` 同目录下的 `ip2region_v4.xdb`、`ip2region_v6.xdb`（如果有） | [ip2region](https://github.com/lionsoul2014/ip2region) 库（Apache-2.0 / MIT）：中国大陆地址的省份。GeoLite2 只知道约六分之一大陆地址的省份，按省份调度要靠它 |
 | `--cname-base` | 无 | 该域名下的所有子名都解析到边缘（如 `cdn.example.com`，需委托给本服务）；CNAME 接入模式的区域把主机名 CNAME 到它 |
 | `--panel-host` | 无 | 在边缘上以该主机名对外发布面板和管理 API（HTTPS，仍需令牌） |
 | `--primary` | 无 | 作为只读副本运行：主节点的面板主机名（走 HTTPS），或它的管理 API 地址 `http://host:port` |
@@ -63,7 +64,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /warp/purge_cache                        POST             清除预留端点 /cdn-cgi/fucf-warp 的缓存：{"purge_everything":true} | {"files":[键...]} | {"prefixes":[键前缀...]}
 /nodes[/{id}]                            CRUD             {"name", "ipv4", "ipv6", "continents": ["AS","OC"], "enabled", "traffic_dns_gb", "traffic_throttle_gb", "traffic_limit_gb", "traffic_period", "traffic_reset_day", "rate_limit_mbps"}；
                                                           返回值带 healthy、副本状态（配置版本、是否同步、最后上报时间）和 traffic（本周期已用字节数、状态）
-/steering[/{id}]                         CRUD             {"name", "priority", "countries", "continents", "asns", "as_orgs", "action": "route|block", "nodes": [...]}
+/steering[/{id}]                         CRUD             {"name", "priority", "countries", "regions", "continents", "asns", "as_orgs", "action": "route|block", "nodes": [...]}
+/steering/test?ip=                       GET              这个地址被定位到哪里（国家、省份、大洲、ASN）、命中哪条规则
 /email/status                            GET              本节点 SMTP 监听地址、主机名、中继配置与最近转发活动
 /zones                                   GET POST         {"name", "type": "full|partial"}
 /zones/{id}                              GET PATCH DELETE
@@ -326,6 +328,25 @@ API 令牌照旧可用（运维脚本、副本同步、应急），拥有全部�
 
 管理员可以在同一页添加 / 删除节点、编辑节点的调度大洲与三档流量限制（摘除 DNS / 开始限速 / 停服及周期与重置日），对节点下指令（`POST /fleet/{节点}/actions {"action": "restart" | "purge_cache"}`：本机立即执行，副本在 5 秒内取走执行），以及发布新版本、撤回并回退或仅忘掉当前发布，见下节。
 
+## 更新时不断连
+
+进程换成另一个二进制（滚动发布、面板的"重启"、或替换 `/usr/local/bin/fucf` 后发 `SIGUSR2`）时，监听的套接字（边缘、HTTP/3、DNS、API、SMTP）
+原样交给下一个进程（环境变量 `FUCF_LISTEN_FDS`）：这期间到达的连接在内核队列里等几百毫秒，而不是被拒绝。
+换之前先等手上的请求答完（最多 2 秒），期间已有连接上的新请求得到"边缘节点正在更新"页面（503，`Retry-After: 30`，30 秒后自动刷新）。
+手动换二进制：
+
+```bash
+install -m 755 fucf /usr/local/bin/fucf && systemctl kill -s USR2 --kill-whom=main fucf   # 或在 unit 里写 ExecReload=/bin/kill -USR2 $MAINPID，用 systemctl reload fucf
+```
+
+`systemctl restart` 仍会有几百毫秒没有进程监听；停止时同样先给手上的请求最多 3 秒，期间来的访客看到更新页面。
+
+## 伪装子域
+
+区域设置 `decoy_subdomains`（面板：域名 → 安全 → 伪装子域）：开启后该域名下任何没有记录的名字都能解析——指向没有流量限制、其次流量配额最大的健康节点
+（不用仅加速节点），每个地址族一个地址——但都无法访问：HTTPS 握手失败，HTTP 直接断开。靠解析枚举子域就没有意义了。
+已有记录、通配记录、空非终端、子域委派和 Spectrum 应用不受影响。
+
 ## 滚动更新与自动回滚
 
 机群可以自己换二进制：把一个签过名的新版本交给主节点，它让副本**一台一台**地换，全部换完并稳定后自己最后换。
@@ -448,7 +469,8 @@ scripts/deploy/verify.sh                      # 节点互相探测 HTTPS / QUIC 
 | 其余 | 按大洲：亚洲 / 大洋洲 → au，欧洲 / 非洲 → eu，美洲 → us | |
 
 中国大陆的流量在 au 与 eu 之间互为备用，只有两者都不可用时才会落到 us。
-报告中的"电信分省"方案没有实现：GeoLite2 的 Country / ASN 库不含省级信息。
+按省份调度（规则的 `regions`，ISO 3166-2 代码如 `JS` `ZJ` `SH` `SD` `AH`）用 ip2region 判断大陆地址的省份：GeoLite2 City 只覆盖约六分之一的大陆地址，江苏电信的 DNS 就查不到省份，规则多半不命中。
+DNS 调度看到的是递归 DNS 的地址（带 ECS 时是访客网段）；面板「调度与 DNS 屏蔽」页可以输入 IP 测试定位和命中的规则。
 
 `tune-node.sh` 针对 150–260 ms、5–15% 丢包的长肥管道：BBR + fq、TCP Fast Open、32 MiB 的 TCP 窗口上限、
 加大 UDP 默认缓冲（QUIC）、关闭空闲后慢启动、开启 MTU 探测；并安装每周更新的 GeoLite2 库。
@@ -511,7 +533,7 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 - 多节点：配置单向同步（主节点 → 副本轮询）；缓存和限速计数是各节点各自的内存状态。分析数据和安全事件每 2 分钟及退出时落盘，
   进程被强杀会丢最后这一段；副本联系不上主节点期间攒着待上报的数据，重启则丢失。
   主节点不可用时副本继续按最后一次拿到的配置服务，但无法修改配置，证书也不会续期。
-- 调度：健康检查只到 TLS 握手为止，不发 HTTP 请求；GeoIP 精度到国家和 ASN，没有省 / 城市级调度。
+- 调度：健康检查只到 TLS 握手为止，不发 HTTP 请求；GeoIP 精度到国家、ASN 和（中国大陆，需 ip2region 库）省份，没有城市级调度。
 - 证书：ACME 客户端只支持 ECDSA P-256 账户和证书密钥，不支持 External Account Binding（需要它的 CA 如 ZeroSSL 用不了）；
   对真实 CA 只实测过 Let's Encrypt（staging 和正式）的 TLS-ALPN-01；DNS-01 和 HTTP-01 目前只有模拟 CA 的自动化测试；HTTP/3 (QUIC) 监听不应答 TLS-ALPN-01（CA 只走 TCP，不影响签发）。
 - 滚动更新：自检只查本机（监听、API、DNS 有应答，副本联系得上主节点），查不出"能应答但答错了"的版本；主节点换自己时

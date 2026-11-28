@@ -124,6 +124,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/nodes", get(list_nodes).post(create_node))
         .route("/nodes/{node_id}", get(get_node).put(update_node).patch(update_node).delete(delete_node))
         .route("/steering", get(list_steering).post(create_steering))
+        .route("/steering/test", get(test_steering))
         .route("/steering/{rule_id}", axum::routing::put(update_steering).patch(update_steering).delete(delete_steering))
         .route("/proxy/rules", get(list_proxy_rules).post(create_proxy_rule))
         .route(
@@ -2226,6 +2227,37 @@ async fn list_nodes(State(st): St) -> ApiResult {
 
 async fn list_steering(State(st): St) -> ApiResult {
     ok(serde_json::to_value(st.store.list_steering()).unwrap_or_default())
+}
+
+/// Where a visitor at `ip` is placed, and which steering rule takes it
+/// (the first enabled one by priority that matches; health and traffic
+/// allowances aside).
+async fn test_steering(State(st): St, Query(q): Params) -> ApiResult {
+    let ip: std::net::IpAddr = q
+        .get("ip")
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(|| StoreError::Invalid("ip must be an IPv4 or IPv6 address".into()))?;
+    let geo = st.edge.geo.get().cloned().unwrap_or_default();
+    let loc = geo.locate(ip);
+    let snap = st.store.snapshot();
+    let rule = snap.steering.iter().find(|r| r.matches(&loc));
+    let continent: Vec<&str> = match &loc.continent {
+        Some(c) => snap.nodes.iter().filter(|n| n.continents.contains(c)).map(|n| n.name.as_str()).collect(),
+        None => Vec::new(),
+    };
+    ok(json!({
+        "ip": ip.to_string(),
+        "location": {
+            "continent": loc.continent,
+            "country": loc.country,
+            "region": loc.region,
+            "asn": loc.asn,
+            "as_org": loc.as_org,
+        },
+        "databases": { "country": geo.has_country_db(), "cn_provinces": geo.has_cn_db() },
+        "rule": rule.map(|r| json!({ "id": r.id, "name": r.name, "action": r.action, "nodes": r.nodes, "priority": r.priority })),
+        "continent_nodes": continent,
+    }))
 }
 
 async fn create_steering(State(st): St, bytes: Bytes) -> ApiResult {

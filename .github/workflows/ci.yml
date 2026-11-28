@@ -153,6 +153,20 @@ jobs:
           [ -n "$AUTH_COOKIE" ] || { echo "no session cookie after registering"; cat /tmp/auth-reg.h; exit 1; }
           curl -fsS -H "Host: auth.example.com" -H "Cookie: $AUTH_COOKIE" $A/account | grep -q "uicheck\|UI 检查" || { echo "account page does not show the user"; exit 1; }
           echo "AUTH_COOKIE=$AUTH_COOKIE" >> $GITHUB_ENV
+      - name: a reload (SIGUSR2) keeps the listeners open
+        run: |
+          PID=$(pgrep -f 'dist/fucf-linux-x86_64' | head -1)
+          A=http://127.0.0.1:18080
+          # visitors keep coming while the process turns into the binary again
+          ( for i in $(seq 1 150); do curl -s -o /dev/null -m 5 -w "%{http_code} %{exitcode}\n" -H "Host: auth.example.com" $A/healthz; sleep 0.02; done ) > /tmp/reload-probe.txt &
+          PROBE=$!
+          sleep 0.5; kill -USR2 "$PID"; wait $PROBE
+          for i in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:8787/ && break; sleep 0.2; done
+          sort /tmp/reload-probe.txt | uniq -c
+          [ "$(pgrep -f 'dist/fucf-linux-x86_64' | head -1)" = "$PID" ] || { echo "the process was not replaced in place"; exit 1; }
+          grep -q "took over the listener on tcp 127.0.0.1:18080" /tmp/fucf-ui.log || { echo "the edge listener was not handed over"; tail -30 /tmp/fucf-ui.log; exit 1; }
+          if grep -qv '^200 0$\|^503 0$' /tmp/reload-probe.txt; then echo "visitors were refused or failed during the reload"; tail -30 /tmp/fucf-ui.log; exit 1; fi
+          curl -fsS -H "Host: auth.example.com" $A/healthz; echo
       - name: screenshots
         run: |
           cd scripts/ui && npm init -y >/dev/null && npm i --no-audit --no-fund playwright@1.49.1 >/dev/null && npx playwright install --with-deps chromium >/dev/null

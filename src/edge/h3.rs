@@ -43,7 +43,9 @@ pub fn endpoint(addr: SocketAddr, store: Arc<Store>) -> anyhow::Result<quinn::En
     transport.receive_window((16u32 * 1024 * 1024).into());
     transport.stream_receive_window((4u32 * 1024 * 1024).into());
     config.transport_config(Arc::new(transport));
-    Ok(quinn::Endpoint::server(config, addr)?)
+    // the socket may come from the process before (see crate::handoff)
+    let socket = crate::handoff::udp(addr)?;
+    Ok(quinn::Endpoint::new(quinn::EndpointConfig::default(), Some(config), socket, Arc::new(quinn::TokioRuntime))?)
 }
 
 pub async fn serve(endpoint: quinn::Endpoint, edge: Arc<Edge>) {

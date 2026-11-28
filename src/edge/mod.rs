@@ -107,9 +107,17 @@ impl std::fmt::Display for Reason {
 /// The title of every error page about the origin.
 pub const ORIGIN_ERROR: &str = "回源错误 Origin error";
 
+/// Status of [`EdgeError::hang_up`] (nginx's convention): nothing is answered.
+const HANG_UP: u16 = 444;
+
 impl EdgeError {
     pub fn new(status: u16, title: &'static str, detail: impl Into<String>) -> Self {
         EdgeError { status, title, detail: detail.into(), origin: None }
+    }
+
+    /// Answer nothing at all: the connection is closed (decoy names).
+    pub fn hang_up(detail: impl Into<String>) -> Self {
+        EdgeError::new(HANG_UP, "Hung up", detail)
     }
 
     /// The origin could not be reached or answered badly. `reason` is what the
@@ -314,7 +322,8 @@ footer code{font:12.5px ui-monospace,'SF Mono',Consolas,monospace;color:var(--su
 .hop em{display:inline-block;margin-top:.5rem;padding:3px 9px;border-radius:999px;font:500 12px/1.4 inherit;font-style:normal;background:var(--chip);color:var(--faint)}\
 .hop.ok i,.hop.ok em{background:rgba(74,155,110,.14);color:#2f7a52}\
 .hop.bad i,.hop.bad em{background:rgba(217,119,87,.16);color:#b5462a}\
-@media (prefers-color-scheme:dark){.hop.ok i,.hop.ok em{color:#7cc49b}.hop.bad i,.hop.bad em{color:#f0a283}}\
+.hop.warn i,.hop.warn em{background:rgba(201,150,40,.16);color:#8a6410}\
+@media (prefers-color-scheme:dark){.hop.ok i,.hop.ok em{color:#7cc49b}.hop.bad i,.hop.bad em{color:#f0a283}.hop.warn i,.hop.warn em{color:#e3c06a}}\
 .hop em{white-space:nowrap}\
 html[data-lang=zh] [data-l=en],html[data-lang=en] [data-l=zh]{display:none}\
 main{position:relative}.lang{position:absolute;top:3rem;right:1.5rem;min-height:32px;padding:4px 12px;font-size:13px;background:var(--chip);color:var(--sub)}\
@@ -342,9 +351,10 @@ const ICON_EDGE: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"curre
 const ICON_ORIGIN: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"4\" y=\"4.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><rect x=\"4\" y=\"13.5\" width=\"16\" height=\"6\" rx=\"1.5\"/><path d=\"M7.5 7.5h.01M7.5 16.5h.01\"/></svg>";
 
 /// The path of the request and where it broke, like Cloudflare's 5xx pages.
-fn path_html(ctx: &PageCtx) -> String {
+fn path_html(ctx: &PageCtx, updating: bool) -> String {
     let state = |hop: Hop| -> (&str, String) {
         match (ctx.hop, hop) {
+            (Hop::Edge, Hop::Edge) if updating => ("warn", bi("更新中", "Updating")),
             (failed, h) if failed == h => ("bad", bi("出错", "Error")),
             (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", bi("未涉及", "Not involved")),
             _ => ("ok", bi("正常", "Working")),
@@ -414,8 +424,48 @@ document.getElementById('lang').onclick=function(){var n=d.getAttribute('data-la
 d.setAttribute('data-lang',n);d.lang=n==='en'?'en':'zh-CN';try{localStorage.setItem(k,n)}catch(e){}}})()</script>";
 
 fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Response<Body> {
+    page_with(status, title, detail, ray, ctx, None)
+}
+
+/// Seconds after which the "node updating" page reloads itself.
+const UPDATING_REFRESH: u32 = 30;
+
+/// What visitors get while this node is going away for an update (or a
+/// restart): nothing is wrong with the site, the page reloads itself, and
+/// by then the visitor is answered by this node again or by another one.
+pub fn updating_page(ray: &str, ctx: &PageCtx) -> Response<Body> {
+    let colo = &ctx.here.colo;
+    let special = Special {
+        title: ("边缘节点正在更新", "This edge node is updating"),
+        detail: (
+            format!("边缘节点 {colo} 正在更新，马上就回来。本页 {UPDATING_REFRESH} 秒后自动刷新。"),
+            format!("The edge in {colo} is being updated and will be back in a moment. This page reloads itself in {UPDATING_REFRESH} seconds."),
+        ),
+        what: (
+            format!("你的请求到达了边缘节点 {colo}，它正在换用新版本，这几秒内不接新请求。站点和源站都正常。"),
+            format!("Your request reached the edge in {colo} while it was switching to a new version, which takes a few seconds. The site and its origin are fine."),
+        ),
+        todo: ("稍等即可：页面会自动刷新，届时由更新好的节点或其他节点为你服务。", "Just wait: the page reloads by itself, and you will be served by the updated node or another one."),
+    };
+    let mut resp = page_with(503, "Edge node updating", "", ray, ctx, Some(special));
+    resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(UPDATING_REFRESH));
+    resp
+}
+
+/// Texts of a page that is not about an error (see [`updating_page`]).
+struct Special {
+    title: (&'static str, &'static str),
+    detail: (String, String),
+    what: (String, String),
+    todo: (&'static str, &'static str),
+}
+
+fn page_with(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx, special: Option<Special>) -> Response<Body> {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let (title_zh, title_en, detail_zh, detail_en) = match ctx.reason {
+    let updating = special.is_some();
+    let (title_zh, title_en, detail_zh, detail_en) = match (&special, ctx.reason) {
+        (Some(sp), _) => (sp.title.0.to_string(), sp.title.1.to_string(), sp.detail.0.clone(), sp.detail.1.clone()),
+        (None, reason) => match reason {
         Some(r) => (
             "回源错误".to_string(),
             "Origin error".to_string(),
@@ -423,15 +473,29 @@ fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Res
             format!("{}: the edge is working, but could not get a valid response from the origin.", capitalized(r.en)),
         ),
         None => (zh(title).unwrap_or(title).to_string(), title.to_string(), zh(detail).unwrap_or(detail).to_string(), detail.to_string()),
+        },
     };
     // a retry helps with what is temporary; a 4xx will not change by itself
-    let retry = if status >= 500 {
+    let retry = if updating {
+        format!(
+            "<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">{}</button></div>\
+             <script>(function(){{var n={UPDATING_REFRESH},c=document.querySelectorAll('.cd');setInterval(function(){{n--;for(var i=0;i<c.length;i++)c[i].textContent=Math.max(n,0);if(n<=0)location.reload()}},1000)}})()</script>",
+            format!(
+                "<span data-l=\"zh\">立即刷新（<span class=\"cd\">{UPDATING_REFRESH}</span> 秒）</span><span data-l=\"en\">Reload now (<span class=\"cd\">{UPDATING_REFRESH}</span> s)</span>"
+            ),
+        )
+    } else if status >= 500 {
         format!("<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">{}</button></div>", bi("重新加载", "Reload"))
     } else {
         String::new()
     };
     let when = crate::store::now();
-    let ((what_zh, what_en), (todo_zh, todo_en)) = advice(status, ctx);
+    let ((what_zh, what_en), (todo_zh, todo_en)) = match special {
+        Some(sp) => (sp.what, sp.todo),
+        None => advice(status, ctx),
+    };
+    let refresh = if updating { format!("<meta http-equiv=\"refresh\" content=\"{UPDATING_REFRESH}\">") } else { String::new() };
+    let code_line = if updating { bi("维护中", "Maintenance") } else { format!("Error {status}") };
     let (colo, fl) = (escape(&ctx.here.colo), escape(&ctx.here.fl));
     let (lang, head_title) = match ctx.lang {
         Lang::Zh => ("zh", &title_zh),
@@ -439,10 +503,10 @@ fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Res
     };
     let html = format!(
         "<!doctype html><html lang=\"{html_lang}\" data-lang=\"{lang}\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\">{refresh}\
          <title>{status} · {}</title><style>{PAGE_CSS}</style></head><body><main>\
          <button type=\"button\" id=\"lang\" class=\"lang\" aria-label=\"Language / 语言\"><span data-l=\"zh\">English</span><span data-l=\"en\">中文</span></button>\
-         {PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{}</h1><p>{}</p>{path}\
+         {PAGE_MARK}<span class=\"code\">{code_line}</span><h1>{}</h1><p>{}</p>{path}\
          <div class=\"what\"><h2>{}</h2><p>{}</p><h2>{}</h2><p>{}</p></div>{retry}\
          <footer><span>Ray ID <code>{ray}</code></span><span>{} <code>{colo}</code> · <code>fl={fl}</code></span><span>{when}</span><span>fucf</span></footer>\
          </main>{LANG_SCRIPT}</body></html>",
@@ -455,7 +519,7 @@ fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Res
         bi(todo_zh, todo_en),
         bi("节点", "Node"),
         html_lang = if ctx.lang == Lang::En { "en" } else { "zh-CN" },
-        path = path_html(ctx),
+        path = path_html(ctx, updating),
     );
     let mut resp = Response::new(full(html));
     *resp.status_mut() = code;
@@ -921,6 +985,30 @@ pub struct Edge {
     /// Origin addresses that recently refused connections or timed out.
     down: std::sync::Mutex<std::collections::HashMap<String, Instant>>,
     rr: AtomicUsize,
+    /// This process is about to go (see [`Edge::leave`]): visitors get the
+    /// "node updating" page.
+    pub leaving: std::sync::atomic::AtomicBool,
+    /// Set when the listeners are being handed to the next binary: they
+    /// accept nothing more here (connections wait for the next process).
+    handing_over: tokio::sync::watch::Sender<bool>,
+    /// Requests being answered right now.
+    busy: AtomicUsize,
+}
+
+/// Counts a request as under way for as long as it lives.
+struct Busy(Arc<Edge>);
+
+impl Busy {
+    fn new(edge: Arc<Edge>) -> Self {
+        edge.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(edge)
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct IdleTimeoutIo<S> {
@@ -1159,7 +1247,44 @@ impl Edge {
             allow_subrequest_loopback: std::sync::atomic::AtomicBool::new(false),
             down: Default::default(),
             rr: AtomicUsize::new(0),
+            leaving: std::sync::atomic::AtomicBool::new(false),
+            handing_over: tokio::sync::watch::channel(false).0,
+            busy: AtomicUsize::new(0),
         })
+    }
+
+    /// This process is about to go: from now on visitors get the "node
+    /// updating" page, and the requests under way get up to `grace` to be
+    /// answered. With `handover` (the next binary takes over the
+    /// listeners), nothing more is accepted: new connections wait in the
+    /// kernel's queue for the next process instead.
+    pub async fn leave(&self, handover: bool, grace: Duration) {
+        self.leaving.store(true, Ordering::SeqCst);
+        if handover {
+            self.handing_over.send_replace(true);
+        }
+        let until = Instant::now() + grace;
+        while self.busy.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The handover did not happen: serve as before.
+    pub fn resume(&self) {
+        self.handing_over.send_replace(false);
+        self.leaving.store(false, Ordering::SeqCst);
+    }
+
+    /// Completes once the listeners are being handed over.
+    async fn handed_over(&self) {
+        let mut over = self.handing_over.subscribe();
+        let _ = over.wait_for(|on| *on).await;
+    }
+
+    /// Completes when a handover did not happen after all (see [`Edge::resume`]).
+    async fn taken_back(&self) {
+        let mut over = self.handing_over.subscribe();
+        let _ = over.wait_for(|on| !*on).await;
     }
 
     /// Is `host` a proxied name of this zone?
@@ -1838,6 +1963,9 @@ impl Edge {
         }
 
         let Some(zone) = snap.find_zone(&host).filter(|z| Self::serves(z, &host)) else {
+            if snap.find_zone(&host).is_some_and(|z| z.is_decoy(&host)) {
+                return Err(EdgeError::hang_up(format!("{host} is a decoy name")));
+            }
             if let Some(rule) = proxy::match_fallback(&snap.local_proxy_rules, node_name, listener.as_ref(), &host, req.uri().path()).cloned() {
                 return proxy::forward(&self, &rule, ip, ssl, &host, req).await;
             }
@@ -2056,6 +2184,13 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
         .filter(|h| h.len() <= 253 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:".contains(&b)))
         .unwrap_or_default();
     let lang = Lang::from_headers(req.headers());
+    if edge.leaving.load(Ordering::SeqCst) {
+        let ctx = PageCtx { hop: Hop::Edge, host: asked_host, here: edge.here(), reason: None, lang };
+        let mut resp = updating_page(&ray, &ctx);
+        resp.headers_mut().insert(header::SERVER, HeaderValue::from_static("fucf"));
+        return resp;
+    }
+    let _busy = Busy::new(edge.clone());
     let mut seen = None;
     // `refusal`: why the edge answered by itself instead of passing on the origin's answer
     let (resp, refusal) = match edge.clone().process(peer.ip().to_canonical(), ssl, req, &ray, &mut seen).await {
@@ -2065,6 +2200,10 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
                 _ => "refused by the security rules of this site".to_string(),
             });
             (r, by_waf)
+        }
+        Err(e) if e.status == HANG_UP => {
+            tracing::debug!(%ray, client = %peer.ip(), "{line}: {}", e.detail);
+            return Response::new(HangUp.boxed());
         }
         Err(e) => {
             let public = e.public_detail();
@@ -2149,6 +2288,22 @@ async fn handle(
         req.extensions_mut().insert(info);
     }
     Ok(respond(edge, peer, ssl, req).await)
+}
+
+/// A response body that fails before its first byte: hyper then closes
+/// the connection without writing anything (the head is still in its
+/// buffer), and HTTP/2 or HTTP/3 reset the stream.
+struct HangUp;
+
+impl hyper::body::Body for HangUp {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        std::task::Poll::Ready(Some(Err("hung up".into())))
+    }
 }
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -2355,7 +2510,15 @@ async fn serve_with_options(
     });
     loop {
         let Ok(permit) = limit.clone().acquire_owned().await else { return };
-        let (mut stream, mut peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            // the next binary takes this listener over: leave its queue to it
+            _ = edge.handed_over() => {
+                edge.taken_back().await;
+                continue;
+            }
+        };
+        let (mut stream, mut peer) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!("edge accept error: {e}");

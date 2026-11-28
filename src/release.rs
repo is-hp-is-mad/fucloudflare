@@ -508,7 +508,11 @@ fn exec(path: &Path, launcher: Option<&Path>) -> std::io::Error {
         Some(launcher) => command.env(LAUNCHED, launcher),
         None => command.env_remove(LAUNCHED),
     };
-    command.args(args).exec()
+    // the listeners stay open for the next binary: visitors wait instead of being refused
+    crate::handoff::prepare_exec(&mut command);
+    let error = command.args(args).exec();
+    crate::handoff::exec_failed();
+    error
 }
 
 #[cfg(not(unix))]

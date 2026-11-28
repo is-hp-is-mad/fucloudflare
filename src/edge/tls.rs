@@ -164,6 +164,9 @@ impl CertResolver {
     pub async fn warm_sni(self: &Arc<Self>, sni: &str) {
         let sni = sni.to_ascii_lowercase();
         let snap = self.store.snapshot();
+        if snap.find_zone(&sni).is_some_and(|z| z.is_decoy(&sni)) {
+            return None; // decoy names: the handshake fails
+        }
         let wildcard = sni.split_once('.').map(|(_, parent)| format!("*.{parent}"));
         if snap.certs.contains_key(&sni) || wildcard.as_deref().is_some_and(|w| snap.certs.contains_key(w)) {
             return;

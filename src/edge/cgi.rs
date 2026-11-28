@@ -102,6 +102,7 @@ impl Edge {
             ("asn", location.asn.map(|n| n.to_string()).unwrap_or_default()),
             ("zone", zone.to_string()),
             ("limit", limit.as_str().to_string()),
+            ("region", location.region.unwrap_or_default()),
         ];
         let body: String = lines.iter().map(|(key, value)| format!("{key}={value}\n")).collect();
         let mut resp = text(body);

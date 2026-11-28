@@ -138,6 +138,12 @@ pub struct Settings {
     /// Take mail for addresses of this zone and pass it on as its e-mail
     /// routing rules say (see crate::mail).
     pub email_routing: bool,
+    /// Decoy subdomains: every name under the zone that has no records
+    /// resolves anyway (to the edge nodes with the most traffic to spare,
+    /// never accelerate nodes), and the edge refuses it -- the TLS handshake
+    /// fails, plain HTTP is hung up on. Enumerating the zone's names by
+    /// resolving them tells nothing then.
+    pub decoy_subdomains: bool,
 }
 
 impl Default for Settings {
@@ -156,6 +162,7 @@ impl Default for Settings {
             hsts_include_subdomains: false,
             grpc: true,
             email_routing: false,
+            decoy_subdomains: false,
         }
     }
 }

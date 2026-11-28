@@ -45,6 +45,8 @@ maxminddb = { version = "0.33.0", features = ["mmap"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
 base64 = "0.22"
+libc = "0.2"
+memmap2 = "0.9"
 
 [profile.release]
 lto = "thin"

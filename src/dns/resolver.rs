@@ -439,6 +439,26 @@ impl Resolver {
         of_list(&pool)
     }
 
+    /// Where decoy names point (see `Settings::decoy_subdomains`): the node
+    /// with the most traffic to spare -- one without a traffic limit first,
+    /// then by the size of its limit -- that is up and not over its
+    /// allowance, one address per family. Accelerate nodes never.
+    fn decoy_edges(&self, snap: &Snapshot) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+        use crate::limits::State;
+        let (me, mine) = self.limits.own();
+        let state = |n: &EdgeNode| {
+            let known = snap.limited.get(&n.name).copied().unwrap_or_default();
+            if n.name == me { known.max(mine) } else { known }
+        };
+        let mut nodes: Vec<&EdgeNode> = snap.nodes.iter().filter(|n| !n.role.eq_ignore_ascii_case("accelerate")).collect();
+        nodes.sort_by(|a, b| {
+            let rank = |n: &EdgeNode| (state(n) != State::Ok, !self.health.is_up(&n.name));
+            let room = |n: &EdgeNode| n.traffic_limit_gb.filter(|gb| *gb > 0.0).unwrap_or(f64::INFINITY);
+            rank(a).cmp(&rank(b)).then(room(b).total_cmp(&room(a))).then(a.name.cmp(&b.name))
+        });
+        (nodes.iter().find_map(|n| n.ipv4), nodes.iter().find_map(|n| n.ipv6))
+    }
+
     /// HTTPS records for a name served by the edge: HTTP/3 on its port first,
     /// HTTP/2 on 443 for clients without QUIC.
     fn https_rrs(&self, owner: &str, http3: bool) -> Vec<RR> {
@@ -542,6 +562,21 @@ impl Resolver {
                 resp.authority.push(soa(z)); // the name exists, this type does not
                 return;
             }
+        }
+
+        if z.is_decoy(qname) {
+            // a decoy name exists for every query: addresses for A/AAAA, NODATA for the rest
+            let (v4, v6) = self.decoy_edges(&snap);
+            let rr = |data| RR { name: qname.to_string(), ttl: self.edge_ttl, data };
+            match qtype {
+                rtype::A => resp.answers.extend(v4.map(|ip| rr(RData::A(ip)))),
+                rtype::AAAA => resp.answers.extend(v6.map(|ip| rr(RData::Aaaa(ip)))),
+                _ => {}
+            }
+            if resp.answers.is_empty() {
+                resp.authority.push(soa(z));
+            }
+            return;
         }
 
         let mut name = qname.to_string();
@@ -1245,6 +1280,45 @@ mod tests {
         )])).unwrap();
         assert!(has_v4(&ask_q(shanghai, rtype::A), 20), "CN A must skip v4_tcp-blocked jp");
         assert!(has_v6(&ask_q(shanghai, rtype::AAAA), 0x10), "CN AAAA keeps v6_tcp-healthy jp");
+    }
+
+    #[test]
+    fn decoy_names_resolve_to_the_node_with_the_most_room() {
+        use crate::limits::State;
+        use serde_json::json;
+        use std::collections::BTreeMap;
+        let r = setup();
+        let zone = r.store.snapshot().find_zone("example.com").unwrap().zone.id.clone();
+        r.store.save_node(None, json!({ "name": "small", "ipv4": "203.0.113.1", "traffic_limit_gb": 100 })).unwrap();
+        r.store.save_node(None, json!({ "name": "big", "ipv4": "203.0.113.2", "ipv6": "2001:db8::2", "traffic_limit_gb": 2000 })).unwrap();
+        r.store.save_node(None, json!({ "name": "free", "ipv4": "203.0.113.3" })).unwrap();
+        r.store.save_node(None, json!({ "name": "jp", "ipv4": "203.0.113.4", "role": "accelerate", "accel_hosts": ["*.example.com"] })).unwrap();
+
+        // off: a name that does not exist does not
+        assert_eq!(ask(&r, "nothing.example.com", rtype::A).rcode, rcode::NXDOMAIN);
+        r.store.update_setting(&zone, "decoy_subdomains", json!(true)).unwrap();
+
+        // on: the node without a limit, then the one with the larger limit; never an accelerate node
+        let m = ask(&r, "nothing.example.com", rtype::A);
+        assert!(m.rcode == 0 && m.an == 1 && contains(&m, &[203, 0, 113, 3]), "free first");
+        let m = ask(&r, "a.b.c.example.com", rtype::AAAA);
+        assert!(m.an == 1 && contains(&m, &Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).octets()), "the only node with IPv6");
+        let m = ask(&r, "nothing.example.com", rtype::TXT);
+        assert!(m.rcode == 0 && m.an == 0 && m.ns == 1, "NODATA for other types");
+        r.store.set_limited_nodes(BTreeMap::from([("free".to_string(), State::Throttled)])).unwrap();
+        assert!(contains(&ask(&r, "nothing.example.com", rtype::A), &[203, 0, 113, 2]), "then by the size of the limit");
+
+        // what exists stays as it is: records, wildcards, empty non-terminals, delegations
+        assert!(contains(&ask(&r, "mail.example.com", rtype::A), &[192, 0, 2, 25]));
+        assert!(contains(&ask(&r, "x.wild.example.com", rtype::A), &[192, 0, 2, 7]));
+        let ent = ask(&r, "a.b.example.com", rtype::A);
+        assert!(ent.rcode == 0 && ent.an == 0, "empty non-terminal");
+        assert!(!ask(&r, "x.sub.example.com", rtype::A).aa, "delegated");
+        let snap = r.store.snapshot();
+        let z = snap.find_zone("example.com").unwrap();
+        assert!(z.is_decoy("nothing.example.com") && !z.is_decoy("mail.example.com") && !z.is_decoy("example.com"));
+        assert!(!z.is_decoy("x.sub.example.com") && !z.is_decoy("a.b.example.com") && !z.is_decoy("x.wild.example.com"));
+        assert!(!z.is_decoy("badexample.com"));
     }
 
     #[test]

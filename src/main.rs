@@ -6,7 +6,9 @@ mod edge;
 mod expr;
 mod fleet;
 mod geo;
+mod geo_cn;
 mod gfw;
+mod handoff;
 mod items;
 mod limits;
 mod log;
@@ -53,6 +55,12 @@ struct Args {
     /// MaxMind GeoLite2-ASN database; enables steering rules by network operator.
     #[arg(long, env = "FUCF_GEOIP_ASN_DB")]
     geoip_asn_db: Option<PathBuf>,
+
+    /// ip2region databases (`ip2region_v4.xdb`, `ip2region_v6.xdb`): the
+    /// provinces of mainland China, which GeoLite2 mostly lacks, for steering
+    /// rules by province. Default: those files next to --geoip-db, if present.
+    #[arg(long, env = "FUCF_GEOIP_CN_DB", value_delimiter = ',')]
+    geoip_cn_db: Vec<PathBuf>,
 
     /// Domain whose every sub-name resolves to the edge (e.g. cdn.example.com,
     /// delegated to this server). Zones in "partial" mode CNAME their hosts to it.
@@ -545,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
         if addr == "off" {
             continue;
         }
-        let listener = tokio::net::TcpListener::bind(addr.as_str())
+        let listener = handoff::tcp(addr.as_str())
             .await
             .with_context(|| format!("cannot bind edge {what} listener on {addr}"))?;
         tracing::info!("edge {what} listening on {}", listener.local_addr()?);
@@ -596,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         let (addr_str, tag) = spec.split_once('=').map(|(a, t)| (a.trim(), Some(t.trim()))).unwrap_or((spec, None));
-        let listener = tokio::net::TcpListener::bind(addr_str)
+        let listener = handoff::tcp(addr_str)
             .await
             .with_context(|| format!("cannot bind --proxy-listen on {addr_str}"))?;
         let local = listener.local_addr()?;
@@ -613,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         let addr_str = spec.split_once('=').map(|(a, _)| a.trim()).unwrap_or(spec);
-        let listener = tokio::net::TcpListener::bind(addr_str)
+        let listener = handoff::tcp(addr_str)
             .await
             .with_context(|| format!("cannot bind --proxy-tls-listen on {addr_str}"))?;
         let local = listener.local_addr()?;
@@ -645,7 +653,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let front = match args.h3_front_listen {
         Some(addr) => {
-            let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("cannot bind the HTTP/3 front's listener on {addr}"))?;
+            let listener = handoff::tcp(&addr.to_string()).await.with_context(|| format!("cannot bind the HTTP/3 front's listener on {addr}"))?;
             if !addr.ip().is_loopback() {
                 tracing::warn!("the HTTP/3 front's listener on {addr} believes whoever connects about the visitor's address: it belongs on loopback");
             }
@@ -659,7 +667,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let geo = Arc::new(geo::Geo::open(args.geoip_db.as_deref(), args.geoip_asn_db.as_deref())?);
+    let geo = Arc::new(geo::Geo::open(args.geoip_db.as_deref(), args.geoip_asn_db.as_deref())?.with_cn(&args.geoip_cn_db, args.geoip_db.as_deref())?);
     let _ = edge.geo.set(geo.clone());
     tokio::spawn(gfw::run(gfw.clone(), geo.clone(), node_limits.clone(), args.edge_ips.clone()));
     let health = Arc::new(geo::Health::default());
@@ -715,7 +723,7 @@ async fn main() -> anyhow::Result<()> {
             // can come back to any of them.
             let mail = Arc::new(mail::Mail::new(store.clone(), token.as_bytes(), hosts, relay)?);
             let _ = mail.edge.set(edge.clone());
-            let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("cannot bind the SMTP listener on {addr}"))?;
+            let listener = handoff::tcp(&addr.to_string()).await.with_context(|| format!("cannot bind the SMTP listener on {addr}"))?;
             tracing::info!("SMTP listening on {}", listener.local_addr()?);
             tokio::spawn(mail.clone().serve(listener));
             Some(mail)
@@ -800,14 +808,42 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(telemetry.clone().keep_saving());
     }
 
-    let listener = tokio::net::TcpListener::bind(args.api_listen)
+    let listener = handoff::tcp(&args.api_listen.to_string())
         .await
         .with_context(|| format!("cannot bind API listener on {}", args.api_listen))?;
     tracing::info!("API listening on http://{}/client/v4", listener.local_addr()?);
+    // whatever the process before listened on and this one does not
+    handoff::close_unclaimed();
     // A release on trial has to show that it works here before it may stay.
     let self_test = SelfTest { api: listener.local_addr()?, token: token.clone(), edge: edge_listeners, dns: dns_listeners, polled };
     updater.watchdog();
     tokio::spawn(updater.clone().settle(move || self_test.run()));
+    // SIGUSR2: start over as the binary now installed (after replacing it),
+    // keeping the listeners open meanwhile (see handoff)
+    #[cfg(unix)]
+    {
+        let (edge, updater, telemetry, accounts) = (edge.clone(), updater.clone(), telemetry.clone(), accounts.clone());
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let Ok(mut usr2) = signal(SignalKind::user_defined2()) else { return };
+            while usr2.recv().await.is_some() {
+                tracing::info!("SIGUSR2: starting over as the installed binary; the listeners stay open");
+                edge.leave(true, HANDOVER_GRACE).await;
+                if !accel {
+                    telemetry.save_async().await;
+                    let acc = accounts.clone();
+                    let _ = tokio::task::spawn_blocking(move || acc.flush_blocking()).await;
+                }
+                let u = updater.clone();
+                if let Ok(why) = tokio::task::spawn_blocking(move || u.relaunch()).await {
+                    tracing::error!("{why}");
+                }
+                // still here: go on serving
+                edge.resume();
+            }
+        });
+    }
+    let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {
         store,
         token,
@@ -833,7 +869,13 @@ async fn main() -> anyhow::Result<()> {
         providers: vec![kv_store.clone(), d1_store.clone()],
         edge,
     }));
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // whoever comes now is told that the node is updating, while what is under way finishes
+            edge_at_stop.leave(false, STOP_GRACE).await;
+        })
+        .await?;
     if !accel {
         telemetry.save_async().await;
         let acc = accounts.clone();
@@ -841,6 +883,13 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// How long requests under way get to finish before the process turns
+/// into the next binary (it keeps the listeners: nobody is refused).
+const HANDOVER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long requests under way get when the process stops; whoever comes
+/// meanwhile gets the "node updating" page.
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Completes when the process is asked to stop: Ctrl-C, or SIGTERM from a
 /// service manager.

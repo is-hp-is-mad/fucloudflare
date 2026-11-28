@@ -273,6 +273,27 @@ impl ZoneSnap {
         }
         self.names.get(&format!("*.{encloser}")).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// Whether `host` is one of the zone's decoy names (see
+    /// `Settings::decoy_subdomains`): below the apex, with nothing at it,
+    /// no wildcard covering it, not a Spectrum app, not delegated away.
+    pub fn is_decoy(&self, host: &str) -> bool {
+        let zone = &self.zone.name;
+        if !self.zone.settings.decoy_subdomains || host.len() <= zone.len() + 1 || !host.ends_with(zone.as_str()) || !host[..host.len() - zone.len()].ends_with('.') {
+            return false;
+        }
+        if self.nodes.contains(host) || self.spectrum_names.contains(host) || !self.records_for(host).is_empty() {
+            return false;
+        }
+        let mut n = host;
+        while n.len() > zone.len() {
+            if self.names.get(n).is_some_and(|rs| rs.iter().any(|r| r.rtype == "NS")) {
+                return false;
+            }
+            n = n.split_once('.').map(|(_, p)| p).unwrap_or("");
+        }
+        true
+    }
 }
 
 #[derive(Default)]

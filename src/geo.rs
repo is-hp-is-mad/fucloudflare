@@ -1,5 +1,6 @@
-//! Client geolocation for DNS steering (MaxMind GeoLite2 Country + ASN
-//! databases) and the health view of the edge nodes.
+//! Client geolocation for DNS steering (MaxMind GeoLite2 Country/City +
+//! ASN databases, and ip2region for the provinces of mainland China) and
+//! the health view of the edge nodes.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -24,6 +25,8 @@ pub struct Location {
 pub struct Geo {
     country: Option<maxminddb::Reader<maxminddb::Mmap>>,
     asn: Option<maxminddb::Reader<maxminddb::Mmap>>,
+    /// ip2region databases (IPv4 and/or IPv6): provinces of mainland China.
+    cn: Vec<crate::geo_cn::Xdb>,
     #[cfg(test)]
     pub fixed: HashMap<IpAddr, Location>,
 }
@@ -37,6 +40,32 @@ fn open(path: &std::path::Path) -> anyhow::Result<maxminddb::Reader<maxminddb::M
 impl Geo {
     pub fn open(country: Option<&std::path::Path>, asn: Option<&std::path::Path>) -> anyhow::Result<Self> {
         Ok(Geo { country: country.map(open).transpose()?, asn: asn.map(open).transpose()?, ..Default::default() })
+    }
+
+    /// Add the ip2region databases at `paths`; with none given, the
+    /// `ip2region_v4.xdb` / `ip2region_v6.xdb` next to the country
+    /// database, if they are there.
+    pub fn with_cn(mut self, paths: &[std::path::PathBuf], country: Option<&std::path::Path>) -> anyhow::Result<Self> {
+        let found: Vec<std::path::PathBuf> = if paths.is_empty() {
+            let dir = country.and_then(|c| c.parent()).map(std::path::Path::to_path_buf);
+            dir.into_iter()
+                .flat_map(|d| ["ip2region_v4.xdb", "ip2region_v6.xdb"].map(|f| d.join(f)))
+                .filter(|p| p.is_file())
+                .collect()
+        } else {
+            paths.to_vec()
+        };
+        for path in found {
+            let db = crate::geo_cn::Xdb::open(&path)?;
+            tracing::info!("provinces of mainland China from {} ({})", path.display(), if db.is_v6() { "IPv6" } else { "IPv4" });
+            self.cn.push(db);
+        }
+        Ok(self)
+    }
+
+    /// Whether an ip2region database is loaded.
+    pub fn has_cn_db(&self) -> bool {
+        !self.cn.is_empty()
     }
 
     /// Whether a Country/City GeoIP database is loaded.
@@ -64,6 +93,19 @@ impl Geo {
                 .first()
                 .and_then(|s| s.iso_code)
                 .map(|s| s.to_ascii_uppercase());
+        }
+        // GeoLite2 rarely knows the province of a mainland address: ip2region does
+        if matches!(loc.country.as_deref(), None | Some("CN")) {
+            let ip = ip.to_canonical();
+            let place = self.cn.iter().find_map(|db| db.lookup(ip)).and_then(crate::geo_cn::parse);
+            if let Some(place) = place {
+                if loc.country.is_none() {
+                    (loc.country, loc.continent) = (Some("CN".into()), Some("AS".into()));
+                }
+                if let Some(region) = place.region {
+                    loc.region = Some(region.to_string());
+                }
+            }
         }
         let asn = self.asn.as_ref().and_then(|r| r.lookup(ip).ok()?.decode::<maxminddb::geoip2::Asn>().ok()?);
         if let Some(a) = asn {

@@ -935,6 +935,36 @@ async fn serves_ranges_unsized_objects_and_stale_copies() {
 }
 
 #[tokio::test]
+async fn decoy_names_get_nothing_and_a_leaving_node_says_it_is_updating() {
+    let env = setup().await;
+    assert_eq!(get(&env, "nope.example.com", "/").await.status, 404, "an unknown name, decoys off");
+    env.store.update_setting(&env.zone, "decoy_subdomains", json!(true)).unwrap();
+
+    // plain HTTP: the connection is closed without a byte
+    let r = get(&env, "nope.example.com", "/").await;
+    assert!(r.status == 0 && r.head.is_empty(), "{}", r.head);
+    assert_eq!(get(&env, "www.example.com", "/").await.status, 200, "real names are served as before");
+    // HTTPS: no handshake for a decoy name
+    let handshake = |sni: &'static str| async move {
+        let tcp = TcpStream::connect(("127.0.0.1", env.tls_port)).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(tls::client_config(false).unwrap());
+        connector.connect(rustls::pki_types::ServerName::try_from(sni).unwrap(), tcp).await.is_ok()
+    };
+    assert!(!handshake("deep.nope.example.com").await);
+    assert!(handshake("www.example.com").await);
+
+    // about to go: every visitor gets the page that reloads itself
+    env.edge.leave(false, Duration::from_millis(10)).await;
+    let r = get(&env, "www.example.com", "/").await;
+    assert_eq!(r.status, 503);
+    assert_eq!(r.header("retry-after"), Some("30"));
+    assert!(r.body.contains("<meta http-equiv=\"refresh\" content=\"30\">") && r.body.contains("边缘节点正在更新"), "{}", r.body);
+    assert!(r.body.contains("This edge node is updating") && r.body.contains("class=\"hop warn\""), "{}", r.body);
+    env.edge.resume();
+    assert_eq!(get(&env, "www.example.com", "/").await.status, 200);
+}
+
+#[tokio::test]
 async fn zone_settings_shape_requests_and_responses() {
     let env = setup().await;
     let set = |name: &str, value: serde_json::Value| env.store.update_setting(&env.zone, name, value);

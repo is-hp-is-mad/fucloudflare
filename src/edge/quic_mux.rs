@@ -327,7 +327,7 @@ pub async fn bind(
     cname_base: Option<String>,
     fallback_snis: Vec<String>,
 ) -> anyhow::Result<quinn::Endpoint> {
-    let pub_sock = Arc::new(UdpSocket::bind(addr).await?);
+    let pub_sock = Arc::new(UdpSocket::from_std(crate::handoff::udp(addr)?)?);
     let (h3_tx, h3_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(LOCAL_QUEUE);
 
     let tls = super::tls::quic_server_config(store.clone())?;

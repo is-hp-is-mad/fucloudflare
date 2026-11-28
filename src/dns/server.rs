@@ -14,9 +14,9 @@ const MAX_TCP_CONNS: usize = 1024;
 /// Bind both transports; fails fast if the address is unavailable.
 pub async fn bind(addr: SocketAddr) -> anyhow::Result<(UdpSocket, TcpListener)> {
     let ctx = |e| anyhow::anyhow!("cannot bind DNS listener on {addr}: {e}");
-    let udp = UdpSocket::bind(addr).await.map_err(ctx)?;
+    let udp = UdpSocket::from_std(crate::handoff::udp(addr).map_err(ctx)?).map_err(ctx)?;
     // Use the port UDP actually got, so `:0` yields matching UDP/TCP ports.
-    let tcp = TcpListener::bind(udp.local_addr()?).await.map_err(ctx)?;
+    let tcp = crate::handoff::tcp(&udp.local_addr()?.to_string()).await.map_err(ctx)?;
     Ok((udp, tcp))
 }
 
