@@ -1024,8 +1024,12 @@ const ZONE = {
     const dns = missing.length
       ? `<div class="note bad" style="margin:14px 20px">邮件要正常收发，DNS 还缺这些记录：<dl class="kv" style="margin-top:8px">${missing.map(r => `<dt>${esc(r.type)}</dt><dd><code>${esc(r.name)}${r.priority ? " 优先级 " + r.priority : ""} → ${esc(r.content)}</code></dd>`).join("")}</dl><div style="margin-top:10px">${btn("emailDns", "添加这些记录", {}, "pri sm")}</div></div>`
       : `<div class="note" style="margin:14px 20px">MX：${e.mx.map(m => `<code>${esc(m)}</code>`).join(" ") || "—"}<br>SPF：${e.spf.map(t => `<code>${esc(t)}</code>`).join(" ") || "—"}</div>`;
+    const dkim = !e.has_dkim_private_key ? "转发出去的信用这个域名的密钥加 DKIM 签名，收件方能确认信由本域名转发、之后没被改动。私钥由你提供，保存后不再显示。"
+      : `用选择器 <code>${esc(e.dkim_selector)}</code> 的 RSA ${esc(e.dkim_key_bits || "")} 位密钥签名（relaxed/relaxed，rsa-sha256）。${e.dkim_error ? "密钥读不出来，信会不带签名转发：" + esc(e.dkim_error) : e.dkim_published ? "DNS 里已有对应的公钥记录。" : "DNS 里还缺下面这条公钥记录。"}`;
+    const dkimRecord = e.dkim_record ? `<div style="margin:0 20px 14px"><p class="hint">公钥 TXT 记录 · 名称 <code>${esc(e.dkim_record.name)}</code></p><div class="secret">${esc(e.dkim_record.content)}</div></div>` : "";
     return { sub: "这个域名的收件开关与转发规则；由开启了 SMTP 监听的节点收取并按规则转发。", body:
-      card("邮件路由", "", setRow("接收邮件", `开启后，发件服务器按 MX 记录把 ${esc(z.name)} 的邮件交给本平台节点，按下面的规则处理。`, sw("email_routing", z.settings.email_routing, "接收邮件")) + dns) +
+      card("邮件路由", "", setRow("接收邮件", `开启后，发件服务器按 MX 记录把 ${esc(z.name)} 的邮件交给本平台节点，按下面的规则处理。`, sw("email_routing", z.settings.email_routing, "接收邮件")) +
+        setRow("DKIM 签名", dkim, btn("dkimEdit", e.has_dkim_private_key ? "更换" : "设置", {}, "sm") + (e.has_dkim_private_key ? btn("dkimDel", "移除", {}, "danger sm") : "")) + dkimRecord + dns) +
       await ruleSection(z.id, "email") };
   },
   async analytics(z) {
@@ -1796,6 +1800,19 @@ const A = {
     const e = await api("GET", `/zones/${S.zone}/email`);
     for (const r of e.needed_records || []) await api("POST", `/zones/${S.zone}/dns_records`, r);
     toast("记录已添加"); render();
+  },
+  dkimEdit: async () => {
+    const e = await api("GET", `/zones/${S.zone}/email`);
+    openForm("DKIM 签名", [
+      { k: "dkim_selector", label: "选择器", hint: "字母、数字和 -，如 fucf；公钥记录放在 选择器._domainkey 下" },
+      { k: "dkim_private_key", label: e.has_dkim_private_key ? "私钥 PEM（留空保留现有私钥）" : "私钥 PEM", type: "textarea", opt: 1,
+        hint: "未加密的 RSA 私钥，PKCS#8 格式，2048 到 4096 位，如 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 的输出；保存后不再显示" }],
+      { dkim_selector: e.dkim_selector || "fucf" },
+      v => { if (!v.dkim_selector) throw new Error("请填写选择器"); return api("PATCH", `/zones/${S.zone}/email`, v); });
+  },
+  dkimDel: async () => {
+    if (!(await confirmBox("移除 DKIM 密钥？", "转发出去的信将不再带这个域名的签名；DNS 里的公钥记录需要另行删除。", "移除"))) return;
+    await api("PATCH", `/zones/${S.zone}/email`, { dkim_selector: null }); toast("已移除"); render();
   },
   nodeEdit: d => openForm(d.id ? "编辑节点" : "添加节点", [
     { k: "name", label: "名称", hint: "小写字母、数字、-" }, { k: "colo", label: "位置代号（机场三字码，如 NRT、CMH）", opt: 1, hint: "显示在报错页与 fucf-trace 的 colo；同一地点的多台机器用相同代号、不同 dc 区分（fl 以 dc 开头）" }, { k: "dc", label: "同地点机器编号（dc）", type: "number", min: 1, opt: 1 }, { k: "ipv4", label: "IPv4", opt: 1 }, { k: "ipv6", label: "IPv6", opt: 1 },

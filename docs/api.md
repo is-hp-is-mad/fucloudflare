@@ -607,7 +607,10 @@ curl -s -X POST $BASE/d1/database/$DB/query -H "Authorization: Bearer $TOKEN" -d
 
 ```
 GET    /email/status                      this node's SMTP listener, host names, relay and recent activity
-GET    /zones/{id}/email                  whether routing is on, the rules, the zone's MX and SPF, and "needed_records"
+GET    /zones/{id}/email                  whether routing is on, the rules, the zone's MX and SPF, its DKIM key, and
+                                           "needed_records"
+PATCH  /zones/{id}/email                  {"dkim_selector", "dkim_private_key"}: set, change or remove the DKIM key;
+                                           answers what GET does
 CRUD   /zones/{id}/email/rules            {"address", "action": "forward|drop|worker", "destinations": [...], "worker",
                                            "enabled", "description"}
 ```
@@ -618,6 +621,46 @@ other rule is for. A forwarding rule has 1 to 10 destinations outside the zones 
 ```json
 { "address": "hello", "action": "forward", "destinations": ["someone@example.net"] }
 ```
+
+#### DKIM
+
+Mail that a zone forwards (by a rule or by an Email Worker) is signed with the zone's DKIM key
+just before it goes out, when the zone has one: a `DKIM-Signature` with `d=` the zone, `a=rsa-sha256`,
+`c=relaxed/relaxed`, `t=` the time of signing, and `h=` the fields of From, To, Cc, Subject, Date,
+Message-ID, Reply-To, In-Reply-To, References, MIME-Version, Content-Type and
+Content-Transfer-Encoding that the message has (each instance), plus From once more, so that a
+second From cannot be added without breaking the signature. Nothing else in the message changes.
+A message without exactly one From is passed on unsigned (with a warning in the log), as is all
+mail of a zone without a key; bounces handed back to an original sender are not signed. ARC is not
+done yet.
+
+`PATCH /zones/{id}/email` reads only these two fields (others, such as the rest of what GET
+answers, are ignored, so that answer can be sent back as it is):
+
+| Field | Value |
+|---|---|
+| `dkim_selector` | a DNS name of letters, digits and hyphens in dot-separated labels, at most 63 characters (stored lowercase); `null` or `""` removes the key |
+| `dkim_private_key` | an unencrypted RSA private key of 2048 to 4096 bits as PKCS#8 PEM (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`); left out, `null` or `""` keeps the stored key. Encrypted keys, PKCS#1 (`RSA PRIVATE KEY`) and other algorithms are refused |
+
+The private key is never answered. GET (and PATCH) answer these fields alongside the routing ones:
+
+| Field | Meaning |
+|---|---|
+| `dkim_selector` | the selector, or `null` |
+| `has_dkim_private_key` | whether a key is set |
+| `dkim_record` | the TXT record to publish, `{"type": "TXT", "name": "<selector>._domainkey.<zone>", "content": "v=DKIM1; k=rsa; p=<SubjectPublicKeyInfo, base64>"}`, or `null` |
+| `dkim_key_bits` | the key's size |
+| `dkim_published` | whether the zone's DNS has a TXT record at that name with that `p=` (quoted strings are joined) |
+| `dkim_error` | why a stored key cannot be read, or `null` |
+
+While `dkim_published` is false the record is also in `needed_records`.
+
+```sh
+jq -n --arg key "$(cat dkim.pem)" '{dkim_selector: "fucf", dkim_private_key: $key}' |
+  curl -s -X PATCH $BASE/zones/$ZONE/email -H "Authorization: Bearer $TOKEN" -d @-
+```
+
+Tokens need Email Routing Rules Read to see these fields and Email Routing Rules Write to change them.
 
 ### Spectrum
 

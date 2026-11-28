@@ -186,7 +186,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
   同一节点上同一令牌只接受一次。
 - 测试：令牌的签发与校验；过期；主机名不在 `domains`；`secret` 错误；重复提交。
 
-### [ ] T10 转发邮件的 DKIM 签名
+### [x] T10 转发邮件的 DKIM 签名
 
 - 目标：经邮件路由转发出去的信带上本域名的 DKIM 签名。新文件 `src/dkim.rs`。
 - 密钥由用户提供：域名的邮件设置里加 `dkim_selector` 和 `dkim_private_key`（RSA，PKCS#8 PEM），用 `ring` 的 `RsaKeyPair` 做 rsa-sha256 签名。
@@ -278,6 +278,12 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 新文件 `src/edge/reqlog.rs`：每个节点内存里一个 5000 条的环形缓冲（锁内只做入队出队和取 Arc），序号连续，游标就是序号。比最旧还旧的游标从最旧开始并返回 `gap: true`，比最新还新的游标返回空和当前最新游标。在 `respond(` 里 `edge.stats.record(` 旁边一行接入；method、ASN、UA 加进了 `Seen`。
 - 接口 `GET /zones/{id}/logs/requests`（参数写错一律 400）；推送任务 `LogJob` 按 `Item` 存储，走 `/zones/{id}/logpush/jobs`（照 Cloudflare 的路径）。新的域名级令牌区域 `Logs`（Logs Read / Write），`Analytics Read` 看不到日志；面板里只有管理员能写推送任务。推送循环在所有节点上跑，NDJSON，10 秒超时，失败丢弃并记一条只含主机名的警告。
 - 没把握：`bytes` 是响应声明的长度（流式无长度时为 null），`duration_ms` 只算到响应头；质询不区分 js_challenge 和 managed_challenge；推送目标禁止内网（局域网收集器用不了）；多个推送任务串行发送；没有对真实 HTTPS 收集器跑过；Logs Read 能看到推送目标地址（地址里若带令牌也看得到）。
+
+### T10
+- 新增 src/dkim.rs：私钥存在 `Zone.email_dkim`，不放在 settings 里，所以 API 永远不返回私钥。通过 `PATCH /zones/{id}/email` 设置 `dkim_selector` 和 `dkim_private_key`；私钥留空就保留原来的，选择器为 null 或空就移除。
+- mail.rs 的 `hand_on` 在 send 之前给转发和 Worker 转发的信加签名（relaxed/relaxed，rsa-sha256，From 多签一次防止追加），退信不签；签名失败照常转发，只记一条不含密钥的警告。没配置的域名原样转发。
+- GET 返回 `dkim_record` 等字段，公钥 TXT 没发布时会列进 `needed_records`；面板"电子邮件"卡片可以设置、更换和移除。
+- 没把握：旧节点不认识 `email_dkim`，滚动升级期间可能被 LWW 覆盖掉。ARC 没做，私钥每封信都重新解析一次。
 
 ## 5. 部署（通过 Komari）
 

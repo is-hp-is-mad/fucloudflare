@@ -196,7 +196,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<RedirectRule>("/zones/{zone_id}/redirect_rules"))
         .merge(crud::<TransformRule>("/zones/{zone_id}/transform_rules"))
         .merge(crud::<CacheRule>("/zones/{zone_id}/cache_rules"))
-        .route("/zones/{zone_id}/email", get(email_zone))
+        .route("/zones/{zone_id}/email", get(email_zone).patch(patch_email))
         .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
         .route("/zones/{zone_id}/rulesets", get(list_rulesets).post(create_ruleset))
         .route("/zones/{zone_id}/rulesets/phases/{phase}/entrypoint", get(get_entrypoint).put(put_entrypoint))
@@ -2158,9 +2158,10 @@ async fn email_status(State(st): St) -> ApiResult {
     ok(v)
 }
 
-/// A zone's mail routing: is it on, its rules, and whether the DNS the
-/// world needs (MX at the zone, an SPF that allows the exchangers) is
-/// there; what is missing comes back ready to paste.
+/// A zone's mail routing: is it on, its rules, its DKIM key (never the
+/// private part), and whether the DNS the world needs (MX at the zone, an
+/// SPF that allows the exchangers, the DKIM key's TXT) is there; what is
+/// missing comes back ready to paste.
 async fn email_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
     let (z, records) = st.store.list_records(&zone_id)?;
     let rules = st.store.items::<EmailRule>(&zone_id)?;
@@ -2178,13 +2179,27 @@ async fn email_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
         // the exchangers are the only machines that send as this zone
         needed.push(json!({ "type": "TXT", "name": z.name, "content": "v=spf1 mx -all" }));
     }
-    ok(json!({
+    let (dkim, dkim_needed) = crate::dkim::view(&z, &records);
+    needed.extend(dkim_needed);
+    let mut v = json!({
         "enabled": z.settings.email_routing,
         "rules": rules.iter().map(Item::public).collect::<Vec<_>>(),
         "mx": mx,
         "spf": spf,
         "needed_records": needed,
-    }))
+    });
+    if let Some(o) = v.as_object_mut() {
+        o.extend(dkim);
+    }
+    ok(v)
+}
+
+/// Change a zone's e-mail settings: for now its DKIM key
+/// (`dkim_selector`, `dkim_private_key`; see crate::dkim::patch). Answers
+/// what GET does.
+async fn patch_email(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    crate::dkim::patch(&st.store, &zone_id, &body::<Value>(&bytes)?).await?;
+    email_zone(State(st), Path(zone_id)).await
 }
 
 // ------------------------------------------------- cache and security ----
@@ -4232,6 +4247,116 @@ mod tests {
         assert_eq!(sc, StatusCode::OK);
         let (sc, _) = call(&mut app, "GET", &format!("{base}/{id}"), vec![]).await;
         assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn email_settings_take_a_dkim_key_but_never_answer_it() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-dkim-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("view@example.com", Role::Viewer, Some("viewer-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let session = |email: &str, password: &str| match st.accounts.login(email, password, &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (as_admin, as_viewer) = (session("admin@example.com", "strong-pass-123"), session("view@example.com", "viewer-pass-123"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let email = format!("/client/v4/zones/{}/email", zone.id);
+        let pem = crate::dkim::test_keys::rsa_2048();
+        let secret_part = crate::dkim::test_keys::rsa_2048_b64()[300..340].to_string();
+        let leaks = |b: &[u8]| {
+            let text = String::from_utf8_lossy(b);
+            text.contains(&secret_part) || text.contains("KEY-----") || text.contains("private_key\":\"")
+        };
+
+        let (sc, b) = call(&mut app, "GET", &email, vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let v = json_of(&b)["result"].clone();
+        assert_eq!((v["dkim_selector"].clone(), v["has_dkim_private_key"].clone(), v["dkim_record"].clone()), (Value::Null, json!(false), Value::Null));
+
+        let (sc, b) = call(&mut app, "PATCH", &email, json!({ "dkim_selector": "fucf", "dkim_private_key": pem }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(!leaks(&b), "{}", String::from_utf8_lossy(&b));
+        let v = json_of(&b)["result"].clone();
+        let record = json!({ "type": "TXT", "name": "fucf._domainkey.example.com", "content": format!("v=DKIM1; k=rsa; p={}", crate::dkim::test_keys::RSA_2048_SPKI) });
+        assert_eq!((v["dkim_selector"].clone(), v["has_dkim_private_key"].clone(), v["dkim_key_bits"].clone()), (json!("fucf"), json!(true), json!(2048)));
+        assert_eq!((v["dkim_record"].clone(), v["dkim_published"].clone()), (record.clone(), json!(false)));
+        assert!(v["needed_records"].as_array().unwrap().contains(&record), "{v}");
+        assert!(v.get("rules").is_some() && v.get("enabled").is_some(), "the same answer as GET");
+        // nothing else that shows the zone shows the key
+        for path in [format!("/client/v4/zones/{}", zone.id), format!("/client/v4/zones/{}/settings", zone.id), "/client/v4/zones".to_string(), email.clone()] {
+            let (sc, b) = call(&mut app, "GET", &path, vec![]).await;
+            assert!(sc == StatusCode::OK && !leaks(&b), "{path}: {}", String::from_utf8_lossy(&b));
+        }
+
+        // the answer sent back as it is keeps the key; refused input changes nothing
+        call(&mut app, "PATCH", &email, v.to_string().into_bytes()).await;
+        let stored = || st.store.get_zone(&zone.id).unwrap().email_dkim;
+        assert_eq!(stored().map(|k| k.private_key), Some(pem.clone()));
+        for (body, status) in [
+            (json!({ "dkim_selector": "fucf", "dkim_private_key": "***" }).to_string(), StatusCode::BAD_REQUEST),
+            (json!({ "dkim_selector": "under_score" }).to_string(), StatusCode::BAD_REQUEST),
+            (json!({ "dkim_selector": "fucf", "dkim_private_key": crate::dkim::test_keys::rsa_1024() }).to_string(), StatusCode::BAD_REQUEST),
+            ("not json".to_string(), StatusCode::BAD_REQUEST),
+        ] {
+            let (sc, b) = call(&mut app, "PATCH", &email, body.clone().into_bytes()).await;
+            assert_eq!(sc, status, "{body}: {}", String::from_utf8_lossy(&b));
+            assert!(!leaks(&b));
+            assert_eq!(stored().map(|k| (k.selector, k.private_key)), Some(("fucf".to_string(), pem.clone())), "{body}");
+        }
+        let (sc, _) = call(&mut app, "PATCH", "/client/v4/zones/0123456789abcdef0123456789abcdef/email", json!({ "dkim_selector": "fucf" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // once the record is there, it is no longer asked for
+        let (sc, b) = call(&mut app, "POST", &format!("/client/v4/zones/{}/dns_records", zone.id), record.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (_, b) = call(&mut app, "GET", &email, vec![]).await;
+        let v = json_of(&b)["result"].clone();
+        assert_eq!(v["dkim_published"], json!(true));
+        assert!(!v["needed_records"].as_array().unwrap().iter().any(|r| r["name"] == record["name"]), "{v}");
+
+        // viewers read, but do not change (once past their first password)
+        let first = br#"{"current":"viewer-pass-123","new":"viewer-pass-456"}"#.to_vec();
+        let (sc, _, _) = call_raw(&mut app, "POST", "/client/v4/account/password", vec![("authorization", &as_viewer), ("content-type", "application/json")], first).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, b) = call_raw(&mut app, "GET", &email, vec![("authorization", &as_viewer)], vec![]).await;
+        assert!(sc == StatusCode::OK && !leaks(&b), "{sc}");
+        let (sc, _, _) = call_raw(&mut app, "PATCH", &email, vec![("authorization", &as_viewer), ("content-type", "application/json")], br#"{"dkim_selector":null}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        assert!(stored().is_some());
+
+        // tokens: e-mail routing read sees it, write changes it, others neither
+        let token = |group: &str| {
+            let spec = json!({ "name": group, "policies": [{ "effect": "allow",
+                "resources": { format!("com.cloudflare.api.account.zone.{}", zone.id): "*" }, "permission_groups": [{ "name": group }] }] });
+            (spec.to_string().into_bytes(), group.to_string())
+        };
+        let mut bearer = HashMap::new();
+        for group in ["Email Routing Rules Read", "Email Routing Rules Write", "DNS Write"] {
+            let (spec, name) = token(group);
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", vec![("authorization", &as_admin), ("content-type", "application/json")], spec).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            bearer.insert(name, format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap()));
+        }
+        let with = |group: &str| vec![("authorization", bearer[group].as_str()), ("content-type", "application/json")];
+        let remove = br#"{"dkim_selector":""}"#.to_vec();
+        let (sc, _, b) = call_raw(&mut app, "GET", &email, with("Email Routing Rules Read"), vec![]).await;
+        assert!(sc == StatusCode::OK && !leaks(&b));
+        let (sc, _, _) = call_raw(&mut app, "PATCH", &email, with("Email Routing Rules Read"), remove.clone()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, _, _) = call_raw(&mut app, "GET", &email, with("DNS Write"), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, _, _) = call_raw(&mut app, "PATCH", &email, with("DNS Write"), remove.clone()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        assert!(stored().is_some());
+        let (sc, _, b) = call_raw(&mut app, "PATCH", &email, with("Email Routing Rules Write"), remove).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(json_of(&b)["result"]["has_dkim_private_key"], json!(false));
+        assert!(stored().is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

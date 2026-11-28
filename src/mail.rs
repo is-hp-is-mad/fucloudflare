@@ -674,12 +674,12 @@ impl Mail {
     /// Pass a message on along its routes. The SMTP reply for the sender.
     async fn hand_on(&self, sender: &str, routes: &[(String, Route)], data: &[u8]) -> String {
         let digest = crate::release::sha256_hex(data);
-        // (envelope sender, destination domain) -> destinations, each with the address it was sent to
-        let mut batches: Vec<(String, String, Vec<String>, String)> = Vec::new();
+        // (envelope sender, destination domain, zone that signs) -> destinations, each with the address it was sent to
+        let mut batches: Vec<(String, String, Vec<String>, String, Option<String>)> = Vec::new();
         let (mut delivered, mut temporary, mut permanent) = (0, None, None);
         for (recipient, route) in routes {
-            let (from, to) = match route {
-                Route::Forward { to, zone } => (srs_forward(&self.secret, sender, zone, today()), to.clone()),
+            let (from, to, signer) = match route {
+                Route::Forward { to, zone } => (srs_forward(&self.secret, sender, zone, today()), to.clone(), Some(zone.clone())),
                 Route::Worker { script, zone } => {
                     let snap = self.store.snapshot();
                     let Some(worker) = snap.workers.get(script).cloned() else {
@@ -715,7 +715,7 @@ impl Mail {
                                 delivered += 1;
                                 continue;
                             }
-                            (srs_forward(&self.secret, sender, zone, today()), dests)
+                            (srs_forward(&self.secret, sender, zone, today()), dests, Some(zone.clone()))
                         }
                         Err(why) => {
                             self.note(sender, recipient, "deferred", &format!("{script}: {why}"));
@@ -725,7 +725,7 @@ impl Mail {
                         }
                     }
                 }
-                Route::Bounce { to } => (String::new(), vec![to.clone()]),
+                Route::Bounce { to } => (String::new(), vec![to.clone()], None),
                 Route::Drop => {
                     self.note(sender, recipient, "dropped", "");
                     continue;
@@ -735,14 +735,14 @@ impl Mail {
             for destination in to {
                 let domain = destination.rsplit_once('@').map(|(_, d)| d.to_string()).unwrap_or_default();
                 let key = if self.relay.is_some() { String::new() } else { domain };
-                match batches.iter_mut().find(|b| b.0 == from && b.1 == key) {
+                match batches.iter_mut().find(|b| b.0 == from && b.1 == key && b.4 == signer) {
                     Some(batch) if !batch.2.contains(&destination) => batch.2.push(destination),
                     Some(_) => {}
-                    None => batches.push((from.clone(), key, vec![destination], recipient.clone())),
+                    None => batches.push((from.clone(), key, vec![destination], recipient.clone(), signer.clone())),
                 }
             }
         }
-        for (from, domain, to, recipient) in batches {
+        for (from, domain, to, recipient, signer) in batches {
             let fresh: Vec<String> = {
                 let mut seen = self.delivered.lock().unwrap();
                 seen.retain(|_, at| at.elapsed() < Duration::from_secs(5 * 86400));
@@ -753,7 +753,12 @@ impl Mail {
                 continue;
             }
             let domain = if domain.is_empty() { "relay".to_string() } else { domain };
-            match self.send(&domain, &from, &fresh, data).await {
+            // signed for the zone it was sent to, just before it goes (a bounce we hand back is not ours to sign)
+            let data = match &signer {
+                Some(zone) => crate::dkim::sign_forwarded(&self.store.snapshot(), zone, data, chrono::Utc::now().timestamp().max(0) as u64),
+                None => std::borrow::Cow::Borrowed(data),
+            };
+            match self.send(&domain, &from, &fresh, &data).await {
                 Ok(()) => {
                     delivered += 1;
                     let mut seen = self.delivered.lock().unwrap();
@@ -1236,5 +1241,51 @@ mod tests {
         let said = talk(server, &["EHLO x", "MAIL FROM:<a@b.example>", "RCPT TO:<hello@example.com>", "DATA", &looping]).await;
         assert!(said[5].starts_with("554"), "{said:?}");
         assert_eq!(mail.status()["hosts"][0], "mx.cdn.example");
+    }
+
+    #[tokio::test]
+    async fn forwarded_mail_is_signed_for_its_zone_and_bounces_are_not() {
+        let (store, zone) = routed();
+        let (mx, taken) = exchanger().await;
+        let mut mail = Mail::new(store.clone(), SECRET, vec!["mx.cdn.example".into()], None).unwrap();
+        mail.exchanger = Some(mx);
+        let mail = Arc::new(mail);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        tokio::spawn(mail.clone().serve(listener));
+        let message = "From: Alice <alice@sender.example>\r\nTo: hello@example.com\r\nSubject: hi\r\nMessage-ID: <1@sender.example>\r\n\r\nhello\r\n.";
+        let send = |message: &str| {
+            let message = message.to_string();
+            async move { talk(server, &["EHLO sender.example", "MAIL FROM:<alice@sender.example>", "RCPT TO:<hello@example.com>", "DATA", &message, "QUIT"]).await }
+        };
+
+        // no key: as it came, after our Received
+        assert_eq!(send(message).await[5], "250 2.0.0 passed on");
+        let (_, _, unsigned) = taken.lock().unwrap().pop().unwrap();
+        assert!(unsigned.starts_with("Received: ") && unsigned.ends_with("Subject: hi\r\nMessage-ID: <1@sender.example>\r\n\r\nhello\r\n"), "{unsigned}");
+
+        // with a key: a DKIM-Signature of the zone in front, which verifies
+        let body = json!({ "dkim_selector": "fucf", "dkim_private_key": crate::dkim::test_keys::rsa_2048() });
+        crate::dkim::patch(&store, &zone, &body).await.unwrap();
+        // (another message: the same one again would count as handed on already)
+        let message = message.replace("<1@", "<2@");
+        assert_eq!(send(&message).await[5], "250 2.0.0 passed on");
+        let (from, to, signed) = taken.lock().unwrap().pop().unwrap();
+        assert!(from.starts_with("srs0=") && to == ["Owner@mailbox.example"], "{from} {to:?}");
+        assert!(signed.starts_with("DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=fucf;"), "{signed}");
+        crate::dkim::verify(signed.as_bytes(), &crate::dkim::test_keys::rsa_2048_public()).unwrap();
+        let received = signed.find("Received: ").unwrap();
+        assert!(signed[received..].ends_with("Subject: hi\r\nMessage-ID: <2@sender.example>\r\n\r\nhello\r\n"), "{signed}");
+
+        // what cannot be signed (no From) still goes, unsigned
+        assert_eq!(send("Subject: no sender\r\n\r\nhello\r\n.").await[5], "250 2.0.0 passed on");
+        let (_, _, unsigned) = taken.lock().unwrap().pop().unwrap();
+        assert!(unsigned.starts_with("Received: ") && !unsigned.contains("DKIM-Signature"), "{unsigned}");
+
+        // a bounce handed back to the original sender is not signed by the zone
+        let said = talk(server, &["EHLO mailbox.example", "MAIL FROM:<>", &format!("RCPT TO:<{from}>"), "DATA", "From: mailer-daemon@mailbox.example\r\nSubject: could not deliver\r\n\r\n.\r\n."]).await;
+        assert_eq!(said[5], "250 2.0.0 passed on", "{said:?}");
+        let (_, to, bounce) = taken.lock().unwrap().pop().unwrap();
+        assert!(to == ["alice@sender.example"] && !bounce.contains("DKIM-Signature"), "{bounce}");
     }
 }

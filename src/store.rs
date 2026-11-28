@@ -42,6 +42,10 @@ pub struct Zone {
     pub settings: Settings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dnssec: Option<crate::dns::dnssec::DnssecConfig>,
+    /// The key forwarded mail of this zone is signed with (crate::dkim);
+    /// kept here rather than in `settings`, which the API shows as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_dkim: Option<crate::dkim::DkimKey>,
     pub created_on: String,
     pub modified_on: String,
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
@@ -1642,6 +1646,25 @@ impl Store {
             .await
     }
 
+    /// Set or remove a zone's DKIM key (crate::dkim::patch). `update` gets
+    /// the zone as it is inside the write, so that a key it keeps from
+    /// before is the one stored at that moment, not one read earlier.
+    pub async fn set_email_dkim_async<F>(&self, zone_id: &str, update: F) -> Result<Zone, StoreError>
+    where
+        F: FnOnce(&Zone) -> Result<Option<crate::dkim::DkimKey>, StoreError> + Send + 'static,
+    {
+        let zone_id = zone_id.to_string();
+        self.mutate_async(move |d, clock, sync_node| {
+            let pos = d.zones.iter().position(|z| z.id == zone_id).ok_or(StoreError::ZoneNotFound)?;
+            let key = update(&d.zones[pos])?;
+            let sync = stamp_next(d, clock, sync_node, false);
+            let z = &mut d.zones[pos];
+            (z.email_dkim, z.modified_on, z.sync) = (key, now(), sync);
+            Ok(z.clone())
+        })
+        .await
+    }
+
     #[allow(dead_code)]
     pub fn set_zone_kind(&self, id: &str, kind: &str) -> Result<Zone, StoreError> {
         let (id_owned, kind_owned) = (id.to_string(), kind.to_string());
@@ -2176,6 +2199,7 @@ fn apply_create_zone(
         kind: kind.to_string(),
         settings: Settings::default(),
         dnssec: None,
+        email_dkim: None,
         created_on: ts.clone(),
         modified_on: ts,
         sync,

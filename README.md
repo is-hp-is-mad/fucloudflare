@@ -11,7 +11,7 @@
 | 节点限流 | 每个节点可设周期流量配额（摘除 DNS / 开始限速 / 硬限流三档）和限速；超限节点自动退出 DNS 应答，硬限流后只返回提示页 |
 | 证书 | 内置 ACME 客户端：向 Let's Encrypt 等 CA 自动签发并续期证书（DNS-01 / TLS-ALPN-01 / HTTP-01），也可上传自有证书 |
 | 规则 | 重定向规则、请求/响应改写规则、缓存规则 |
-| 电子邮件 | SMTP 收信与转发路由（不落盘）：按地址 / `+tag` / `*` 兜底转发或丢弃，SRS 发件人改写与退信回溯，支持外发中继（submission 587/465） |
+| 电子邮件 | SMTP 收信与转发路由（不落盘）：按地址 / `+tag` / `*` 兜底转发或丢弃，SRS 发件人改写与退信回溯，转发的信加本域名的 DKIM 签名，支持外发中继（submission 587/465） |
 | 分析 | 全机群的时间序列（分钟级 1 天、小时级 30 天）：请求数、流量、状态码、缓存命中、拦截数、协议版本，按节点、国家、主机名、路径拆分；重启不丢 |
 | WAF | 自定义规则、限速、托管规则集、人机验证（`js_challenge` / `managed_challenge`）、按 IP 威胁分的安全级别与 Under Attack 模式、自动防火墙、安全事件日志（全机群汇总）、规则共用的 IP 列表（`ip.src in $名字`） |
 | 回源规则 | 按表达式改写回源地址 / 端口 / 协议 / Host 头 / SNI |
@@ -85,7 +85,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/redirect_rules[/{id}]        CRUD             {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
 /zones/{id}/transform_rules[/{id}]       CRUD             {"expression", "rewrite_path", "set_request_headers", "remove_request_headers", "set_response_headers", "remove_response_headers"}
 /zones/{id}/cache_rules[/{id}]           CRUD             {"expression", "cache": true|false, "edge_ttl", "priority"}
-/zones/{id}/email                        GET              区域邮件路由开关、规则、当前 MX/SPF 及缺失的建议 DNS 记录
+/zones/{id}/email                        GET PATCH        区域邮件路由开关、规则、当前 MX/SPF/DKIM 及缺失的建议 DNS 记录；PATCH {"dkim_selector", "dkim_private_key"}
 /zones/{id}/email/rules[/{id}]           CRUD             {"address", "action": "forward|drop", "destinations": [...], "enabled", "description"}
 /zones/{id}/analytics                    GET              ?since=-1440（分钟）| 90m | 24h | 7d（默认 24h，最长 30d），?step= 分钟
 /zones/{id}/logs/requests                GET              应答节点上这个区域最近的请求：?since=游标 &limit= &status=404|5xx &host= &path=前缀 &ip=，见“请求日志”
@@ -308,7 +308,8 @@ export default {
 
 - **规则匹配**：支持本地名（如 `postmaster`，等价于 `postmaster@域名`）、完整地址（含子域）、`name+tag@` 自动归并到 `name@`（若有带 tag 的专属规则则优先）、以及 `*` 兜底规则。动作支持 `forward`（1–10 个外部邮箱，禁止转发回本域或本平台其他开启邮件路由的域）和 `drop`（收下后静默丢弃）。
 - **SRS 发件人改写**：转发时用机群共享的 API 令牌对信封发件人做 HMAC-SHA256 签名，改写为 `srs0=<hash>=<stamp>=<原域>=<原本地名>@<本域>`（约 21 天有效），保证目标邮箱的 SPF 校验通过；退信（仅限空信封发件人 `MAIL FROM:<>`）落到任意节点都能验签还原并回投给原始发件人。
-- **DNS 记录与迁移**：面板的"电子邮件"页和 `GET /zones/{id}/email` 会检查该域名的 `MX` 与 `SPF` 记录，列出缺失项并支持一键添加；建议同时配置 `DMARC`（`v=DMARC1; p=quarantine; ...`）并在使用外部中继发信时配置对应中继商的 `SPF` / `DKIM`。邮件相关的 `MX` / `TXT` 记录都是普通的 `dns_records`，`email_rules` 存放在配置 `state.json` 中随副本同步自动复制，域名迁移或导入导出时会一并带走。
+- **DKIM 签名**：在"电子邮件"页（或 `PATCH /zones/{id}/email`）填上选择器（`dkim_selector`，如 `fucf`）和私钥（`dkim_private_key`，未加密的 RSA 私钥，PKCS#8 PEM，2048 到 4096 位，可用 `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048` 生成）后，转发出去的信在交给目标之前加上本域名的 `DKIM-Signature`（`d=` 本域名，rsa-sha256，relaxed/relaxed，签 From、To、Cc、Subject、Date、Message-ID 等存在的头，From 多签一次防止被追加第二个 From）。面板和接口给出要添加的 TXT 记录：名称 `<选择器>._domainkey.<域名>`，内容 `v=DKIM1; k=rsa; p=<公钥>`，没有时会列进缺失记录里一键添加。私钥保存后不再显示，接口只回答 `has_dkim_private_key`；PATCH 里不带私钥（或为空）就保留原来的，`dkim_selector` 为 `null` 或空字符串则移除。没配置时信原样转发；没有 From 或有多个 From、签不了名的信照样转发，只是不带签名（记一条警告）。退回给原发件人的退信不签。ARC 封装还没有做。
+- **DNS 记录与迁移**：面板的"电子邮件"页和 `GET /zones/{id}/email` 会检查该域名的 `MX`、`SPF` 与 DKIM 公钥记录，列出缺失项并支持一键添加；建议同时配置 `DMARC`（`v=DMARC1; p=quarantine; ...`）并在使用外部中继发信时配置对应中继商的 `SPF` / `DKIM`。邮件相关的 `MX` / `TXT` 记录都是普通的 `dns_records`，`email_rules` 存放在配置 `state.json` 中随副本同步自动复制，域名迁移或导入导出时会一并带走。
 - **网络要求（云主机 25 端口）**：许多云厂商（包括 AWS EC2）默认封堵**出方向 TCP 25**，无法直连 Gmail / QQ 等目标的 MX:25。生产环境请配置 `--mail-relay` 走中继服务的 submission 端口（`587` STARTTLS 或 `465` 隐式 TLS，均强制校验证书）；若要接收公网邮件，需在收信节点开启 `--smtp-listen 0.0.0.0:25` 并确认防火墙 / 安全组放行入方向 TCP 25。
 
 ## 面板账户、两步验证与通行密钥

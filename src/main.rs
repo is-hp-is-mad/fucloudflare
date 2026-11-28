@@ -3,6 +3,7 @@ mod alerts;
 mod api;
 mod auth;
 mod backup;
+mod dkim;
 mod dns;
 mod edge;
 mod expr;

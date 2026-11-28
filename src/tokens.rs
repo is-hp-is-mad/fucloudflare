@@ -126,7 +126,7 @@ groups! {
     "2e3b2afa3158466bb0afd23d3d35592b" "Workers Routes Read" WorkersRoutes false "Read Workers routes";
     "28f4b596e7d643029c524985477ae49a" "Workers Routes Write" WorkersRoutes true "Change Workers routes";
     "5272e56105d04b5897466995b9bd4643" "Email Routing Rules Read" EmailRouting false "Read e-mail routing";
-    "79b3ec0d10ce4148a8f8bdc0cc5f97f2" "Email Routing Rules Write" EmailRouting true "Change e-mail routing rules";
+    "79b3ec0d10ce4148a8f8bdc0cc5f97f2" "Email Routing Rules Write" EmailRouting true "Change e-mail routing rules and the DKIM key";
     "3f4c3d0b2a6947a3b0c5d1e2f3a4b5c6" "Zone Spectrum Read" Spectrum false "Read Spectrum applications";
     "4a5d4e1c3b7a48b4c1d6e2f3a4b5c6d7" "Zone Spectrum Write" Spectrum true "Change Spectrum applications";
     "9c88f9c5bce24ce7af9a958ba9c504db" "Analytics Read" Analytics false "Read zone analytics";
