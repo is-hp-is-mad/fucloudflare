@@ -379,15 +379,15 @@ async fn rate_limits_and_challenges() {
     assert_eq!(get(&env, "example.com", "/other").await.status, 200, "only matching requests are limited");
     assert_eq!(env.hits.load(Ordering::SeqCst), 4);
 
-    // JS challenge: a page that sets a clearance cookie, which then lets the client in
+    // JS challenge: the page no longer hands out the clearance itself (the human check grants it,
+    // see the_human_check_lets_a_person_through_and_keeps_automation_out)
     env.store
         .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "http.request.uri.path eq \"/shop\"", "action": "js_challenge" }), true)
         .unwrap();
     let page = get(&env, "example.com", "/shop").await;
     assert!(page.status == 403 && page.body.contains("Checking your browser"));
-    let token = page.body.split("fucf_clearance=").nth(1).unwrap().split(';').next().unwrap().to_string();
-    let passed = send(&env, "GET", "example.com", "/shop", &format!("Cookie: fucf_clearance={token}\r\n"), "").await;
-    assert_eq!(passed.status, 200);
+    assert_eq!(page.header("cf-mitigated"), Some("challenge"));
+    assert!(!page.body.contains("fucf_clearance="), "the clearance is never in the page");
     let forged = send(&env, "GET", "example.com", "/shop", "Cookie: fucf_clearance=9999999999.abcd\r\n", "").await;
     assert_eq!(forged.status, 403);
 }
