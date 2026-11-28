@@ -328,6 +328,20 @@ struct WafHit;
 #[derive(Clone)]
 struct OffersHttp3(String);
 
+/// May an `accelerate` node serve `host`? It serves the hosts on its
+/// allowlist (`accel_hosts`) and its own sites: proxy rules scoped to this
+/// node by name. Rules for every node do not count -- the allowlist is what
+/// keeps the fleet's sites off an accelerate node.
+fn accelerate_allows(edge: &Edge, snap: &crate::store::Snapshot, host: &str, path: &str, listener: Option<&proxy::ListenerInfo>) -> bool {
+    let me = crate::fleet::self_name(&edge.store, &edge.edge_ips, edge.node_name.get().map(String::as_str));
+    if snap.nodes.iter().find(|n| n.name == me).is_some_and(|n| crate::items::accel_host_matches(&n.accel_hosts, host)) {
+        return true;
+    }
+    proxy::match_rule(&snap.local_proxy_rules, Some(&me), listener, host, path)
+        .or_else(|| proxy::match_fallback(&snap.local_proxy_rules, Some(&me), listener, host, path))
+        .is_some_and(|rule| rule.nodes.iter().any(|n| n.eq_ignore_ascii_case(&me)))
+}
+
 /// What the pipeline learned about a request before it finished or failed:
 /// enough for analytics and for the edge's own response headers.
 struct Seen {
@@ -776,17 +790,10 @@ pub(crate) async fn open_upstream_websocket(
     if hops >= 4 {
         return Err(EdgeError::new(508, "Loop detected", "maximum internal forwarding hops exceeded"));
     }
-    if edge.accelerate.load(Ordering::Relaxed) {
-        let snap = edge.store.snapshot();
-        let me = crate::fleet::self_name(&edge.store, &edge.edge_ips, edge.node_name.get().map(String::as_str));
-        let allowed = snap
-            .nodes
-            .iter()
-            .find(|n| n.name == me)
-            .is_some_and(|n| crate::items::accel_host_matches(&n.accel_hosts, &host));
-        if !allowed {
-            return Err(EdgeError::new(403, "Forbidden", "host is not in this accelerate node's allowlist"));
-        }
+    if edge.accelerate.load(Ordering::Relaxed)
+        && !accelerate_allows(edge, &edge.store.snapshot(), &host, req_parts.uri.path(), req_parts.extensions.get::<proxy::ListenerInfo>())
+    {
+        return Err(EdgeError::new(403, "Forbidden", "host is not in this accelerate node's allowlist"));
     }
 
     let snap = edge.store.snapshot();
@@ -1407,17 +1414,10 @@ impl Edge {
             return Err(EdgeError::new(508, "Loop detected", "maximum internal forwarding hops exceeded"));
         }
 
-        if self.accelerate.load(Ordering::Relaxed) {
-            let snap = self.store.snapshot();
-            let me = crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.get().map(String::as_str));
-            let allowed = snap
-                .nodes
-                .iter()
-                .find(|n| n.name == me)
-                .is_some_and(|n| crate::items::accel_host_matches(&n.accel_hosts, &host));
-            if !allowed {
-                return Err(EdgeError::new(403, "Forbidden", "host is not in this accelerate node's allowlist"));
-            }
+        if self.accelerate.load(Ordering::Relaxed)
+            && !accelerate_allows(&self, &self.store.snapshot(), &host, req.uri().path(), req.extensions().get::<proxy::ListenerInfo>())
+        {
+            return Err(EdgeError::new(403, "Forbidden", "host is not in this accelerate node's allowlist"));
         }
 
         // HTTP/2 WebSocket Extended CONNECT (RFC 8441)

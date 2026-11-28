@@ -1707,6 +1707,20 @@ async fn accel_hosts_forced_ip_returns_403() {
 
     let blocked = get(&env, "example.com", "/secret").await;
     assert_eq!(blocked.status, 403);
+
+    // the node's own sites (proxy rules scoped to it by name) need no allowlist entry ...
+    env.store.save_proxy_rule(None, json!({
+        "name": "own-site", "nodes": ["acc1"], "hosts": ["own.example.net"],
+        "respond": { "status": 200, "body": "own" }
+    })).unwrap();
+    let own = get(&env, "own.example.net", "/").await;
+    assert_eq!((own.status, own.body.as_str()), (200, "own"));
+    // ... the fleet's rules do
+    env.store.save_proxy_rule(None, json!({
+        "name": "fleet-site", "hosts": ["fleet.example.net"],
+        "respond": { "status": 200, "body": "fleet" }
+    })).unwrap();
+    assert_eq!(get(&env, "fleet.example.net", "/").await.status, 403);
 }
 
 #[tokio::test]
