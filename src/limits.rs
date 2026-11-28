@@ -260,7 +260,10 @@ impl Limits {
 
     /// This node's name and state.
     pub fn own(&self) -> (String, State) {
-        (self.config.read().unwrap().name.clone(), self.state())
+        // Never hold the guard while state() reads the lock again: std's RwLock
+        // lets a queued writer (configure) go first, so a nested read deadlocks.
+        let name = self.config.read().unwrap().name.clone();
+        (name, self.state())
     }
 
     /// Probability (0-100) that DNS queries should offload away from this node.
@@ -287,7 +290,8 @@ impl Limits {
 
     /// This node's name and DNS offload probability (0-100).
     pub fn own_offload(&self) -> (String, u8) {
-        (self.config.read().unwrap().name.clone(), self.offload_pct())
+        let name = self.config.read().unwrap().name.clone();
+        (name, self.offload_pct())
     }
 
     /// Should this node stay silent on public DNS (port 53)?
