@@ -414,18 +414,23 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
 /// signed in to the panel.
 async fn auth(State(st): St, mut req: Request, next: Next) -> Response {
     let from = client(req.headers());
-    let text = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
-    let presented = text(header::AUTHORIZATION.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
-    let who = match presented {
-        Some(t) if ct_eq(t.as_bytes(), st.token.as_bytes()) => Ok(Some(Principal::system())),
-        Some(t) if t.starts_with("fucf_s_") => Ok(st.accounts.session(t)),
-        // a user's API token, Cloudflare style
-        Some(t) => st.accounts.token(t, from.ip.parse().ok()).transpose(),
-        // or the Global API Key
-        None => match (text("x-auth-email"), text("x-auth-key")) {
-            (Some(email), Some(key)) => Ok(st.accounts.api_key(email, key)),
-            _ => Ok(None),
-        },
+    // (in a block: nothing borrowed from the request may live across the await below)
+    let who = {
+        let headers = req.headers();
+        let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+        let presented = text(header::AUTHORIZATION.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
+        let who = match presented {
+            Some(t) if ct_eq(t.as_bytes(), st.token.as_bytes()) => Ok(Some(Principal::system())),
+            Some(t) if t.starts_with("fucf_s_") => Ok(st.accounts.session(t)),
+            // a user's API token, Cloudflare style
+            Some(t) => st.accounts.token(t, from.ip.parse().ok()).transpose(),
+            // or the Global API Key
+            None => match (text("x-auth-email"), text("x-auth-key")) {
+                (Some(email), Some(key)) => Ok(st.accounts.api_key(email, key)),
+                _ => Ok(None),
+            },
+        };
+        who
     };
     let who = match who {
         Ok(Some(who)) => who,

@@ -1219,8 +1219,9 @@ const codesHtml = codes => `<p>下面 10 个备用验证码<b>只显示这一次
   <div class="codes">${codes.map(c => `<span>${esc(c)}</span>`).join("")}</div><button type="button" data-copy="${esc(codes.join("\n"))}">复制全部</button>`;
 async function viewAccount() {
   if (me.api_token) return { title: "账户与安全", sub: "当前是用 API 令牌登录的。", body: `<div class="note warn">API 令牌不是账户：没有密码、两步验证和通行密钥。${me.initialized ? "要管理自己的账户，请退出后用邮箱登录。" : "面板还没有账户，退出后可以初始化第一个管理员。"}</div>` };
-  const a = C.me = await api("GET", "/account");
-  const keys = a.passkey_list, ses = a.sessions;
+  const [a, toks, groups, accts] = await Promise.all([api("GET", "/account"), api("GET", "/user/tokens?per_page=100").catch(() => []), api("GET", "/user/tokens/permission_groups?per_page=200").catch(() => []), api("GET", "/accounts").catch(() => [])]);
+  C.me = a; C.tokens = toks; C.groups = groups;
+  const keys = a.passkey_list, ses = a.sessions, acct = (accts[0] || {}).id || "";
   return { title: "账户与安全", sub: `${esc(a.email)} · ${ROLE[a.role]}`, body:
     `<div class="grid2">` +
     card("密码", btn("pwChange", "修改密码", {}, ""), `<dl class="kv pad"><dt>上次登录</dt><dd>${when(a.last_login_on)}</dd><dt>账户创建</dt><dd>${when(a.created_on)}</dd></dl>
@@ -1235,10 +1236,37 @@ async function viewAccount() {
     card(`登录会话 <span class="cnt">${ses.length}</span>`, "", table([
       { label: "设备", fmt: s => `<span title="${esc(s.agent)}">${esc(agentName(s.agent))}</span>${s.current ? ' <span class="tag ok">当前</span>' : ""}` }, { label: "IP", fmt: s => `<span class="mono">${esc(s.ip)}</span>` },
       { label: "登录方式", fmt: s => METHOD[s.method] || esc(s.method) }, { label: "登录时间", fmt: s => when(s.created_on) }, { label: "最近活动", fmt: s => when(s.last_seen_on) },
-    ], ses, s => (s.current ? "" : lk("sesDel", "下线", { id: s.id }, "bad")), "")) };
+    ], ses, s => (s.current ? "" : lk("sesDel", "下线", { id: s.id }, "bad")), "")) +
+    card(`API 令牌 <span class="cnt">${toks.length}</span>`, btn("tokAdd", "创建令牌", {}, "pri"), `<p class="hint pad">和 Cloudflare 的 API 令牌一样用：<span class="mono">Authorization: Bearer &lt;令牌&gt;</span>，接口地址 <span class="mono">${esc(location.origin)}/client/v4</span>，账户 ID <span class="mono">${esc(acct)}</span>。令牌能做的不会超过你自己的角色。</p>` + table([
+      { label: "名称", fmt: t => `<b>${esc(t.name)}</b>` },
+      { label: "权限", fmt: t => t.policies.map(p => `${p.effect === "deny" ? '<span class="tag bad">拒绝</span> ' : ""}${p.permission_groups.map(g => esc(GROUP_CN[g.name] || g.name)).join("、")}`).join("<br>") },
+      { label: "范围", fmt: t => t.policies.map(p => esc(tokScope(p.resources))).join("<br>") },
+      { label: "限制", fmt: t => [t.condition && t.condition["request.ip"] ? "IP：" + esc([...(t.condition["request.ip"].in || []), ...(t.condition["request.ip"].not_in || []).map(n => "非 " + n)].join(", ")) : "", t.expires_on ? "到期：" + when(t.expires_on) : "", t.not_before ? "生效：" + when(t.not_before) : ""].filter(Boolean).join("<br>") || '<span class="hint">—</span>' },
+      { label: "状态", fmt: t => (t.status === "active" ? (t.expires_on && new Date(t.expires_on) < new Date() ? '<span class="st bad">已过期</span>' : '<span class="st ok">有效</span>') : '<span class="st">已停用</span>') },
+      { label: "上次使用", fmt: t => (t.last_used_on ? when(t.last_used_on) : '<span class="hint">还没用过</span>') },
+    ], toks, t => lk("tokRoll", "轮换", { id: t.id }) + lk("tokToggle", t.status === "active" ? "停用" : "启用", { id: t.id }) + lk("tokDel", "删除", { id: t.id, name: t.name }, "bad"), "<b>还没有 API 令牌</b>给 certbot、acme.sh、Terraform、DDNS 脚本之类的工具用，可以只给某个域名的 DNS 权限。")) +
+    card("Global API Key", (a.api_key ? btn("apiKeyRoll", "重新生成", {}, "") + btn("apiKeyDel", "删除", {}, "danger") : btn("apiKeyRoll", "生成", {}, "")), `<dl class="kv pad"><dt>状态</dt><dd>${a.api_key ? '<span class="st ok">已生成</span>' : '<span class="st">未生成</span>'}</dd></dl>
+      <p class="hint pad">老工具用的认证方式：请求头 <span class="mono">X-Auth-Email: ${esc(a.email)}</span> 加 <span class="mono">X-Auth-Key</span>。它有你账户的全部权限（改密码、两步验证除外），能用 API 令牌就别用它。</p>`) };
 }
+const GROUP_CN = { "Zone Read": "域名：读", "Zone Write": "域名：增删改", "Zone Settings Read": "域名设置：读", "Zone Settings Write": "域名设置：改", "DNS Read": "DNS：读", "DNS Write": "DNS：改", "Cache Purge": "清除缓存",
+  "Firewall Services Read": "防火墙：读", "Firewall Services Write": "防火墙：改", "SSL and Certificates Read": "证书：读", "SSL and Certificates Write": "证书：改", "Origin Rules Read": "回源规则：读", "Origin Rules Write": "回源规则：改",
+  "Dynamic Redirect Read": "重定向：读", "Dynamic Redirect Write": "重定向：改", "Transform Rules Read": "转换规则：读", "Transform Rules Write": "转换规则：改", "Cache Rules Read": "缓存规则：读", "Cache Rules Write": "缓存规则：改",
+  "Workers Routes Read": "Workers 路由：读", "Workers Routes Write": "Workers 路由：改", "Email Routing Rules Read": "邮件路由：读", "Email Routing Rules Write": "邮件路由：改", "Zone Spectrum Read": "Spectrum：读", "Zone Spectrum Write": "Spectrum：改",
+  "Analytics Read": "域名分析：读", "Workers Scripts Read": "Workers 脚本：读", "Workers Scripts Write": "Workers 脚本：改", "Workers KV Storage Read": "KV：读", "Workers KV Storage Write": "KV：改", "D1 Read": "D1：读", "D1 Write": "D1：改",
+  "Fleet Read": "节点与调度：读", "Fleet Write": "节点与调度：改", "Account Analytics Read": "账户分析：读", "Audit Logs Read": "审计记录：读", "API Tokens Read": "API 令牌：读", "API Tokens Write": "API 令牌：改" };
+const tokScope = r => Object.entries(r || {}).map(([k, v]) => {
+  if (k === "com.cloudflare.api.account.zone.*") return "全部域名";
+  if (k.startsWith("com.cloudflare.api.account.zone.")) { const id = k.slice(32), z = (C.zones || []).find(z => z.id === id); return "域名 " + (z ? z.name : id.slice(0, 8)); }
+  if (k.startsWith("com.cloudflare.api.user.")) return "自己的令牌";
+  if (k.startsWith("com.cloudflare.api.account.")) return typeof v === "object" ? "账户下全部域名" : "账户";
+  return k;
+}).join("、");
+const tokenBox = (title, value) => showBox(title, `<p>令牌<b>只显示这一次</b>，请马上存好：</p><div class="secret">${esc(value)}</div><button type="button" data-copy="${esc(value)}">复制</button>
+  <p class="hint">试一下：<span class="mono">curl -H "Authorization: Bearer ${esc(value)}" ${esc(location.origin)}/client/v4/user/tokens/verify</span></p>`, "我已保存");
+const tokSpec = t => ({ name: t.name, status: t.status, policies: t.policies, condition: t.condition, not_before: t.not_before, expires_on: t.expires_on });
 const AUDIT = { "user.create": "创建用户", "user.update": "修改用户", "user.delete": "删除用户", login: "登录", "login.failed": "登录失败", "password.change": "修改密码", "two_factor.enable": "开启两步验证", "two_factor.disable": "关闭两步验证",
-  "backup_codes.regenerate": "重新生成备用验证码", "passkey.add": "添加通行密钥", "passkey.remove": "删除通行密钥", "node.action": "节点操作" };
+  "backup_codes.regenerate": "重新生成备用验证码", "passkey.add": "添加通行密钥", "passkey.remove": "删除通行密钥", "node.action": "节点操作",
+  "token.create": "创建 API 令牌", "token.update": "修改 API 令牌", "token.roll": "轮换 API 令牌", "token.delete": "删除 API 令牌", "api_key.roll": "生成 Global API Key", "api_key.remove": "删除 Global API Key" };
 async function viewUsers() {
   const [users, audit] = await Promise.all([api("GET", "/users"), api("GET", "/audit")]);
   C.users = users;
@@ -1698,6 +1726,56 @@ const A = {
   }),
   pkDel: d => del("/account/passkeys/" + d.id, "通行密钥“" + d.name + "”"),
   sesDel: async d => { await api("DELETE", "/account/sessions/" + d.id); toast("已下线"); render(); },
+  tokAdd: async () => {
+    const zones = C.zones = await api("GET", "/zones?per_page=500").catch(() => C.zones || []);
+    const groups = C.groups || [];
+    const scopeOf = g => (g.scopes || [""])[0];
+    openForm("创建 API 令牌", [
+      { k: "name", label: "名称", def: "我的令牌" },
+      { k: "groups", label: "权限", type: "multi", options: groups.map(g => [g.id, (GROUP_CN[g.name] || g.name) + "（" + g.name + "）"]), def: groups.filter(g => ["Zone Read", "DNS Write"].includes(g.name)).map(g => g.id),
+        hint: "写权限包含读。和 Cloudflare 的同名权限组对应，工具按名字找也能找到。" },
+      { k: "zones", label: "域名范围", type: "multi", options: zones.map(z => [z.id, z.name]), hint: "不选 = 全部域名（以后新加的也算）。只对域名类的权限有效。" },
+      { k: "ips", label: "只允许这些 IP 使用", type: "list", opt: true, hint: "IP 或 CIDR，用逗号分开；留空不限制" },
+      { k: "expires", label: "到期时间", opt: true, hint: "例如 2027-01-01；留空长期有效" },
+      { k: "policies", label: "高级：直接写 policies（JSON，Cloudflare 格式；填了就以它为准）", type: "json", defJson: [] },
+    ], {}, async v => {
+      let policies = Array.isArray(v.policies) && v.policies.length ? v.policies : null;
+      if (!policies) {
+        const pick = scope => groups.filter(g => v.groups.includes(g.id) && scopeOf(g) === scope).map(g => ({ id: g.id }));
+        const zoneRes = v.zones.length ? Object.fromEntries(v.zones.map(id => ["com.cloudflare.api.account.zone." + id, "*"])) : { "com.cloudflare.api.account.zone.*": "*" };
+        policies = [
+          [pick("com.cloudflare.api.account.zone"), zoneRes],
+          [pick("com.cloudflare.api.account"), { ["com.cloudflare.api.account." + ((await api("GET", "/accounts"))[0] || {}).id]: "*" }],
+          [pick("com.cloudflare.api.user"), { ["com.cloudflare.api.user." + me.id]: "*" }],
+        ].filter(([g]) => g.length).map(([permission_groups, resources]) => ({ effect: "allow", resources, permission_groups }));
+        if (!policies.length) throw new Error("至少选一个权限");
+      }
+      let expires_on = null;
+      if (v.expires) { const d = new Date(v.expires); if (isNaN(d)) throw new Error("到期时间看不懂，写成 2027-01-01 这样"); expires_on = d.toISOString(); }
+      const condition = v.ips.length ? { "request.ip": { in: v.ips } } : {};
+      const r = await api("POST", "/user/tokens", { name: v.name, policies, condition, expires_on });
+      setTimeout(() => tokenBox("令牌已创建", r.value), 50);
+    }, true);
+  },
+  tokRoll: async d => {
+    if (!(await confirmBox("轮换这个令牌？", "会生成新的令牌值，旧的立即失效。", "轮换", false))) return;
+    const value = await api("PUT", "/user/tokens/" + d.id + "/value", {});
+    await tokenBox("令牌已轮换", value); render();
+  },
+  tokToggle: async d => {
+    const t = byId("tokens", d.id);
+    await api("PUT", "/user/tokens/" + d.id, { ...tokSpec(t), status: t.status === "active" ? "disabled" : "active" });
+    toast(t.status === "active" ? "已停用" : "已启用"); render();
+  },
+  tokDel: d => del("/user/tokens/" + d.id, "令牌“" + d.name + "”"),
+  apiKeyRoll: () => openForm(C.me.api_key ? "重新生成 Global API Key" : "生成 Global API Key", [{ k: "password", label: "当前密码", type: "password" }], {}, async v => {
+    let r;
+    try { r = await api("POST", "/account/api_key", { password: v.password }); } catch (e) { throw new Error(PW_TEXT(e.message)); }
+    setTimeout(() => showBox("Global API Key", `<p>只显示这一次${C.me.api_key ? "，旧的已经失效" : ""}：</p><div class="secret">${esc(r.api_key)}</div><button type="button" data-copy="${esc(r.api_key)}">复制</button>`, "我已保存"), 50);
+  }),
+  apiKeyDel: () => openForm("删除 Global API Key", [{ k: "password", label: "当前密码", type: "password" }], {}, async v => {
+    try { await api("POST", "/account/api_key", { password: v.password, remove: true }); } catch (e) { throw new Error(PW_TEXT(e.message)); }
+  }),
   userAdd: () => openForm("添加用户", [
     { k: "email", label: "邮箱" }, { k: "role", label: "角色", type: "select", options: [["viewer", "只读"], ["editor", "编辑"], ["admin", "管理员"]] },
   ], {}, async v => {
