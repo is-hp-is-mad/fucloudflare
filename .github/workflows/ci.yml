@@ -91,6 +91,9 @@ jobs:
     name: UI screenshots
     needs: build-musl
     runs-on: ubuntu-24.04
+    env:
+      # a throwaway token for the throwaway instance below
+      UI_TOKEN: ui-check-token
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -104,16 +107,16 @@ jobs:
         run: |
           chmod +x dist/fucf-linux-x86_64
           mkdir -p /tmp/fucf-ui
-          FUCF_DATA_DIR=/tmp/fucf-ui FUCF_API_TOKEN=ui-check-token FUCF_API_LISTEN=127.0.0.1:8787 \
+          FUCF_DATA_DIR=/tmp/fucf-ui FUCF_API_TOKEN="$UI_TOKEN" FUCF_API_LISTEN=127.0.0.1:8787 \
           FUCF_HTTP_LISTEN=127.0.0.1:18080 FUCF_HTTPS_LISTEN=off FUCF_HTTP3_LISTEN=off FUCF_DNS_LISTEN=127.0.0.1:15353 \
           FUCF_EDGE_IPS=127.0.0.1 nohup ./dist/fucf-linux-x86_64 > /tmp/fucf-ui.log 2>&1 &
           for i in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:8787/ && break; sleep 0.2; done
           tail -5 /tmp/fucf-ui.log
       - name: seed an account, a zone and edge pages
         run: |
-          api() { curl -fsS -X "$1" -H "Authorization: Bearer ui-check-token" -H "Content-Type: application/json" "http://127.0.0.1:8787/client/v4$2" ${3:+-d "$3"}; }
+          api() { curl -fsS -X "$1" -H "Authorization: Bearer $UI_TOKEN" -H "Content-Type: application/json" "http://127.0.0.1:8787/client/v4$2" ${3:+-d "$3"}; }
           SESSION=$(curl -fsS -X POST -H "Content-Type: application/json" http://127.0.0.1:8787/client/v4/auth/setup \
-            -d '{"token":"ui-check-token","email":"owner@example.com","password":"a long ui check password"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["token"])')
+            -d "{\"token\":\"$UI_TOKEN\",\"email\":\"owner@example.com\",\"password\":\"a long ui check password\"}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["token"])')
           ZONE=$(api POST /zones '{"name":"example.com"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["id"])')
           api POST /zones/$ZONE/dns_records '{"type":"A","name":"example.com","content":"127.0.0.1","proxied":true}' >/dev/null
           api POST /zones/$ZONE/dns_records '{"type":"A","name":"down.example.com","content":"192.0.2.1","proxied":true}' >/dev/null
