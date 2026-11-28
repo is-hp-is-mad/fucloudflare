@@ -207,6 +207,16 @@ struct Args {
     #[arg(long, env = "FUCF_BAN_EXPORT")]
     ban_export: Option<PathBuf>,
 
+    /// Authenticated origin pulls: a certificate (PEM) this node presents to
+    /// origins that ask for a client certificate, so they can take requests
+    /// from this fleet alone. Needs --origin-client-key.
+    #[arg(long, env = "FUCF_ORIGIN_CLIENT_CERT", requires = "origin_client_key")]
+    origin_client_cert: Option<PathBuf>,
+
+    /// The private key (PEM) of --origin-client-cert.
+    #[arg(long, env = "FUCF_ORIGIN_CLIENT_KEY", requires = "origin_client_cert")]
+    origin_client_key: Option<PathBuf>,
+
     /// SMTP listener for inbound e-mail routing (e.g. `0.0.0.0:25`). Off unless set.
     #[arg(long, env = "FUCF_SMTP_LISTEN")]
     smtp_listen: Option<SocketAddr>,
@@ -531,6 +541,10 @@ async fn main() -> anyhow::Result<()> {
     let waf = Arc::new(edge::waf::Waf::with_secret(token.as_bytes()));
     // so are TLS session tickets: a visitor the DNS moves to another node resumes there
     edge::tls::share_tickets(token.as_bytes());
+    if let (Some(cert), Some(key)) = (&args.origin_client_cert, &args.origin_client_key) {
+        let read = |p: &PathBuf| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
+        edge::tls::present_to_origins(&read(cert)?, &read(key)?).map_err(|e| anyhow::anyhow!("--origin-client-cert: {e}"))?;
+    }
     let telemetry = if accel {
         waf.set_outbox_only();
         Arc::new(Telemetry {

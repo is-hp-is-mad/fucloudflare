@@ -403,15 +403,32 @@ impl ServerCertVerifier for NoVerify {
 }
 
 /// Client config for origin connections; `verify` selects strict mode.
+/// The certificate this edge shows the origins that ask for one (see [`present_to_origins`]).
+static ORIGIN_IDENTITY: OnceLock<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> = OnceLock::new();
+
+/// Authenticated origin pulls: have the client configurations made from now
+/// on present this certificate, so an origin can take requests from this
+/// fleet alone (it asks for a client certificate and checks it against ours).
+pub fn present_to_origins(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    parse_cert(cert_pem, key_pem)?;
+    let chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>().map_err(|e| format!("invalid certificate PEM: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|e| format!("invalid private key PEM: {e}"))?;
+    let _ = ORIGIN_IDENTITY.set((chain, key));
+    Ok(())
+}
+
 pub fn client_config(verify: bool) -> anyhow::Result<Arc<ClientConfig>> {
     let builder = ClientConfig::builder_with_provider(crypto()).with_safe_default_protocol_versions()?;
-    let cfg = if verify {
-        let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        builder.with_root_certificates(roots).with_no_client_auth()
+    let identity = ORIGIN_IDENTITY.get().map(|(chain, key)| (chain.clone(), key.clone_key()));
+    let builder = if verify {
+        builder.with_root_certificates(RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
     } else {
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(crypto()))).with_no_client_auth()
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(crypto())))
     };
-    Ok(Arc::new(cfg))
+    Ok(Arc::new(match identity {
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key)?,
+        None => builder.with_no_client_auth(),
+    }))
 }
 
 #[cfg(test)]

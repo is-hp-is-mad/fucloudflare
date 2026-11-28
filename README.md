@@ -193,6 +193,11 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
 - `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
 
+### 回源时出示客户端证书
+
+`--origin-client-cert` / `--origin-client-key`（`FUCF_ORIGIN_CLIENT_CERT` / `FUCF_ORIGIN_CLIENT_KEY`，PEM）：回源的 TLS 握手里出示这张证书。
+源站要求并校验客户端证书后，就只接受本机群的回源请求，别人即使知道源站地址也连不上。各节点用同一张证书。
+
 ### TLS 指纹（JA4）
 
 每条 TLS 连接的 ClientHello 会算出 JA4 指纹（协议版本、加密套件、扩展、签名算法的组合）：浏览器、命令行工具和攻击工具的指纹各不相同，与它们自称的 User-Agent 无关。
