@@ -238,6 +238,7 @@ footer code{font:12.5px ui-monospace,'SF Mono',Consolas,monospace;color:var(--su
 .hop.ok i,.hop.ok em{background:rgba(74,155,110,.14);color:#2f7a52}\
 .hop.bad i,.hop.bad em{background:rgba(217,119,87,.16);color:#b5462a}\
 @media (prefers-color-scheme:dark){.hop.ok i,.hop.ok em{color:#7cc49b}.hop.bad i,.hop.bad em{color:#f0a283}}\
+.hop em{white-space:nowrap}@media (max-width:520px){.hop .en{display:none}}\
 .what h2{font-size:15px;font-weight:600;margin:1.25rem 0 .25rem}.what p{font-size:15px;margin:0}\
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -265,9 +266,9 @@ const ICON_ORIGIN: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"cur
 fn path_html(ctx: &PageCtx) -> String {
     let state = |hop: Hop| -> (&str, &str) {
         match (ctx.hop, hop) {
-            (failed, h) if failed == h => ("bad", "出错 Error"),
-            (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", "未涉及 Not involved"),
-            _ => ("ok", "正常 Working"),
+            (failed, h) if failed == h => ("bad", "出错<span class=\"en\"> Error</span>"),
+            (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", "未涉及<span class=\"en\"> Not involved</span>"),
+            _ => ("ok", "正常<span class=\"en\"> Working</span>"),
         }
     };
     let stop = |hop: Hop, icon: &str, name: &str, sub: &str| {
