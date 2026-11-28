@@ -6,8 +6,8 @@
     python scripts/e2e.py --list-tests
     python scripts/e2e.py --selftest
 
-Preserves all 152 baseline checks (130 Windows / 152 Unix) and extends with
-246 opaque-box 4-tier tests across R1-R5 (398 total checks).
+Preserves all 175 baseline checks (153 Windows / 175 Unix) and extends with
+246 opaque-box 4-tier tests across R1-R5 (421 total checks).
 """
 import argparse
 import http.client
@@ -50,7 +50,10 @@ class Origin(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         Origin.hits += 1
         body = f"origin path={self.path} host={self.headers['Host']} ip={self.headers.get('CF-Connecting-IP')}".encode()
-        self.send_response(200)
+        # a 404 for the rate limit that counts answers by their status, tags for the purge by tag
+        self.send_response(404 if self.path.startswith("/rl-status/missing") else 200)
+        if self.path.startswith("/tagged/"):
+            self.send_header("Cache-Tag", "e2e-a, e2e-b")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -316,6 +319,7 @@ def run_baseline(bin_path=None, keep_logs=False):
             except OSError:
                 time.sleep(0.1)
         run()
+        newer()
         mail()
         accounts()
         fleet(data_dir)
@@ -930,12 +934,84 @@ def run():
           and r.getheader("X-Frame-Options") == "DENY", "panel sends CSP and anti-clickjacking headers")
 
 
+def newer():
+    """Purges by tag and by host, DNS analytics, measured steering and rate
+    limits keyed by more than the address: only what one node, its visitors
+    all on loopback, can tell for sure."""
+    zid = [z for z in api("GET", "/zones")[1]["result"] if z["name"] == "example.test"][0]["id"]
+    purge = f"/zones/{zid}/purge_cache"
+
+    print("purge by tag and by host")
+    # (each purge is also applied again from the configuration, a moment later: hence
+    # no exact counts, and no HIT expected of anything a purge could still reach)
+    st, h, _ = edge("/tagged/t.css")
+    check(st == 200 and h["fcf-cache-status"] == "MISS" and "cache-tag" not in h, "the origin's Cache-Tag is not passed on to visitors")
+    st, h, _ = edge("/tagged/t.css")
+    check(h["fcf-cache-status"] == "HIT" and "cache-tag" not in h, "... not even from the cache")
+    st, r = api("POST", purge, {"tags": ["nope"]})
+    check(st == 200 and r["result"] == {"id": zid, "purged": 0} and edge("/tagged/t.css")[1]["fcf-cache-status"] == "HIT",
+          "a tag nothing carries purges nothing")
+    st, r = api("POST", purge, {"tags": [" e2e-b "]})
+    check(st == 200 and r["result"]["purged"] in (0, 1) and edge("/tagged/t.css")[1]["fcf-cache-status"] == "MISS",
+          "purged by one of the tags the origin gave")
+    check(api("POST", f"/zones/{zid}/dns_records", {"type": "A", "name": "keep", "content": "127.0.0.1", "proxied": True})[0] == 200,
+          "a second host name in the zone")
+    for host in ("example.test", "keep.example.test"):
+        edge("/a/host.css", host=host)
+    check([edge("/a/host.css", host=host)[1]["fcf-cache-status"] for host in ("example.test", "keep.example.test")] == ["HIT", "HIT"],
+          "both host names have the object cached")
+    st, r = api("POST", purge, {"hosts": ["Example.TEST/"]})
+    check(st == 200 and r["result"]["id"] == zid and isinstance(r["result"]["purged"], int)
+          and edge("/a/host.css")[1]["fcf-cache-status"] == "MISS", "purged by host name (case and a trailing slash do not matter)")
+    check(edge("/a/host.css", host="keep.example.test")[1]["fcf-cache-status"] == "HIT", "... and only that host name, not the ones under it")
+    check(api("POST", purge, {"hosts": [" ", "/"], "tags": [""]})[0] == 400, "empty host names and tags are no purge")
+
+    print("DNS analytics")
+    st, r = api("GET", f"/zones/{zid}/dns_analytics")
+    before = r["result"]
+    check(st == 200 and set(before) == {"total", "by_type", "by_rcode"}, "DNS analytics: a total, by type and by answer")
+    check(len(dns_a("example.test")) == 1 and dns_a("e2e-absent.example.test") == [], "two queries for the zone: a name that is there, one that is not")
+    after = api("GET", f"/zones/{zid}/dns_analytics")[1]["result"]
+    check(after["total"] >= before["total"] + 2 and after["by_type"].get("A", 0) >= before["by_type"].get("A", 0) + 2
+          and after["by_rcode"].get("NOERROR", 0) >= before["by_rcode"].get("NOERROR", 0) + 1
+          and after["by_rcode"].get("NXDOMAIN", 0) >= before["by_rcode"].get("NXDOMAIN", 0) + 1, "... are counted, by type and by answer")
+
+    print("measured steering")
+    st, r = api("GET", "/steering/measured")
+    table = r["result"]
+    check(st == 200 and isinstance(table, dict) and all(isinstance(nodes, dict) and all(set(m) == {"ms", "samples", "age"} for m in nodes.values())
+                                                         for nodes in table.values()), "measured round trips: network -> node -> ms, samples, age")
+    st, r = api("GET", "/steering/test?ip=192.0.2.1")
+    check(st == 200 and "measured" in r["result"] and r["result"]["measured"] is None, "with fewer than two nodes no measurement tells them apart")
+
+    print("rate limits by more than the address")
+    st, r = api("POST", f"/zones/{zid}/rate_limits", {"expression": 'http.request.uri.path eq "/rl-key"', "threshold": 2, "period": 60,
+                                                      "characteristics": [" Header:X-Key "]})
+    check(st == 200 and r["result"]["characteristics"] == ["header:x-key"], "a rate limit keyed by a header (its name in lower case)")
+    check([edge("/rl-key", headers={"X-Key": "a"})[0] for _ in range(3)] == [200, 200, 429], "requests with one value of the header are counted together")
+    check(edge("/rl-key", headers={"X-Key": "b"})[0] == 200, "another value is another client")
+    check([edge("/rl-key")[0] for _ in range(3)] == [200, 200, 429], "without the header, one visitor's requests are still counted")
+    # (were one taken after all, it counts nothing anybody asks for)
+    never = {"expression": 'http.request.uri.path eq "/rl-never"', "threshold": 1, "period": 60}
+    bad = [["header:"], ["header:x key"], ["fingerprint"], ["ip", "asn", "country", "host", "path"]]
+    check(all(api("POST", f"/zones/{zid}/rate_limits", {**never, "characteristics": c})[0] == 400 for c in bad)
+          and api("POST", f"/zones/{zid}/rate_limits", {**never, "status_codes": [99]})[0] == 400,
+          "unknown or too many characteristics, and status codes that are none, are refused")
+    st, r = api("POST", f"/zones/{zid}/rate_limits", {"expression": 'starts_with(http.request.uri.path, "/rl-status/")', "threshold": 1, "period": 60,
+                                                      "status_codes": ["404"]})
+    check(st == 200 and r["result"]["status_codes"] == [404], "a rate limit that counts only 404 answers (given as digits)")
+    check([edge("/rl-status/ok")[0] for _ in range(3)] == [200] * 3, "other answers are not counted")
+    check([edge("/rl-status/missing")[0] for _ in range(3)] == [404, 404, 429], "over the limit from the request after the answer that crossed it")
+    check(edge("/rl-status/ok")[0] == 429, "... for every request the rule matches")
+
+
 def _cmd_list_tests():
     from e2e_tiers import load_all_tiers
 
     tests = load_all_tiers()
-    print("Baseline checks (152 total: 130 Windows / 152 Linux):")
+    print("Baseline checks (175 total: 153 Windows / 175 Linux):")
     print("  baseline/run       : 70 checks (Zone/DNS, CDN, WAF, Workers, Spectrum, Rules/H3, Limits, Certs, Misc)")
+    print("  baseline/newer     : 23 checks (Purge by tag / host, DNS analytics, measured steering, rate limit keys)")
     print("  baseline/mail      : 18 checks (SMTP Email Routing + SRS)")
     print("  baseline/accounts  : 32 checks (Panel accounts, roles, TOTP, backup codes, audit, fleet)")
     print("  baseline/fleet     : 10 checks (Replica sync, analytics, events, cache purge)")
@@ -950,7 +1026,7 @@ def _cmd_list_tests():
     print("")
     print(
         f"Counts: Tier 1={by_tier['1']}, Tier 2={by_tier['2']}, Tier 3={by_tier['3']}, Tier 4={by_tier['4']} "
-        f"(new={len(tests)}, baseline=152, grand_total={len(tests) + 152})"
+        f"(new={len(tests)}, baseline=175, grand_total={len(tests) + 175})"
     )
 
 

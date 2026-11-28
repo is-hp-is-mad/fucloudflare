@@ -638,7 +638,7 @@ def t4_011(ctx: TestContext) -> None:
     "4",
     "baseline",
     ("REQ-07",),
-    "Existing 152-check regression baseline (130 Windows / 152 Unix)",
+    "Existing 175-check regression baseline (153 Windows / 175 Unix)",
     tags=("baseline",),
 )
 def t4_012(ctx: TestContext) -> None:
@@ -648,5 +648,5 @@ def t4_012(ctx: TestContext) -> None:
     import e2e  # type: ignore
 
     ran = e2e.run_baseline(ctx.bin)
-    expected = 130 if os.name == "nt" else 152
+    expected = 153 if os.name == "nt" else 175
     assert ran == expected, f"expected {expected} baseline checks, ran {ran}"

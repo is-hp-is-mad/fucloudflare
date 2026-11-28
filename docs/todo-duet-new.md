@@ -58,7 +58,7 @@
 - 核对 README 已有小节与代码一致，过期就修。
 - 例子只用保留地址与示例域名。
 
-### [ ] N5 e2e 脚本覆盖新功能（只写静态能确定的）
+### [x] N5 e2e 脚本覆盖新功能（只写静态能确定的）
 
 - `scripts/e2e.py` baseline 段照抄现有检查风格，新增小而稳的检查：按 `tags`/`hosts` 清除的 API 形状、`dns_analytics` 在发过查询后出现记录、`/steering/measured` 形状、`characteristics` 限速在缺该头时按 IP 计数。
 - 只写不依赖真源站行为的；拿不准语义的宁可不写，在交接里注明"留待验证"。
@@ -151,3 +151,9 @@
 - api.md 新增"Zone transfers (AXFR)""DNS query counts""Origins: health checks, weights and session affinity""Steering by measured round trips"四节；限速的 `characteristics` / `status_codes` 写在 Rules 里，Rulesets 的对应关系只链接、不重复。
 - README 修了过期的地方：`--edge-ttl` 说明、`fucf-trace` 字段、已知限制里"没有 AXFR / 没有主动健康检查 / 没有 DNS 查询统计"，并补上 `--dns-rrl`、`--ban-export`、`--origin-client-*` 三个参数。
 - 留给能运行的人：`--ban-export` 写不出 IPv6 封禁（autofw 存的是 /64，banset 只认单个地址），`banned6` 总是空的；`characteristics` 缺头时所有这类请求共用一个计数；`cache_tier_node` 保存时不检查节点是否存在。
+
+### N5
+- `scripts/e2e.py`：baseline 在 `run()` 之后新增 `newer()`（23 项）：按 tag / 按主机名清除（各 3 项）、`dns_analytics` 在一次存在、一次不存在的 A 查询后按类型和应答计数、`/steering/measured` 的形状（网络 → 节点 → `{ms, samples, age}`）、带请求头特征和 `status_codes` 的限速；测试源站在 `/tagged/` 下加 `Cache-Tag`，在 `/rl-status/missing` 返回 404。`scripts/e2e_tiers/tier4_scenarios.py` 的 T4-012 改成 153 / 175 项。
+- 清除会在配置里再执行一次（`apply_purges`），所以不断言准确的 `purged` 数，只断言 MISS / HIT。
+- 缺请求头时代码把所有 IP 放进同一个空键（不是"按 IP"），单 IP 的 e2e 区分不出来，检查写成两种理解都通过，留待验证。
+- 留待能运行的人：真实握手的 RTT 和 `fastest`、cookie / ASN / 国家特征、源站健康、AXFR、新记录类型、`swr` / `ignore_query`。没有对着真实服务跑过，只做了 `py_compile` 和 `--list-tests`。
