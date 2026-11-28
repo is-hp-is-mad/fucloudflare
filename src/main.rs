@@ -224,6 +224,15 @@ struct Args {
     #[arg(long, env = "FUCF_CACHE_MB", default_value_t = 512)]
     cache_mb: usize,
 
+    /// Size of the edge cache's disk tier in MiB (0: memory only). It keeps
+    /// what does not fit in memory, and what was cached before a restart.
+    #[arg(long, env = "FUCF_CACHE_DISK_MB", default_value_t = 150)]
+    cache_disk_mb: usize,
+
+    /// Directory of the disk tier (default: `<data dir>/cache`).
+    #[arg(long, env = "FUCF_CACHE_DISK_DIR")]
+    cache_disk_dir: Option<PathBuf>,
+
     /// Host names of this deployment's nameservers, assigned to new zones.
     #[arg(long = "ns", env = "FUCF_NS", value_delimiter = ',', default_value = "ns1.fucf.local,ns2.fucf.local")]
     name_servers: Vec<String>,
@@ -416,7 +425,23 @@ async fn main() -> anyhow::Result<()> {
         accounts.spawn_writer();
     }
 
-    let cache = Arc::new(edge::cache::Cache::new(args.cache_mb * 1024 * 1024));
+    let cache = {
+        let memory = args.cache_mb * 1024 * 1024;
+        let dir = args.cache_disk_dir.clone().unwrap_or_else(|| args.data_dir.join("cache"));
+        let disk = args.cache_disk_mb * 1024 * 1024;
+        let tiered = if disk > 0 {
+            match tokio::task::spawn_blocking(move || edge::cache::Cache::with_disk(memory, dir, disk)).await? {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!("edge cache: no disk tier ({e}); memory only");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Arc::new(tiered.unwrap_or_else(|| edge::cache::Cache::new(memory)))
+    };
     // Challenge clearances are derived from the token: the nodes of a fleet
     // share it, so they accept each other's, and restarts do not void them.
     let waf = Arc::new(edge::waf::Waf::with_secret(token.as_bytes()));

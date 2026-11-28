@@ -1332,7 +1332,7 @@ impl Edge {
         // May what the origin answers be stored?
         let mut storable = use_cache;
         if use_cache {
-            match self.cache.get(&key) {
+            match self.cache.lookup(&key).await {
                 Some(entry) if entry.fresh() => return Ok(cached_response(&entry, &method, &conditional, "HIT")),
                 // A part is cut from what we have; otherwise the request goes
                 // to the origin as it is, and its partial answer is not kept.
