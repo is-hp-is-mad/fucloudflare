@@ -290,6 +290,30 @@ GET    /audit                             the last 300 sign-ins, account and use
 See "Zones and DNS records" above. `PATCH /zones/{id}` takes `{"type": "full|partial"}` and
 `{"paused": true|false}`.
 
+#### Who a zone belongs to
+
+A zone belongs to the user who made it. Users who are not administrators (editors and viewers)
+see and change only their own zones: `GET /zones` and `GET /analytics` leave the others out, and
+every path under `/zones/{id}` answers another user's zone with `404` (code `1001`, "Zone not
+found"), the same as a zone id that does not exist. Zones that have no owner (those from before
+owners existed, and those made with the fleet's own API token) are the administrators' only.
+Administrators see every zone.
+
+```
+GET    /zones/{id}                        "owner": {"id": "<user id>" | null, "type": "user"}
+PATCH  /zones/{id}                        {"owner": "<user id>"}, {"owner": {"id": "<user id>"}}, or
+                                          {"owner": null} (administrators only): give the zone to that user,
+                                          or to nobody; an unknown user id is 400 and changes nothing
+POST   /zones                             a zone made by somebody who is not an administrator may not be
+                                          at, below or above a zone of another user (409);
+                                          "owner" may not be sent here (400)
+```
+
+On top of their role, users who are not administrators may only read account-level objects
+(Workers, KV, D1, IP lists, steering, proxy rules, nodes, ...): any other method there is `403`
+(code `2010`). A user's API tokens and Global API Key reach no further than the user, whatever
+zones the token names.
+
 ### Zone settings
 
 ```

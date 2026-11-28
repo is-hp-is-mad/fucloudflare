@@ -46,6 +46,10 @@ pub struct Zone {
     /// kept here rather than in `settings`, which the API shows as it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email_dkim: Option<crate::dkim::DkimKey>,
+    /// The id of the user the zone belongs to (crate::tenancy); none: the
+    /// administrators' only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub created_on: String,
     pub modified_on: String,
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
@@ -1677,9 +1681,35 @@ impl Store {
     }
 
     pub async fn create_zone_as_async(&self, name: &str, kind: &str) -> Result<Zone, StoreError> {
+        self.create_zone_owned_async(name, kind, None, false).await
+    }
+
+    /// A zone that belongs to `owner` (crate::tenancy). `guarded`: made by
+    /// somebody who is not an administrator, so it may not overlap a zone
+    /// of anybody else (checked inside the write).
+    pub async fn create_zone_owned_async(&self, name: &str, kind: &str, owner: Option<String>, guarded: bool) -> Result<Zone, StoreError> {
         let (name_owned, kind_owned, ns) = (name.to_string(), kind.to_string(), self.default_ns.clone());
-        self.mutate_async(move |d, clock, sync_node| apply_create_zone(d, clock, sync_node, &name_owned, &kind_owned, ns))
+        self.mutate_async(move |d, clock, sync_node| create_owned(d, clock, sync_node, &name_owned, &kind_owned, ns, owner, guarded))
             .await
+    }
+
+    #[cfg(test)]
+    pub fn create_zone_owned(&self, name: &str, kind: &str, owner: Option<String>, guarded: bool) -> Result<Zone, StoreError> {
+        let (name_owned, kind_owned, ns) = (name.to_string(), kind.to_string(), self.default_ns.clone());
+        self.mutate(move |d, clock, sync_node| create_owned(d, clock, sync_node, &name_owned, &kind_owned, ns, owner, guarded))
+    }
+
+    /// Give a zone to another user, or (none) to the administrators only.
+    pub async fn set_zone_owner_async(&self, id: &str, owner: Option<String>) -> Result<Zone, StoreError> {
+        let id = id.to_string();
+        self.mutate_async(move |d, clock, sync_node| {
+            let pos = d.zones.iter().position(|z| z.id == id).ok_or(StoreError::ZoneNotFound)?;
+            let sync = stamp_next(d, clock, sync_node, false);
+            let z = &mut d.zones[pos];
+            (z.owner, z.modified_on, z.sync) = (owner, now(), sync);
+            Ok(z.clone())
+        })
+        .await
     }
 
     pub fn get_dnssec(&self, zone_id: &str) -> Result<serde_json::Value, StoreError> {
@@ -2257,6 +2287,27 @@ fn apply_delete_worker(d: &mut Data, clock: &HlcClock, sync_node: &str, name: &s
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn create_owned(
+    d: &mut Data,
+    clock: &HlcClock,
+    sync_node: &str,
+    name: &str,
+    kind: &str,
+    default_ns: Vec<String>,
+    owner: Option<String>,
+    guarded: bool,
+) -> Result<Zone, StoreError> {
+    if guarded {
+        let normalized = normalize_name(name).map_err(StoreError::Invalid)?;
+        crate::tenancy::may_create(&d.zones, &normalized, owner.as_deref()).map_err(StoreError::Conflict)?;
+    }
+    let zone = apply_create_zone(d, clock, sync_node, name, kind, default_ns)?;
+    let z = d.zones.iter_mut().find(|z| z.id == zone.id).ok_or(StoreError::ZoneNotFound)?;
+    z.owner = owner;
+    Ok(z.clone())
+}
+
 fn apply_create_zone(
     d: &mut Data,
     clock: &HlcClock,
@@ -2288,6 +2339,7 @@ fn apply_create_zone(
         settings: Settings::default(),
         dnssec: None,
         email_dkim: None,
+        owner: None,
         created_on: ts.clone(),
         modified_on: ts,
         sync,

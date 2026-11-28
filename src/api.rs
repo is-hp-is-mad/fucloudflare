@@ -509,6 +509,26 @@ async fn auth(State(st): St, mut req: Request, next: Next) -> Response {
     if !token_allows {
         return ApiError(StatusCode::FORBIDDEN, 9109, "Unauthorized to access requested resource".into()).into_response();
     }
+    // zones are their owners' (crate::tenancy), for every path under /zones/{zone_id}
+    let reads = req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD;
+    match crate::tenancy::check(&who, reads, path, &st.store) {
+        Ok(()) => {}
+        Err(crate::tenancy::Denied::Zone) => return ApiError::from(StoreError::ZoneNotFound).into_response(),
+        Err(crate::tenancy::Denied::Account) => {
+            return ApiError(StatusCode::FORBIDDEN, 2010, "only administrators change account-level objects".into()).into_response();
+        }
+    }
+    // an e-mail rule that hands mail to a Worker is the administrators', as a route to one is
+    if who.role != Role::Admin && !reads && crate::tenancy::is_email_rule(path) {
+        let (parts, body) = req.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, 64 << 10).await else {
+            return ApiError(StatusCode::PAYLOAD_TOO_LARGE, 1000, "an e-mail rule is at most 64 KiB".into()).into_response();
+        };
+        if crate::tenancy::binds_worker(&bytes) {
+            return ApiError(StatusCode::FORBIDDEN, 2010, "only administrators hand mail to Workers".into()).into_response();
+        }
+        req = Request::from_parts(parts, axum::body::Body::from(bytes));
+    }
     req.extensions_mut().insert(who);
     req.extensions_mut().insert(from);
     next.run(req).await
@@ -1332,6 +1352,7 @@ fn zone_json(z: &Zone) -> Value {
         "id": z.id, "name": z.name, "status": z.status, "paused": z.paused, "type": z.kind,
         "settings": z.settings,
         "name_servers": z.name_servers, "created_on": z.created_on, "modified_on": z.modified_on,
+        "owner": { "id": z.owner, "type": "user" },
         "account": { "id": crate::tokens::account_id(), "name": crate::tokens::ACCOUNT_NAME },
         "plan": { "id": "free", "name": "Free Website", "price": 0, "currency": "USD", "is_subscribed": true, "can_subscribe": false },
         "permissions": [],
@@ -1346,8 +1367,9 @@ async fn list_zones(State(st): St, axum::Extension(who): Who, Query(q): Params) 
         .iter()
         .filter(|z| name.as_ref().is_none_or(|n| &z.name == n))
         .filter(|z| status.is_none_or(|s| &z.status == s))
-        // a token sees the zones it names
+        // a token sees the zones it names; nobody but administrators sees other users' zones
         .filter(|z| who.grant.as_ref().is_none_or(|g| g.sees_zone(&z.id)))
+        .filter(|z| crate::tenancy::may_see(&who, z.owner.as_deref()))
         .map(zone_json)
         .collect();
     paginated(items, &q, 20)
@@ -1359,20 +1381,69 @@ struct ZoneBody {
     #[serde(rename = "type")]
     kind: Option<String>,
     paused: Option<bool>,
+    /// `{"owner": {"id": "<user id>"}}`, `{"owner": "<user id>"}`, or
+    /// null (the administrators' only); administrators alone may send it.
+    #[serde(default, deserialize_with = "present")]
+    owner: Option<Value>,
 }
 
-async fn create_zone(State(st): St, bytes: Bytes) -> ApiResult {
+/// A field that is there, even as null, is `Some` (null included).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// The zone belongs to whoever makes it (crate::tenancy); one made by
+/// somebody who is not an administrator may not overlap another user's.
+async fn create_zone(State(st): St, axum::Extension(who): Who, bytes: Bytes) -> ApiResult {
     let b: ZoneBody = body(&bytes)?;
     let name = b.name.ok_or_else(|| bad("'name' is required"))?;
-    ok(zone_json(&st.store.create_zone_as_async(&name, b.kind.as_deref().unwrap_or("full")).await?))
+    if b.owner.is_some() {
+        return Err(bad("a new zone belongs to whoever makes it: an administrator gives it to somebody else with PATCH"));
+    }
+    let guarded = who.role != Role::Admin;
+    let zone = st.store.create_zone_owned_async(&name, b.kind.as_deref().unwrap_or("full"), who.user_id.clone(), guarded).await?;
+    ok(zone_json(&zone))
 }
 
 async fn get_zone(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
     ok(zone_json(&st.store.get_zone(&zone_id)?))
 }
 
-async fn patch_zone(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+/// The user id a PATCH gives a zone to: none for null or "".
+fn owner_of(v: &Value, users: &[Value]) -> Result<Option<String>, ApiError> {
+    let id = match v {
+        Value::Null => return Ok(None),
+        Value::String(s) => s.as_str(),
+        Value::Object(o) => match o.get("id") {
+            Some(Value::Null) => return Ok(None),
+            Some(Value::String(s)) => s.as_str(),
+            _ => return Err(bad("'owner' must be a user id, {\"id\": \"<user id>\"} or null")),
+        },
+        _ => return Err(bad("'owner' must be a user id, {\"id\": \"<user id>\"} or null")),
+    };
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if !users.iter().any(|u| u["id"] == id) {
+        return Err(bad(format!("no user with the id '{id}'")));
+    }
+    Ok(Some(id.to_string()))
+}
+
+async fn patch_zone(State(st): St, axum::Extension(who): Who, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
     let b: ZoneBody = body(&bytes)?;
+    // checked before anything changes, so a refused owner changes nothing else either
+    let owner = match &b.owner {
+        Some(_) if who.role != Role::Admin => {
+            return Err(ApiError(StatusCode::FORBIDDEN, 2010, "only administrators change who a zone belongs to".into()));
+        }
+        Some(v) => Some(owner_of(v, &st.accounts.users())?),
+        None => None,
+    };
+    st.store.get_zone(&zone_id)?;
+    if let Some(owner) = owner {
+        st.store.set_zone_owner_async(&zone_id, owner).await?;
+    }
     if let Some(kind) = &b.kind {
         st.store.set_zone_kind_async(&zone_id, kind).await?;
     }
@@ -2659,12 +2730,13 @@ async fn request_log(State(st): St, Path(zone_id): Path<String>, Query(q): Param
 }
 
 /// Traffic totals of every zone.
-async fn analytics_summary(State(st): St, Query(q): Params) -> ApiResult {
+async fn analytics_summary(State(st): St, axum::Extension(who): Who, Query(q): Params) -> ApiResult {
     let window = window(&q, 1440)?;
     let mut by_zone = st.stats.summary(window);
     let mut totals = crate::edge::stats::Counters::default();
     let mut zones = serde_json::Map::new();
-    for z in st.store.list_zones() {
+    // the totals are of the zones the asker may see (crate::tenancy)
+    for z in st.store.list_zones().into_iter().filter(|z| crate::tenancy::may_see(&who, z.owner.as_deref())) {
         let c = by_zone.remove(&z.id).unwrap_or_default();
         totals.add(&c);
         let mut v = c.json();
@@ -3443,6 +3515,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir_b);
     }
 
+    /// Give a test zone to the user with this e-mail (crate::tenancy), so
+    /// their role, not ownership, is what a test looks at.
+    async fn give(st: &ApiState, zone_id: &str, email: &str) {
+        let id = st.accounts.users().iter().find(|u| u["email"] == email).unwrap()["id"].as_str().unwrap().to_string();
+        st.store.set_zone_owner_async(zone_id, Some(id)).await.unwrap();
+    }
+
     async fn call_raw(
         app: &mut Router,
         method: &str,
@@ -3787,6 +3866,7 @@ mod tests {
         assert_eq!(sc, StatusCode::NOT_FOUND);
 
         // panel roles: a viewer reads, does not write
+        give(&st, &z, "viewer@example.com").await;
         let h = vec![("authorization", viewer.as_str()), ("content-type", "application/json")];
         let (sc, _, _) = call_raw(&mut app, "GET", &rooms, h.clone(), vec![]).await;
         assert_eq!(sc, StatusCode::OK);
@@ -3895,7 +3975,8 @@ mod tests {
         // panel roles: everyone who sees the zone reads the log, only admins send it elsewhere
         let with = |bearer: &str| vec![("authorization", bearer.to_string()), ("content-type", "application/json".to_string())];
         let new_job = json!({ "name": "x", "destination": "https://logs.example.com/x" }).to_string();
-        for bearer in [&viewer, &editor] {
+        for (bearer, email) in [(&viewer, "viewer@example.com"), (&editor, "editor@example.com")] {
+            give(&st, &z, email).await;
             let h = with(bearer);
             let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let (sc, _, _) = call_raw(&mut app, "GET", &logs, h.clone(), vec![]).await;
@@ -4618,6 +4699,7 @@ mod tests {
         assert!(!v["needed_records"].as_array().unwrap().iter().any(|r| r["name"] == record["name"]), "{v}");
 
         // viewers read, but do not change (once past their first password)
+        give(&st, &zone.id, "view@example.com").await;
         let first = br#"{"current":"viewer-pass-123","new":"viewer-pass-456"}"#.to_vec();
         let (sc, _, _) = call_raw(&mut app, "POST", "/client/v4/account/password", vec![("authorization", &as_viewer), ("content-type", "application/json")], first).await;
         assert_eq!(sc, StatusCode::OK);
@@ -4655,6 +4737,164 @@ mod tests {
         assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
         assert_eq!(json_of(&b)["result"]["has_dkim_private_key"], json!(false));
         assert!(stored().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn users_see_and_change_only_their_own_zones_and_administrators_see_all() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-tenancy-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        // two editors, each past their first password
+        let mut sessions = HashMap::new();
+        for who in ["alice", "bob"] {
+            let email = format!("{who}@example.com");
+            st.accounts.create_user(&email, Role::Editor, Some("first-pass-123"), "admin@example.com", &Client::default()).unwrap();
+            let Login::Session(token, _) = st.accounts.login(&email, "first-pass-123", &Client::default()).unwrap() else { panic!("expected signed in") };
+            let bearer = format!("Bearer {token}");
+            let (sc, _, _) = call_raw(&mut app, "POST", "/client/v4/account/password", vec![("authorization", &bearer), ("content-type", "application/json")],
+                br#"{"current":"first-pass-123","new":"second-pass-456"}"#.to_vec()).await;
+            assert_eq!(sc, StatusCode::OK);
+            sessions.insert(who, bearer);
+        }
+        let as_user = |who: &str| vec![("authorization", sessions[who].as_str()), ("content-type", "application/json")];
+        let mut users_app = app.clone();
+        let mut ask = async move |who: &str, method: &str, path: &str, body: Value| {
+            let body = if body.is_null() { vec![] } else { body.to_string().into_bytes() };
+            let (sc, _, b) = call_raw(&mut users_app, method, &format!("/client/v4{path}"), as_user(who), body).await;
+            (sc, b)
+        };
+
+        let (sc, b) = ask("alice", "POST", "/zones", json!({ "name": "alice.example.com" })).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let mine = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let alice_id = st.accounts.users().iter().find(|u| u["email"] == "alice@example.com").unwrap()["id"].clone();
+        assert_eq!(json_of(&b)["result"]["owner"]["id"], alice_id);
+        let (_, b) = ask("bob", "POST", "/zones", json!({ "name": "bob.example.net" })).await;
+        let theirs = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let unowned = st.store.create_zone("old.example.org").unwrap().id;
+
+        // the list: each their own, the fleet's token (an administrator) all three
+        let names = |b: &[u8]| json_of(b)["result"].as_array().unwrap().iter().map(|z| z["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let (_, b) = ask("alice", "GET", "/zones", Value::Null).await;
+        assert_eq!(names(&b), ["alice.example.com"]);
+        let (_, b) = ask("bob", "GET", "/zones?name=alice.example.com", Value::Null).await;
+        assert!(names(&b).is_empty(), "not even by name");
+        let (_, b) = call(&mut app, "GET", "/client/v4/zones", vec![]).await;
+        assert_eq!(names(&b).len(), 3);
+
+        // every kind of zone path answers another user's zone as if it were not there
+        let reads = ["", "/dns_records", "/dns_records/export", "/settings", "/settings/ssl", "/dnssec", "/rulesets", "/firewall/rules", "/rate_limits",
+            "/cache_rules", "/workers/routes", "/email", "/email/rules", "/waiting_rooms", "/ssl/certificate_packs", "/custom_certificates",
+            "/security/events", "/logs/requests"];
+        for path in reads {
+            for zone in [&theirs, &unowned] {
+                let (sc, b) = ask("alice", "GET", &format!("/zones/{zone}{path}"), Value::Null).await;
+                assert_eq!((sc, json_of(&b)["errors"][0]["code"].clone()), (StatusCode::NOT_FOUND, json!(1001)), "{path}");
+            }
+            let (sc, b) = ask("alice", "GET", &format!("/zones/{mine}{path}"), Value::Null).await;
+            assert!(sc != StatusCode::NOT_FOUND && sc != StatusCode::FORBIDDEN, "{path}: {sc} {}", String::from_utf8_lossy(&b));
+        }
+        let writes = [
+            ("POST", "/dns_records", json!({ "type": "A", "name": "www", "content": "192.0.2.1" })),
+            ("PATCH", "/settings/ssl", json!({ "value": "full" })),
+            ("POST", "/firewall/rules", json!({ "description": "x", "expression": "ip.src eq 192.0.2.1", "action": "block" })),
+            ("PUT", "/rulesets/phases/http_request_firewall_custom/entrypoint", json!({ "rules": [] })),
+            ("POST", "/purge_cache", json!({ "purge_everything": true })),
+            ("PATCH", "/email", json!({ "dkim_selector": null })),
+            ("PATCH", "", json!({ "paused": true })),
+            ("DELETE", "", Value::Null),
+        ];
+        for (method, path, body) in &writes {
+            let (sc, _) = ask("alice", method, &format!("/zones/{theirs}{path}"), body.clone()).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        // the router decodes the id for the handler, so an encoded one is the same zone
+        let encoded: String = theirs.bytes().map(|b| format!("%{b:02X}")).collect();
+        let (sc, _) = ask("alice", "GET", &format!("/zones/{encoded}/dns_records"), Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _) = ask("alice", "PATCH", &format!("/zones/{encoded}"), json!({ "paused": true })).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let own: String = mine.bytes().map(|b| format!("%{b:02X}")).collect();
+        let (sc, _) = ask("alice", "GET", &format!("/zones/{own}/dns_records"), Value::Null).await;
+        assert_eq!(sc, StatusCode::OK, "the router does decode it");
+        let bob_zone = st.store.get_zone(&theirs).unwrap();
+        assert!(!bob_zone.paused && st.store.list_records(&theirs).unwrap().1.is_empty(), "nothing of bob's changed");
+        let (sc, b) = ask("alice", "POST", &format!("/zones/{mine}/dns_records"), writes[0].2.clone()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+
+        // a zone inside another user's is refused; owners are the administrators' to change
+        let (sc, b) = ask("alice", "POST", "/zones", json!({ "name": "shop.bob.example.net" })).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&b));
+        let (sc, _) = ask("alice", "POST", "/zones", json!({ "name": "example.org" })).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "above the administrators' zone");
+        let (sc, _) = ask("alice", "POST", "/zones", json!({ "name": "new.example.com", "owner": null })).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let (sc, _) = ask("alice", "PATCH", &format!("/zones/{mine}"), json!({ "owner": null })).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        assert!(st.store.get_zone(&mine).unwrap().owner.is_some());
+
+        // account-level objects: they read, administrators change
+        let (sc, _) = ask("alice", "GET", "/kv/namespaces", Value::Null).await;
+        assert_eq!(sc, StatusCode::OK);
+        for (method, path) in [("POST", "/kv/namespaces"), ("POST", "/d1/database"), ("POST", "/rules/lists"), ("PUT", "/workers/scripts/w")] {
+            let (sc, b) = ask("alice", method, path, json!({ "title": "x", "name": "x", "kind": "ip" })).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN, "{method} {path}: {}", String::from_utf8_lossy(&b));
+        }
+
+        // Workers run the administrators' code: no routes or e-mail rules to them from users
+        let (sc, _) = ask("alice", "POST", &format!("/zones/{mine}/workers/routes"), json!({ "pattern": "alice.example.com/*", "script": "w" })).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let rules = format!("/zones/{mine}/email/rules");
+        let (sc, _) = ask("alice", "POST", &rules, json!({ "address": "hi", "action": "worker", "worker": "w" })).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, b) = ask("alice", "POST", &rules, json!({ "address": "hi", "action": "forward", "destinations": ["owner@example.net"] })).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let rule = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let (sc, _) = ask("alice", "PATCH", &format!("{rules}/{rule}"), json!({ "worker": "w" })).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "nor turned into one");
+        let (sc, _) = ask("alice", "PATCH", &format!("{rules}/{rule}"), json!({ "description": "mine" })).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        // analytics count only the zones one sees
+        let (_, b) = ask("alice", "GET", "/analytics", Value::Null).await;
+        let zones = json_of(&b)["result"]["zones"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(zones, [mine.clone()]);
+
+        // a token reaches no further than its user, even one for every zone
+        let spec = json!({ "name": "all", "policies": [{ "effect": "allow", "resources": { "com.cloudflare.api.account.zone.*": "*" },
+            "permission_groups": [{ "name": "Zone Read" }, { "name": "DNS Write" }] }] });
+        let (sc, b) = ask("alice", "POST", "/user/tokens", spec).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let bearer = format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap());
+        let with = vec![("authorization", bearer.as_str()), ("content-type", "application/json")];
+        let (_, _, b) = call_raw(&mut app, "GET", "/client/v4/zones", with.clone(), vec![]).await;
+        assert_eq!(names(&b), ["alice.example.com"]);
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{theirs}/dns_records"), with.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _, _) = call_raw(&mut app, "POST", &format!("/client/v4/zones/{theirs}/dns_records"), with.clone(), writes[0].2.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{mine}/dns_records"), with.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        // an administrator gives bob's zone to alice, then to nobody
+        for bad_owner in [json!("0123456789abcdef0123456789abcdef"), json!(7), json!({ "id": 7 })] {
+            let (sc, _) = call(&mut app, "PATCH", &format!("/client/v4/zones/{theirs}"), json!({ "owner": bad_owner, "paused": true }).to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{bad_owner}");
+            assert!(!st.store.get_zone(&theirs).unwrap().paused, "a refused owner changes nothing else");
+        }
+        let (sc, b) = call(&mut app, "PATCH", &format!("/client/v4/zones/{theirs}"), json!({ "owner": { "id": alice_id } }).to_string().into_bytes()).await;
+        assert_eq!((sc, json_of(&b)["result"]["owner"]["id"].clone()), (StatusCode::OK, alice_id.clone()));
+        let (sc, _) = ask("alice", "GET", &format!("/zones/{theirs}/dns_records"), Value::Null).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = ask("bob", "GET", &format!("/zones/{theirs}"), Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "bob gave it up");
+        let (sc, b) = call(&mut app, "PATCH", &format!("/client/v4/zones/{theirs}"), json!({ "owner": null }).to_string().into_bytes()).await;
+        assert_eq!((sc, json_of(&b)["result"]["owner"]["id"].clone()), (StatusCode::OK, Value::Null));
+        let (sc, _) = ask("alice", "GET", &format!("/zones/{theirs}"), Value::Null).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(dir);
     }

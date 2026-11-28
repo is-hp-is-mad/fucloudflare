@@ -1076,7 +1076,14 @@ const ZONE = {
           "<b>没有推送任务</b>需要把日志存到别处时，添加一个推送任务。")) };
   },
   async manage(z) {
-    return { sub: "接入方式、暂停与删除。", body:
+    // who the zone belongs to: administrators see and change it (others only ever see their own zones)
+    let owner = "";
+    if (me.role === "admin") {
+      const users = await api("GET", "/users"), id = z.owner && z.owner.id, u = users.find(u => u.id === id);
+      owner = card("归属", "", setRow("归属用户", id ? `属于 <code>${esc(u ? u.email : id)}</code>${u ? "" : "（这个用户已不存在）"}。只有这个用户和管理员能看到、修改这个域名。` : "没有归属用户，只有管理员能看到。",
+        btn("zoneOwner", "更改", {}, "sm")));
+    }
+    return { sub: "接入方式、归属、暂停与删除。", body: owner +
       card("接入", "", setRow(`接入方式 ${modeTag(z)}`, z.type === "full" ? "完全托管：域名的 NS 指向本平台，全部 DNS 记录在这里管理。" : z.type === "cert" ? "仅证书：本平台只为这个域名签发和续期证书（在“SSL/TLS”里管理），不解析、不代理。DNS 留在原服务商，只需加一条 _acme-challenge CNAME。" : "CNAME 接入：DNS 留在原服务商，只把要加速的主机名 CNAME 过来。", z.type === "cert" ? "" : btn("zoneKind", z.type === "full" ? "改为 CNAME 接入" : "改为完全托管 (NS)")) +
         setRow(z.paused ? "恢复域名" : "暂停域名", z.paused ? "域名已暂停：已代理的记录直接解析到源站。" : "停止代理，已代理的记录直接解析到源站，不经过 CDN 与 WAF。", btn("zonePause", z.paused ? "恢复" : "暂停"))) +
       card("删除", "", setRow("删除域名", "删除这个域名及其全部记录、规则和证书，无法恢复。", btn("zoneDel", "删除域名", {}, "outbad")), "danger") };
@@ -1719,6 +1726,12 @@ const A = {
     const full = C.zone.type === "full";
     if (!(await confirmBox(full ? "改为 CNAME 接入？" : "改为完全托管？", full ? "域名不再由本平台的名称服务器托管，需要在原 DNS 服务商处为每个主机名添加 CNAME。" : "需要在注册商处把域名的 NS 改为本平台的名称服务器，这里的记录才会对外生效。", "切换", false))) return;
     await api("PATCH", "/zones/" + S.zone, { type: full ? "partial" : "full" }); toast("已切换接入方式"); render();
+  },
+  zoneOwner: async () => {
+    const users = await api("GET", "/users");
+    openForm("更改归属", [{ k: "owner", label: "归属用户", type: "select", options: [["", "无（只有管理员可见）"], ...users.map(u => [u.id, u.email])] }],
+      { owner: (C.zone.owner && C.zone.owner.id) || "" },
+      v => api("PATCH", "/zones/" + S.zone, { owner: v.owner || null }));
   },
   zonePause: async () => {
     const paused = C.zone.paused;

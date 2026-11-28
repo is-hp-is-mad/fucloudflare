@@ -410,6 +410,11 @@ def accounts():
           and call("POST", "/nodes", {"name": "rogue", "ipv4": "203.0.113.99"}, token=viewer)[0] == 403
           and call("POST", "/fleet/local/actions", {"action": "purge_cache"}, token=viewer)[0] == 403,
           "an editor changes the configuration, not the users or the nodes")
+    others = [z["id"] for z in call("GET", "/zones", token=owner)[1] if z["name"] != "editor.test"]
+    check([z["name"] for z in call("GET", "/zones", token=viewer)[1]] == ["editor.test"]
+          and all(call("GET", f"/zones/{z}", token=viewer)[0] == 404 for z in others)
+          and call("POST", "/kv/namespaces", {"title": "x"}, token=viewer)[0] == 403,
+          "an editor sees only the zones they made, and changes no account-level objects")
     owner_id = me["id"]
     check(call("PATCH", f"/users/{owner_id}", {"role": "viewer"}, token=owner)[0] == 409 and call("DELETE", f"/users/{owner_id}", token=owner)[0] == 409, "the last administrator stays one")
     check(call("PATCH", f"/users/{uid}", {"disabled": True}, token=owner)[0] == 200 and call("GET", "/zones", token=viewer)[0] == 401
