@@ -154,7 +154,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 评估逻辑写成不依赖时钟和网络的纯函数（输入机群状态，输出告警集合），便于测试。
 - 测试：各事件的触发与恢复；重发间隔；启动宽限期；打码。
 
-### [ ] T7 请求日志
+### [x] T7 请求日志
 
 - 目标：能看到最近的每一个请求，并能推送到外部。新文件 `src/edge/reqlog.rs`。
 - 每个节点在内存里保留最近 5000 条：时间、ray、节点、域名、主机、方法、路径（不含查询串，最长 512 字节）、状态码、
@@ -264,6 +264,12 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 接口 `/alerts/channels`（增删改查）、`/alerts/channels/{id}/test`、`/alerts/active`。输出里令牌和 Webhook 地址打码，原样送回打码值保留原密钥；写操作只限管理员，令牌要新的账户级 Notifications Read / Write。Webhook 只接受 https 和公网地址，发送时也拒绝解析到内网的名字，不跟随跳转。
 - 近似处理：Fleet 没有"上次同步时间"，`sync_lagging` 用"在线但连续 5 分钟未同步"；`origin_errors` 阈值固定为 5 分钟内 3 次；证书只看证书包，不看各节点自己的站点证书。
 - 拿不准：多个 peer 都没设 `--panel-origin` 时，每个 peer 都满足条件，会各发一份；通道和其他全局密钥一样随配置同步、进备份；没有做 Cloudflare `/accounts/{id}/alerting` 的兼容路径。
+
+### T7
+
+- 新文件 `src/edge/reqlog.rs`：每个节点内存里一个 5000 条的环形缓冲（锁内只做入队出队和取 Arc），序号连续，游标就是序号。比最旧还旧的游标从最旧开始并返回 `gap: true`，比最新还新的游标返回空和当前最新游标。在 `respond(` 里 `edge.stats.record(` 旁边一行接入；method、ASN、UA 加进了 `Seen`。
+- 接口 `GET /zones/{id}/logs/requests`（参数写错一律 400）；推送任务 `LogJob` 按 `Item` 存储，走 `/zones/{id}/logpush/jobs`（照 Cloudflare 的路径）。新的域名级令牌区域 `Logs`（Logs Read / Write），`Analytics Read` 看不到日志；面板里只有管理员能写推送任务。推送循环在所有节点上跑，NDJSON，10 秒超时，失败丢弃并记一条只含主机名的警告。
+- 没把握：`bytes` 是响应声明的长度（流式无长度时为 null），`duration_ms` 只算到响应头；质询不区分 js_challenge 和 managed_challenge；推送目标禁止内网（局域网收集器用不了）；多个推送任务串行发送；没有对真实 HTTPS 收集器跑过；Logs Read 能看到推送目标地址（地址里若带令牌也看得到）。
 
 ## 5. 部署（通过 Komari）
 

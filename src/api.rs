@@ -219,6 +219,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/alerts/channels/{channel_id}", get(get_alert_channel).put(update_alert_channel).patch(update_alert_channel).delete(delete_alert_channel))
         .route("/alerts/channels/{channel_id}/test", post(test_alert_channel))
         .route("/alerts/active", get(active_alerts))
+        .route("/zones/{zone_id}/logs/requests", get(request_log))
+        .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -443,7 +445,9 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
         || under("/replication")
         || under("/backup")
         || path.starts_with("/releases/")
-        || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || under("/alerts") || path.contains("/spectrum/apps")));
+        || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || under("/alerts") || path.contains("/spectrum/apps")))
+        // a log job sends visitor addresses off this fleet
+        || (!reads && path.contains("/logpush/jobs"));
     match role {
         Role::Admin => true,
         Role::Editor => own || !admins,
@@ -2623,6 +2627,14 @@ async fn analytics(State(st): St, Path(zone_id): Path<String>, Query(q): Params)
     ok(st.stats.report(&zone_id, &st.node(), window(&q, 1440)?, step))
 }
 
+/// The newest requests of one zone, as the node answering this call saw
+/// them (crate::edge::reqlog): other nodes keep their own.
+async fn request_log(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    let query = crate::edge::reqlog::LogQuery::parse(&zone_id, &q).map_err(bad)?;
+    ok(st.edge.reqlog.answer(&query, &st.node()))
+}
+
 /// Traffic totals of every zone.
 async fn analytics_summary(State(st): St, Query(q): Params) -> ApiResult {
     let window = window(&q, 1440)?;
@@ -3640,6 +3652,112 @@ mod tests {
         let (sc, _, _) = call_raw(&mut app, "GET", &format!("{base}/{fw_id}"), auth2(), vec![]).await;
         assert_eq!(sc, StatusCode::FORBIDDEN);
         assert_eq!(st.store.items::<TransformRule>(&z).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_request_log_answers_per_zone_and_needs_the_logs_permission() {
+        use crate::edge::reqlog::sample;
+        let dir = std::env::temp_dir().join(format!("fucf-api-reqlog-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("editor@example.com", Role::Editor, Some("strong-pass-123"), "editor@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("viewer@example.com", Role::Viewer, Some("strong-pass-123"), "viewer@example.com", &Client::default()).unwrap();
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (admin, editor, viewer) = (session("admin@example.com"), session("editor@example.com"), session("viewer@example.com"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let z = zone.id.clone();
+        st.edge.reqlog.push(sample(&z, 404, "/a"));
+        st.edge.reqlog.push(sample(&other.id, 500, "/b"));
+        st.edge.reqlog.push(sample(&z, 200, "/c"));
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let logs = format!("/client/v4/zones/{z}/logs/requests");
+
+        let (sc, b) = call(&mut app, "GET", &logs, vec![]).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let r = &json_of(&b)["result"];
+        assert_eq!(r["entries"].as_array().unwrap().iter().map(|e| e["path"].clone()).collect::<Vec<_>>(), vec![json!("/a"), json!("/c")], "only this zone");
+        assert_eq!((r["cursor"].clone(), r["gap"].clone()), (json!(3), json!(false)));
+        assert!(r["node"].is_string());
+        assert_eq!(r["entries"][0]["client_ip"], "192.0.2.10");
+        let (_, b) = call(&mut app, "GET", &format!("{logs}?status=4xx"), vec![]).await;
+        assert_eq!(json_of(&b)["result"]["entries"].as_array().unwrap().len(), 1);
+        let (_, b) = call(&mut app, "GET", &format!("{logs}?since=1&path=/c"), vec![]).await;
+        assert_eq!(json_of(&b)["result"]["entries"][0]["seq"], 3);
+        for since in ["3", "99"] {
+            let (sc, b) = call(&mut app, "GET", &format!("{logs}?since={since}"), vec![]).await;
+            assert_eq!(sc, StatusCode::OK);
+            assert_eq!((json_of(&b)["result"]["entries"].as_array().unwrap().len(), json_of(&b)["result"]["cursor"].clone()), (0, json!(3)), "since={since}");
+        }
+        for bad in ["limit=0", "limit=1001", "status=abc", "status=", "since=-1", "since=x", "ip=nope", "path=c", "host=a%20b", "foo=1"] {
+            let (sc, b) = call(&mut app, "GET", &format!("{logs}?{bad}"), vec![]).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{bad}: {}", String::from_utf8_lossy(&b));
+        }
+        let (sc, _) = call(&mut app, "GET", "/client/v4/zones/no-such-zone/logs/requests", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // log jobs
+        let jobs = format!("/client/v4/zones/{z}/logpush/jobs");
+        let (sc, _) = call(&mut app, "POST", &jobs, json!({ "name": "j", "destination": "http://logs.example.com/in" }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "plain http is refused");
+        let (sc, _) = call(&mut app, "POST", &jobs, b"not json".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let (sc, b) = call(&mut app, "POST", &jobs, json!({ "name": "errors", "destination": "https://logs.example.com/in", "status_min": 500 }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let job_id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        assert_eq!(json_of(&b)["result"]["zone_id"], json!(z));
+        let (_, b) = call(&mut app, "GET", &jobs, vec![]).await;
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().len(), 1);
+        let (sc, _) = call(&mut app, "GET", &format!("/client/v4/zones/{}/logpush/jobs/{job_id}", other.id), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "a job belongs to one zone");
+        let (sc, _) = call(&mut app, "PATCH", &format!("{jobs}/{job_id}"), br#"{"batch_seconds":1}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+
+        // panel roles: everyone who sees the zone reads the log, only admins send it elsewhere
+        let with = |bearer: &str| vec![("authorization", bearer.to_string()), ("content-type", "application/json".to_string())];
+        let new_job = json!({ "name": "x", "destination": "https://logs.example.com/x" }).to_string();
+        for bearer in [&viewer, &editor] {
+            let h = with(bearer);
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (sc, _, _) = call_raw(&mut app, "GET", &logs, h.clone(), vec![]).await;
+            assert_eq!(sc, StatusCode::OK);
+            let (sc, _, _) = call_raw(&mut app, "POST", &jobs, h.clone(), new_job.clone().into_bytes()).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN);
+            let (sc, _, _) = call_raw(&mut app, "DELETE", &format!("{jobs}/{job_id}"), h, vec![]).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN);
+        }
+
+        // tokens: analytics is not enough, logs is per zone, writing needs Logs Write
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let h = vec![("authorization", admin.as_str()), ("content-type", "application/json")];
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h, spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let analytics = token("Analytics Read").await;
+        let read = token("Logs Read").await;
+        let write = token("Logs Write").await;
+        let mut as_token = async |bearer: &str, method: &str, path: &str, body: Vec<u8>| {
+            call_raw(&mut app, method, path, vec![("authorization", bearer), ("content-type", "application/json")], body).await.0
+        };
+        assert_eq!(as_token(&analytics, "GET", &logs, vec![]).await, StatusCode::FORBIDDEN, "visitor addresses need the logs permission");
+        assert_eq!(as_token(&read, "GET", &logs, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "GET", &jobs, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "GET", &format!("/client/v4/zones/{}/logs/requests", other.id), vec![]).await, StatusCode::FORBIDDEN, "another zone");
+        assert_eq!(as_token(&read, "POST", &jobs, new_job.clone().into_bytes()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&write, "POST", &jobs, new_job.clone().into_bytes()).await, StatusCode::OK);
+        assert_eq!(as_token(&write, "DELETE", &format!("{jobs}/{job_id}"), vec![]).await, StatusCode::OK);
+        assert_eq!(st.store.items::<crate::edge::reqlog::LogJob>(&z).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -88,6 +88,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 /zones/{id}/email                        GET              区域邮件路由开关、规则、当前 MX/SPF 及缺失的建议 DNS 记录
 /zones/{id}/email/rules[/{id}]           CRUD             {"address", "action": "forward|drop", "destinations": [...], "enabled", "description"}
 /zones/{id}/analytics                    GET              ?since=-1440（分钟）| 90m | 24h | 7d（默认 24h，最长 30d），?step= 分钟
+/zones/{id}/logs/requests                GET              应答节点上这个区域最近的请求：?since=游标 &limit= &status=404|5xx &host= &path=前缀 &ip=，见“请求日志”
+/zones/{id}/logpush/jobs[/{id}]          CRUD             {"name", "destination": "https://...", "enabled", "status_min", "batch_seconds"}
 /zones/{id}/spectrum/apps[/{id}]         CRUD             {"protocol":"tcp/2222", "dns":{"name":"ssh"}, "origin_direct":["tcp://192.0.2.1:22"], "proxy_protocol":"off|v1"}
 /zones/{id}/workers/routes[/{id}]        CRUD             {"pattern":"example.com/api/*", "script":"name"}
 /workers/scripts[/{name}]                GET PUT DELETE   PUT 的请求体即 JS 源码
@@ -435,6 +437,22 @@ DNS 记录的 Cloudflare 兼容补充：
   `not ip.src in $名字` 则匹配所有地址。
 - 列表一改，用它的规则立即跟着变：快照重建时规则会用新的地址重新编译。
 - 令牌：账户级的 Account Filter Lists Read / Write；只有域名权限的令牌碰不到列表。
+
+## 请求日志
+
+每个节点在内存里保留自己最近的 **5000 条**请求（所有域名合计，重启即清空，不写盘、不在节点之间同步）。
+**日志含访客 IP**，另有时间、Ray ID、节点、主机、方法、路径（不含查询串，最长 512 字节）、状态码、缓存状态、字节数、耗时、
+国家、ASN、User-Agent（最长 256 字节）、协议版本和被安全规则处理的动作（拦截 / 质询 / 限速）。
+
+- 面板：域名 → 实时日志，每 2 秒用游标拉一次，可按状态码（`404` 或 `5xx`）和路径前缀过滤，离开页面就停。
+- 接口 `GET /zones/{id}/logs/requests` **只回答应答这次请求的那个节点上的日志**；经面板域名访问时就是面板所在的节点，别的节点收到的请求看不到。
+  带上一次返回的 `cursor` 作为 `since` 继续拉；游标比最旧的一条还旧时从最旧的开始（`gap: true` 表示中间有请求没来得及读就被挤掉了），
+  比最新的还新（比如节点重启过）时什么都不返回，并给出当前最新的游标。参数写错或不认识一律 400。
+- 推送：域名 → 实时日志 → 日志推送（`/zones/{id}/logpush/jobs`）。每个节点每 `batch_seconds` 秒（10–3600，默认 60）
+  把自己收到的这个域名、状态码不低于 `status_min` 的请求以 NDJSON POST 到 `destination`。目标只能是 https，不能带用户名密码，
+  不能是内网、本机地址（解析到这些地址的域名在连接时拒绝）；任务从它到达节点之后的请求开始推。
+  10 秒内没有 2xx 应答就丢掉这一批，记一条警告，不重试。只有管理员能添加和修改推送任务。
+- 令牌权限是 `Logs Read` / `Logs Write`；`Analytics Read` 看不到日志（日志里有访客 IP）。
 
 ## 自动防火墙
 

@@ -741,6 +741,53 @@ async function rulesetSection(zid) {
     table(cols, rows, r => lk("rulesetEdit", "查看 / 编辑 JSON", { phase: r.phase })));
 }
 
+// Live request log of a zone: the answering node's newest requests, fetched with the cursor every
+// 2 seconds while the page is open. Leaving the page (or opening it again) ends the old loop:
+// every loop carries a generation number and stops as soon as it is not the current one.
+const LIVE = { gen: 0, timer: 0, zone: "", cursor: null, rows: [], status: "", path: "", node: "", err: "", gap: false, paused: false };
+const LIVE_KEEP = 500;
+const LACT = { block: "拦截", challenge: "质询", rate_limit: "限速" };
+const statusTag = s => `<span class="tag ${s >= 500 ? "bad" : s >= 400 ? "warn" : "ok"}">${esc(s)}</span>`;
+function liveDraw() {
+  const box = document.getElementById("livelog"), info = document.getElementById("liveinfo");
+  if (!box) return;
+  if (info) info.textContent = LIVE.err ? "拉取失败：" + LIVE.err
+    : `应答节点 ${LIVE.node || "—"} · 显示最近 ${LIVE.rows.length} 条${LIVE.paused ? " · 已暂停" : ""}${LIVE.gap ? " · 有请求在拉取前已被挤出缓冲区" : ""}`;
+  box.innerHTML = table([
+    { label: "时间", fmt: e => when(e.time) }, { label: "状态", fmt: e => statusTag(e.status) },
+    { label: "请求", fmt: e => `<span class="mono">${esc(e.method + " " + e.host + e.path)}</span>` },
+    { label: "缓存", fmt: e => esc(e.cache || "—") }, { label: "客户端", fmt: e => `<span class="mono">${esc(e.client_ip)}</span>${e.country ? " " + esc(e.country) : ""}${e.asn ? ` <span class="hint">AS${esc(e.asn)}</span>` : ""}` },
+    { label: "协议", fmt: e => esc(e.protocol) }, { label: "耗时", fmt: e => esc(e.duration_ms) + " ms", cls: "num" },
+    { label: "安全动作", fmt: e => (e.action ? `<span class="tag bad">${esc(LACT[e.action] || e.action)}</span>` : '<span class="hint">—</span>') },
+    { label: "Ray ID", fmt: e => `<span class="mono">${esc(e.ray)}</span>` }], LIVE.rows, null,
+    "<b>还没有请求</b>这个节点收到这个域名的请求后会出现在这里。");
+}
+function liveStart(zid) {
+  clearTimeout(LIVE.timer);
+  const gen = ++LIVE.gen;
+  if (LIVE.zone !== zid) Object.assign(LIVE, { zone: zid, cursor: null, rows: [], status: "", path: "", err: "", gap: false, paused: false });
+  const tick = async () => {
+    if (gen !== LIVE.gen) return;
+    if (!document.getElementById("livelog") || S.view !== "zone" || S.tab !== "logs" || S.zone !== zid) { LIVE.gen++; return; }
+    if (!document.hidden && !LIVE.paused) {
+      const q = new URLSearchParams({ limit: "200" });
+      if (LIVE.cursor !== null) q.set("since", LIVE.cursor);
+      if (LIVE.status) q.set("status", LIVE.status);
+      if (LIVE.path) q.set("path", LIVE.path);
+      try {
+        const r = await api("GET", `/zones/${zid}/logs/requests?${q}`);
+        if (gen !== LIVE.gen) return;
+        LIVE.rows = r.entries.reverse().concat(LIVE.rows).slice(0, LIVE_KEEP);
+        Object.assign(LIVE, { cursor: r.cursor, node: r.node, gap: r.gap, err: "" });
+      } catch (e) { if (gen !== LIVE.gen) return; LIVE.err = e.message; }
+      liveDraw();
+    }
+    LIVE.timer = setTimeout(tick, 2000);
+  };
+  liveDraw();
+  tick();
+}
+
 // ---------------------------------------------------------------- views ----
 const zh = tab => `#/zone/${esc(S.zone)}/${tab}`;
 const protoChips = s => chips(["HTTP/1.1", s.http2 && "HTTP/2", s.http3 && "HTTP/3"].filter(Boolean));
@@ -862,7 +909,7 @@ async function viewZones() {
 }
 
 const ZNAV = [["overview", "概览", "grid"], ["dns", "DNS 记录", "list"], ["ssl", "SSL/TLS", "lock"], ["security", "安全", "shield"], ["rules", "规则", "sliders"],
-  ["network", "网络与协议", "network"], ["caching", "缓存", "bolt"], ["workers", "Workers 路由", "code"], ["email", "电子邮件", "mail"], ["analytics", "分析与事件", "chart"], ["manage", "域名管理", "gear"]];
+  ["network", "网络与协议", "network"], ["caching", "缓存", "bolt"], ["workers", "Workers 路由", "code"], ["email", "电子邮件", "mail"], ["analytics", "分析与事件", "chart"], ["logs", "实时日志", "data"], ["manage", "域名管理", "gear"]];
 const ZONE = {
   async overview(z) {
     const [a, recs] = await Promise.all([api("GET", `/zones/${z.id}/analytics`), api("GET", `/zones/${z.id}/dns_records?per_page=5000`)]);
@@ -987,6 +1034,24 @@ const ZONE = {
         { label: "状态码", fmt: e => `<span class="tag bad">${esc(e.rule_id)}</span>` }, { label: "原因与修复", fmt: e => `<div style="white-space:normal;max-width:46em">${esc(e.description)}</div>` },
         { label: "请求", fmt: e => `<span class="mono">${esc(e.method + " " + e.host + e.uri)}</span>` }, { label: "Ray ID", fmt: e => `<span class="mono">${esc(e.ray_id)}</span>` }], oe, null,
         "<b>没有回源错误</b>边缘连不上源站或源站配置有误时会记在这里（同一主机同一状态码每分钟最多一条），访客只看到错误类别；完整细节按 Ray ID 在节点日志（journalctl -u fucf）里查。")) };
+  },
+  async logs(z) {
+    const jobs = C.logJobs = await api("GET", `/zones/${z.id}/logpush/jobs?per_page=1000`);
+    if (LIVE.zone !== z.id) Object.assign(LIVE, { zone: z.id, cursor: null, rows: [], status: "", path: "", err: "", gap: false, paused: false });
+    setTimeout(() => liveStart(z.id));
+    const filters = `<div class="cb" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <input id="lvStatus" placeholder="状态码，如 404 或 5xx" value="${esc(LIVE.status)}" aria-label="按状态码过滤" style="width:13em">
+      <input id="lvPath" placeholder="路径前缀，如 /api" value="${esc(LIVE.path)}" aria-label="按路径前缀过滤" style="width:16em">
+      ${btn("liveFilter", "过滤", {}, "pri sm")}${btn("liveClear", "清空列表", {}, "sm")}${btn("livePause", LIVE.paused ? "继续" : "暂停", {}, "sm", 'id="lvPause"')}
+      <span class="hint" id="liveinfo"></span></div>`;
+    return { sub: "这个域名最近的请求，每 2 秒刷新。只有应答这个页面的节点上的请求：每个节点在内存里各保留最近 5000 条（所有域名合计），含访客 IP。", body:
+      card("实时日志", "", filters + '<div id="livelog"></div>') +
+      card(`日志推送 <span class="cnt">${jobs.length}</span>`, btn("logJobEdit", "添加", {}, "pri sm"),
+        `<p class="hint" style="padding:0 16px">每个节点把自己收到的这个域名的请求按批以 NDJSON POST 到目标地址（只能是 https）。推送失败的那一批直接丢弃、不重试。只有管理员能添加和修改。</p>` +
+        table([{ k: "name", label: "名称" }, { label: "目标地址", fmt: j => `<span class="mono">${esc(j.destination)}</span>` },
+          { label: "状态码下限", fmt: j => (j.status_min ? esc(j.status_min) : '<span class="hint">全部</span>') }, { label: "间隔", fmt: j => esc(j.batch_seconds) + " 秒" },
+          { k: "enabled", label: "启用", fmt: colFmt("enabled") }], jobs, j => rowActs("logJobEdit", "logJobDel", { id: j.id }),
+          "<b>没有推送任务</b>需要把日志存到别处时，添加一个推送任务。")) };
   },
   async manage(z) {
     return { sub: "接入方式、暂停与删除。", body:
@@ -1692,6 +1757,28 @@ const A = {
       { k: "rules", label: "rules (JSON)", type: "json", defJson: [] }], { rules: rs.rules },
       v => api("PUT", `/zones/${S.zone}/rulesets/phases/${d.phase}/entrypoint`, { rules: v.rules }), true);
   },
+  liveFilter: () => {
+    const status = document.getElementById("lvStatus").value.trim(), path = document.getElementById("lvPath").value.trim();
+    if (status && !/^([1-5]\d\d|[1-5]xx)$/i.test(status)) throw new Error("状态码写成 404 这样的三位数，或 5xx 这样的一类");
+    if (path && !path.startsWith("/")) throw new Error("路径前缀要以 / 开头");
+    Object.assign(LIVE, { status, path, cursor: null, rows: [], err: "", gap: false });
+    liveStart(S.zone);
+  },
+  liveClear: () => { LIVE.rows = []; LIVE.gap = false; liveDraw(); },
+  livePause: () => {
+    LIVE.paused = !LIVE.paused;
+    const b = document.getElementById("lvPause");
+    if (b) b.textContent = LIVE.paused ? "继续" : "暂停";
+    liveDraw();
+  },
+  logJobEdit: d => openForm(d.id ? "编辑日志推送" : "添加日志推送", [
+    { k: "name", label: "名称" },
+    { k: "destination", label: "目标地址", hint: "https:// 开头；令牌可以放在路径或查询串里。内网、本机地址会被拒绝" },
+    { k: "status_min", label: "状态码下限（0 为全部）", type: "number", min: 0, max: 599, def: 0 },
+    { k: "batch_seconds", label: "推送间隔（秒，10–3600）", type: "number", min: 10, max: 3600, def: 60 },
+    { k: "enabled", label: "启用", type: "check", def: true }],
+    d.id ? byId("logJobs", d.id) : {}, v => api(d.id ? "PUT" : "POST", `/zones/${S.zone}/logpush/jobs` + (d.id ? "/" + d.id : ""), v)),
+  logJobDel: d => del(`/zones/${S.zone}/logpush/jobs/${d.id}`, "这个推送任务"),
   emailDns: async () => {
     const e = await api("GET", `/zones/${S.zone}/email`);
     for (const r of e.needed_records || []) await api("POST", `/zones/${S.zone}/dns_records`, r);

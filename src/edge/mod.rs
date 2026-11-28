@@ -13,6 +13,7 @@ pub mod front;
 pub mod h3;
 pub mod proxy;
 pub mod quic_mux;
+pub mod reqlog;
 pub mod stats;
 pub mod tls;
 pub mod upstream;
@@ -698,6 +699,10 @@ struct Seen {
     host: String,
     path: String,
     country: String,
+    /// For the request log (crate::edge::reqlog).
+    method: Method,
+    asn: u32,
+    user_agent: String,
 }
 
 /// Counts the body bytes handed to the client and books them once the
@@ -997,6 +1002,8 @@ pub struct Edge {
     /// How bad visitors' addresses look (threat scores).
     pub reputation: std::sync::OnceLock<Arc<reputation::Reputation>>,
     pub stats: Arc<stats::Stats>,
+    /// The newest requests this node answered, for the API and the log jobs.
+    pub reqlog: reqlog::RequestLog,
     /// This node's traffic allowance and speed limit.
     pub limits: Arc<crate::limits::Limits>,
     /// This node's mainland-China (GFW) reachability status.
@@ -1275,6 +1282,7 @@ impl Edge {
             geo: Default::default(),
             reputation: Default::default(),
             stats: Default::default(),
+            reqlog: Default::default(),
             limits: Default::default(),
             gfw: Default::default(),
             assets_host: Default::default(),
@@ -2077,6 +2085,9 @@ impl Edge {
             host: info.host.clone(),
             path: info.path.clone(),
             country: info.country.clone(),
+            method: req.method().clone(),
+            asn: u32::try_from(info.asn).unwrap_or(0),
+            user_agent: reqlog::clip(info.header("user-agent"), reqlog::UA_MAX).to_string(),
         });
         if req.version() == hyper::Version::HTTP_3 && !settings.http3 {
             return Err(EdgeError::new(421, "Misdirected request", "HTTP/3 is not enabled for this site"));
@@ -2444,6 +2455,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     let internal = cgi::is_fucf_node(peer.ip().to_canonical(), &edge.store.snapshot().nodes);
     let is_cdn = seen.is_some();
     if let Some(seen) = seen {
+        reqlog::record(&edge, &seen, &ray, peer.ip().to_canonical(), version, &resp, started.elapsed());
         edge.stats.record(stats::Sample {
             zone_id: &seen.zone_id,
             version,

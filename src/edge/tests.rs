@@ -2141,3 +2141,45 @@ async fn a_node_named_by_its_address_answers_sync_itself() {
     send(&env, "GET", "panel.example.net", "/client/v4/zones", "fucf-sync-direct: seal\r\n", "").await;
     assert!(tried());
 }
+
+#[tokio::test]
+async fn every_answered_request_lands_in_the_request_log() {
+    let env = setup().await;
+    let all = || reqlog::Filter { zone_id: env.zone.clone(), ..Default::default() };
+    let ua = format!("Mozilla/5.0 {}", "中".repeat(100));
+    let r = send(&env, "POST", "www.example.com", "/submit/form?token=test-token", &format!("User-Agent: {ua}\r\n"), "a=1").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let page = env.edge.reqlog.query(None, 10, &all());
+    assert_eq!(page.entries.len(), 1);
+    let (seq, e) = &page.entries[0];
+    assert_eq!(*seq, 1);
+    assert_eq!((e.method.as_str(), e.host.as_str(), e.path.as_str(), e.status), ("POST", "www.example.com", "/submit/form", 200), "no query string");
+    assert_eq!(e.zone_id, env.zone);
+    assert_eq!(Some(e.ray.as_str()), r.header("fucf-ray"), "the ray the visitor was given");
+    assert_eq!((e.cache.as_str(), e.protocol, e.action), ("DYNAMIC", "HTTP/1.1", ""));
+    assert_eq!(e.client_ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(e.node, "local");
+    assert!(e.user_agent.len() <= reqlog::UA_MAX && ua.starts_with(e.user_agent.as_str()), "{}", e.user_agent);
+    assert!(e.user_agent.len() > reqlog::UA_MAX - 3, "cut at the last whole character");
+
+    // blocked and challenged requests are logged with what was done to them
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "starts_with(http.request.uri.path, \"/admin\")", "action": "block" }), true)
+        .unwrap();
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "http.request.uri.path eq \"/shop\"", "action": "js_challenge" }), true)
+        .unwrap();
+    assert_eq!(get(&env, "example.com", "/admin/users").await.status, 403);
+    assert_eq!(get(&env, "example.com", "/shop").await.status, 403);
+    let long = format!("/{}", "a".repeat(reqlog::PATH_MAX + 50));
+    get(&env, "example.com", &long).await;
+    let page = env.edge.reqlog.query(Some(1), 10, &all());
+    let got: Vec<(u16, &str, usize)> = page.entries.iter().map(|(_, e)| (e.status, e.action, e.path.len())).collect();
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[..2], [(403, "block", "/admin/users".len()), (403, "challenge", "/shop".len())]);
+    assert_eq!(got[2].2, reqlog::PATH_MAX, "long paths are cut");
+
+    // hosts that belong to no zone are in nobody's log
+    assert_eq!(get(&env, "other.org", "/").await.status, 404);
+    assert_eq!(env.edge.reqlog.newest(), 4);
+}

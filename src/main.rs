@@ -631,6 +631,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     let edge = Arc::new(edge);
+    // every node, whatever its role, pushes the requests it answered to the zones' log jobs
+    edge::reqlog::spawn_push(edge.clone());
     let mut edge_listeners = Vec::new();
     for (what, addr, tls) in [("HTTP", &args.http_listen, false), ("HTTPS", &args.https_listen, true)] {
         if addr == "off" {

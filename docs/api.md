@@ -90,6 +90,7 @@ by `id` or by `name`:
 | Email Routing Rules Read / Write | zone | `/zones/{id}/email…` |
 | Zone Spectrum Read / Write | zone | `/zones/{id}/spectrum/apps` |
 | Analytics Read | zone | `/zones/{id}/analytics` |
+| Logs Read / Logs Write | zone | `/zones/{id}/logs/requests` (visitor addresses included), `/zones/{id}/logpush/jobs` (Write: change jobs) |
 | Workers Scripts, Workers KV Storage, D1 Read / Write | account | `/workers/scripts…`, `/kv/…`, `/d1/…` |
 | Fleet Read / Write | account | nodes, fleet actions, steering, local proxy rules, releases |
 | Notifications Read / Write | account | `/alerts…` (alert channels, test messages, active alerts) |
@@ -592,6 +593,57 @@ One app per protocol and port across the fleet; `proxy_protocol` is for TCP only
 ```
 GET    /analytics                         every zone: ?since=24h (90m, 24h, 7d, or minutes like -1440; at most 30d)
 GET    /zones/{id}/analytics              one zone: ?since= as above, ?step= minutes
+```
+
+### Request log
+
+```
+GET    /zones/{id}/logs/requests          the newest requests of the zone on the node that answers
+CRUD   /zones/{id}/logpush/jobs           {"name", "destination", "enabled", "status_min", "batch_seconds"}
+```
+
+Every node keeps its own newest 5000 requests in memory (all zones together, lost on restart) and
+answers only from those: behind the panel host that is the panel's node. Entries hold the visitor's
+address. Parameters of `GET …/logs/requests`, all optional; an unknown, empty or malformed one is a 400:
+
+| Parameter | Meaning |
+|---|---|
+| `since` | the `cursor` of an earlier answer: entries after it, oldest first. Without it: the newest entries |
+| `limit` | 1 to 1000 (default 100) |
+| `status` | an exact code (`404`) or a class (`5xx`) |
+| `host` | exact host name |
+| `path` | path prefix, starting with `/` |
+| `ip` | the visitor's address (exact) |
+
+```json
+{ "entries": [{ "seq": 41, "time": "2026-01-01T00:00:00.000Z", "ray": "0123456789abcdef", "node": "ams",
+    "zone_id": "…", "host": "www.example.com", "method": "GET", "path": "/api/items", "status": 200,
+    "cache": "MISS", "bytes": 512, "duration_ms": 12, "client_ip": "192.0.2.10", "country": "NL",
+    "asn": 64496, "user_agent": "curl/8.5.0", "protocol": "HTTP/2", "action": "" }],
+  "cursor": 41, "gap": false, "node": "ams" }
+```
+
+- Poll with `since` set to the last `cursor`. The cursor moves past entries the filters skipped, so a
+  filtered poll does not look at them again. A cursor older than the oldest entry kept starts from the
+  oldest one and sets `gap` (entries were dropped unread); a cursor beyond the newest entry (from before
+  the node restarted) gets nothing and the newest entry's number back.
+- `path` has no query string and is cut to 512 bytes, `user_agent` to 256 bytes (at a character
+  boundary). `bytes` is the size the response declared, `null` for a body streamed without a length;
+  `duration_ms` runs until the response head was ready. `asn` is `null` when unknown. `action` is
+  `block`, `challenge` or `rate_limit` when the security rules stopped the request.
+- Tokens need `Logs Read` (reading the log and the jobs) or `Logs Write` (changing jobs) for the zone;
+  `Analytics Read` is not enough. In the panel only admins may create, change or delete jobs.
+
+A log job makes every node post its own entries of the zone to `destination` every `batch_seconds`
+(10 to 3600, default 60), as NDJSON (`application/x-ndjson`, one entry per line, fields as above), only
+requests with at least `status_min` (0, the default, for all; otherwise 100 to 599). A job starts with
+the requests that come after it reaches the node. `destination` must be `https://`, without a user name
+or password, and not a private, loopback or link-local address (names that resolve to one are refused
+when connecting). A batch that fails (no answer within 10 seconds, or not a 2xx) is dropped and logged
+once as a warning; it is not sent again.
+
+```json
+{ "name": "errors to the collector", "destination": "https://logs.example.com/ingest?token=test-token", "status_min": 500, "batch_seconds": 30 }
 ```
 
 ### The fleet

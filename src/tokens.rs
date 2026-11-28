@@ -61,6 +61,8 @@ pub enum Area {
     EmailRouting,
     Spectrum,
     Analytics,
+    /// The request log (visitor addresses included) and its push jobs.
+    Logs,
     WorkersScripts,
     WorkersKv,
     D1,
@@ -128,6 +130,8 @@ groups! {
     "3f4c3d0b2a6947a3b0c5d1e2f3a4b5c6" "Zone Spectrum Read" Spectrum false "Read Spectrum applications";
     "4a5d4e1c3b7a48b4c1d6e2f3a4b5c6d7" "Zone Spectrum Write" Spectrum true "Change Spectrum applications";
     "9c88f9c5bce24ce7af9a958ba9c504db" "Analytics Read" Analytics false "Read zone analytics";
+    "26b532d014a248b19255e21c73660d14" "Logs Read" Logs false "Read the request log (visitor addresses included) and the log push jobs";
+    "ddf5587f37134125868a20ce6a3f1420" "Logs Write" Logs true "Change the jobs that push the request log to another server";
     "1a71c399035b4950a1bd1466bbe4f420" "Workers Scripts Read" WorkersScripts false "Read Workers scripts and their settings";
     "e086da7e2179491d91ee5f35b3ca210a" "Workers Scripts Write" WorkersScripts true "Upload, configure, run and delete Workers scripts";
     "8b47d2786a534c08a1f94ee8f9f599ef" "Workers KV Storage Read" WorkersKv false "Read Workers KV namespaces and values";
@@ -195,6 +199,7 @@ pub fn need(path: &str) -> Need {
                 "email" => Area::EmailRouting,
                 "spectrum" => Area::Spectrum,
                 "analytics" => Area::Analytics,
+                "logs" | "logpush" => Area::Logs,
                 _ => return Need::Closed,
             };
             Need::Zone(area, Some(z.to_string()))
@@ -453,6 +458,9 @@ mod tests {
             need("/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint"),
             Need::Zone(Area::CacheRules, Some("z1".into()))
         );
+        assert_eq!(need("/zones/z1/logs/requests"), Need::Zone(Area::Logs, Some("z1".into())));
+        assert_eq!(need("/zones/z1/logpush/jobs/j1"), Need::Zone(Area::Logs, Some("z1".into())));
+        assert_eq!(need("/logpush/jobs"), Need::Closed);
     }
 
     #[test]
