@@ -94,11 +94,12 @@ by `id` or by `name`:
 | Fleet Read / Write | account | nodes, fleet actions, steering, local proxy rules, releases |
 | Account Analytics Read, Audit Logs Read | account | `/analytics`, `/audit` |
 | Backup Read | account | `GET /backup` (everything, secrets included: guard such a token) |
+| Account Filter Lists Read / Write | account | `/rules/lists…` (IP lists) |
 | API Tokens Read / Write | user | `/user/tokens…` |
 
 Cloudflare's account-level paths work too: `/accounts/{account id}/workers/scripts/…`,
 `/accounts/{account id}/storage/kv/namespaces/…`, `/accounts/{account id}/d1/database/…`,
-`/accounts/{account id}/tokens/…`.
+`/accounts/{account id}/tokens/…`, `/accounts/{account id}/rules/lists/…`.
 
 ## Zones and DNS records
 
@@ -161,7 +162,7 @@ doubtful), `managed_challenge` (always one click), `log`, `skip`. Expressions us
 language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.user_agent`,
 `http.request.headers["x"]`, `ip.src`, `ip.geoip.country`, `ip.geoip.continent`, `ip.geoip.asnum`,
 `ip.geoip.as_org`, `cf.threat_score` (also `fcf.threat_score`), with `eq ne lt le gt ge contains
-matches in {…} and or not`.
+matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
 
@@ -450,6 +451,62 @@ curl -s -X PUT $BASE/zones/$ZONE/rulesets/phases/http_request_late_transform/ent
     "action_parameters": { "headers": { "x-from-edge": { "operation": "set", "value": "1" } } }
   }]
 }'
+```
+
+### IP lists
+
+Named lists of addresses and networks for the whole account, used in the rules of any zone as
+`ip.src in $name`, as Cloudflare's account lists (also under `/accounts/{account id}/rules/lists…`).
+
+```
+GET    /rules/lists                                   every list, by name
+POST   /rules/lists                                   {"name", "description", "kind": "ip"}
+GET    /rules/lists/{list_id}
+PUT    /rules/lists/{list_id}                         {"name", "description"}: what is given changes (PATCH too)
+DELETE /rules/lists/{list_id}                         refused (409) while a rule uses the list
+GET    /rules/lists/{list_id}/items?search=           every item; search: in the address or the comment
+POST   /rules/lists/{list_id}/items                   [{"ip", "comment"}, …]: added
+PUT    /rules/lists/{list_id}/items                   [{"ip", "comment"}, …]: the list holds exactly these afterwards
+DELETE /rules/lists/{list_id}/items                   {"items": [{"id"}, …]}
+GET    /rules/lists/{list_id}/items/{item_id}
+GET    /rules/lists/bulk_operations/{operation_id}    {"id", "status": "completed", "completed"}
+```
+
+A list answers `id`, `name`, `description`, `kind` (`ip`), `num_items`, `num_referencing_filters` (the
+rules that use it, in every zone), `created_on`, `modified_on`; an item `id`, `ip`, `comment` (when
+there is one), `created_on`, `modified_on`. The three item changes answer `{"operation_id"}`, as on
+Cloudflare; here the change is done by then, and polling `bulk_operations` says `completed`.
+
+- `name`: lowercase letters, digits and `_`, 1 to 50 of them, unique. Only `kind` `ip` is kept:
+  hostname, ASN and redirect lists are refused.
+- `ip`: one IPv4 or IPv6 address, or a network in CIDR form. A network is written with its host bits
+  clear (`192.0.2.0/24`, not `192.0.2.1/24`: refused, the message says which network was meant); an
+  address is kept without its `/32` or `/128`; IPv6 is kept in its short lowercase form; IPv4-mapped
+  IPv6 addresses (`::ffff:192.0.2.1`) are refused: write them as IPv4. A visitor coming over an
+  IPv4-mapped address is matched as IPv4.
+- At most 100 lists and 10000 items a list; `description` and `comment` at most 500 characters.
+- A body that names an address twice is refused. `POST` of an address the list has already keeps its
+  item (and id); a `comment` given replaces the old one. `PUT` keeps the ids of the addresses that
+  stay. A `DELETE` naming an id the list does not have is refused whole. Each change lands whole or
+  not at all.
+- Rules name lists, so a list a rule uses (enabled or not, in any zone) can be neither deleted nor
+  renamed (`409`, naming the rules); change those rules first. A rule naming a list that does not
+  exist is refused (`400`). Should a name still have no list behind it (a peer that has not caught up),
+  `ip.src in $name` matches no address, so `not ip.src in $name` matches every one.
+- A change to a list reaches the rules that use it at once: they are compiled again with the new
+  addresses.
+
+```sh
+L=$(curl -s -X POST $BASE/rules/lists -H "Authorization: Bearer $TOKEN" \
+  -d '{"name": "office", "kind": "ip", "description": "office networks"}' | jq -r .result.id)
+curl -s -X POST $BASE/rules/lists/$L/items -H "Authorization: Bearer $TOKEN" \
+  -d '[{"ip": "198.51.100.0/24", "comment": "head office"}, {"ip": "2001:db8:10::/48"}]'
+curl -s -X POST $BASE/zones/$ZONE/firewall/rules -H "Authorization: Bearer $TOKEN" -d '{
+  "expression": "http.request.uri.path contains \"/admin\" and not ip.src in $office",
+  "action": "block", "description": "admin only from the office"
+}'
+curl -s -X DELETE $BASE/rules/lists/$L/items -H "Authorization: Bearer $TOKEN" \
+  -d '{"items": [{"id": "<item id>"}]}'
 ```
 
 ### Security events

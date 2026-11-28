@@ -16,6 +16,7 @@ mod handoff;
 mod handoff;
 mod items;
 mod limits;
+mod lists;
 mod log;
 mod mail;
 mod node;

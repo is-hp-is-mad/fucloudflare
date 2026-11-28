@@ -4,11 +4,19 @@
 //! ```text
 //! (http.request.uri.path contains "/admin" and not ip.src in {10.0.0.0/8 192.0.2.1})
 //!   or lower(http.user_agent) matches "curl|wget"
+//! ip.src in $office
 //! ```
+//!
+//! `$office` names an IP list (crate::lists). The name is looked up when the
+//! expression is compiled for a snapshot ([`Expr::parse_with`]), so a rule
+//! follows its list as the list changes; a name with no list behind it
+//! matches no address.
 
+use crate::lists::{IpSet, ListSets};
 use regex::Regex;
 use std::borrow::Cow;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Request attributes an expression is evaluated against.
 #[derive(Debug, Clone, Default)]
@@ -85,6 +93,9 @@ enum Op {
     Contains(String),
     Matches(Regex),
     In(Vec<Lit>),
+    /// `ip.src in $name`: the list's addresses as they were when the
+    /// expression was compiled; `None` when no list had that name.
+    InList(String, Option<Arc<IpSet>>),
     Lt(i64),
     Le(i64),
     Gt(i64),
@@ -111,6 +122,8 @@ enum Tok {
     Word(String),
     Str(String),
     Sym(&'static str),
+    /// `$name`, a reference to an IP list.
+    List(String),
 }
 
 fn lex(src: &str) -> Result<Vec<Tok>, String> {
@@ -148,6 +161,24 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             out.push(Tok::Str(String::from_utf8(s).map_err(|_| "invalid utf-8 in string")?));
             continue;
         }
+        if c == b'$' {
+            // the name is checked here, so that `$Office` is an error rather
+            // than a reference that can never match
+            let start = i + 1;
+            i = start;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let name = &src[start..i];
+            if !crate::lists::valid_name(name) {
+                return Err(format!(
+                    "'${name}' is not a list name: lowercase letters, digits and underscores, at most {} characters",
+                    crate::lists::MAX_NAME
+                ));
+            }
+            out.push(Tok::List(name.to_string()));
+            continue;
+        }
         for s in SYMS {
             if src[i..].starts_with(s) {
                 out.push(Tok::Sym(s));
@@ -169,9 +200,11 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
 
 // ------------------------------------------------------------ parsing ----
 
-struct Parser {
+struct Parser<'a> {
     toks: Vec<Tok>,
     pos: usize,
+    /// What `$name` stands for.
+    lists: &'a ListSets,
 }
 
 fn parse_net(s: &str) -> Option<Lit> {
@@ -196,7 +229,7 @@ impl Val {
     }
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -271,6 +304,14 @@ impl Parser {
                 let pattern = self.string()?;
                 let re = regex::RegexBuilder::new(&pattern).size_limit(1 << 20).build();
                 Op::Matches(re.map_err(|e| format!("invalid regex: {e}"))?)
+            }
+            "in" if matches!(self.peek(), Some(Tok::List(_))) => {
+                let Some(Tok::List(name)) = self.next() else { unreachable!() };
+                if ty != Ty::Ip {
+                    return Err(format!("${name} is an IP list: it can only follow ip.src in"));
+                }
+                let set = self.lists.get(&name).cloned();
+                Op::InList(name, set)
             }
             "in" => {
                 self.expect("{")?;
@@ -456,6 +497,7 @@ impl Node {
                     (Op::Eq(l), _) => lit_eq(&v, l),
                     (Op::Ne(l), _) => !lit_eq(&v, l),
                     (Op::In(ls), _) => ls.iter().any(|l| lit_eq(&v, l)),
+                    (Op::InList(_, set), V::Ip(Some(ip))) => set.as_ref().is_some_and(|s| s.contains(*ip)),
                     (Op::Contains(n), V::S(s)) => s.contains(n.as_str()),
                     (Op::Matches(re), V::S(s)) => re.is_match(s),
                     (Op::Lt(n), V::I(i)) => i < n,
@@ -469,8 +511,33 @@ impl Node {
     }
 }
 
+impl Node {
+    /// The IP lists this node names, in order, possibly more than once.
+    fn lists<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Node::And(a, b) | Node::Or(a, b) => {
+                a.lists(out);
+                b.lists(out);
+            }
+            Node::Not(a) => a.lists(out),
+            Node::Cmp(_, Op::InList(name, _)) => out.push(name),
+            Node::Cmp(..) | Node::Truthy(_) => {}
+        }
+    }
+}
+
 impl Expr {
+    /// Parse without IP lists: every `$name` is taken as naming no list, so
+    /// it matches no address. Good for checking what was written; the edge
+    /// compiles with [`Expr::parse_with`].
     pub fn parse(src: &str) -> Result<Expr, String> {
+        Expr::parse_with(src, &ListSets::new())
+    }
+
+    /// Parse, resolving `$name` against `lists` as they are now. A list that
+    /// changes later is not seen by this expression: the snapshot is built,
+    /// and its rules compiled, again then.
+    pub fn parse_with(src: &str, lists: &ListSets) -> Result<Expr, String> {
         if src.len() > 4096 {
             return Err("expression exceeds 4096 characters".into());
         }
@@ -478,7 +545,7 @@ impl Expr {
         if toks.is_empty() {
             return Ok(Expr(None));
         }
-        let mut p = Parser { toks, pos: 0 };
+        let mut p = Parser { toks, pos: 0, lists };
         let node = p.or()?;
         if p.pos != p.toks.len() {
             return Err(format!("unexpected token {:?}", p.toks[p.pos]));
@@ -488,6 +555,17 @@ impl Expr {
 
     pub fn matches(&self, r: &ReqInfo) -> bool {
         self.0.as_ref().is_none_or(|n| n.eval(r))
+    }
+
+    /// The names of the IP lists the expression uses, sorted, each once.
+    pub fn lists(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        if let Some(n) = &self.0 {
+            n.lists(&mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -556,5 +634,77 @@ mod tests {
         ] {
             assert!(Expr::parse(bad).is_err(), "{bad} should fail");
         }
+    }
+
+    /// Lists by name, each holding the given (normalized) items.
+    fn lists(of: &[(&str, &[&str])]) -> ListSets {
+        let list = |(name, items): &(&str, &[&str])| crate::lists::IpList {
+            id: name.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            items: items
+                .iter()
+                .map(|ip| crate::lists::ListItem { id: ip.to_string(), ip: ip.to_string(), comment: String::new(), created_on: String::new(), modified_on: String::new() })
+                .collect(),
+            created_on: String::new(),
+            modified_on: String::new(),
+            sync: Default::default(),
+        };
+        crate::lists::sets(&of.iter().map(list).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn ip_lists_are_named_with_a_dollar_and_resolved_when_compiled() {
+        let sets = lists(&[("office", &["203.0.113.0/24", "2001:db8::/48"]), ("empty", &[]), ("one", &["192.0.2.1"])]);
+        let at = |src: &str, ip: &str| {
+            let e = Expr::parse_with(src, &sets).unwrap_or_else(|e| panic!("{src}: {e}"));
+            e.matches(&ReqInfo { ip: Some(ip.parse().unwrap()), ..req() })
+        };
+        assert!(at("ip.src in $office", "203.0.113.23"));
+        assert!(at("ip.src in $office", "2001:db8::ffff:1"));
+        assert!(at("ip.src in $office", "::ffff:203.0.113.99"));
+        assert!(!at("ip.src in $office", "192.0.2.1"));
+        assert!(!at("ip.src in $office", "2001:db8:1::1"));
+        assert!(at("ip.src in $one", "192.0.2.1") && !at("ip.src in $one", "192.0.2.2"));
+        assert!(!at("ip.src in $empty", "192.0.2.1"));
+        assert!(!at("ip.src in $nowhere", "192.0.2.1"), "a name with no list matches no address");
+        assert!(at("not ip.src in $nowhere", "192.0.2.1"));
+        assert!(at(r#"(ip.src in $one or ip.src in $office) and http.host eq "www.example.com""#, "203.0.113.1"));
+        assert!(at("!(ip.src in $office)", "198.51.100.1"));
+        assert!(at("ip.src in $office && ip.src in {203.0.113.0/25}", "203.0.113.9"), "sets written out still work beside lists");
+        let no_ip = ReqInfo { ip: None, ..req() };
+        assert!(!Expr::parse_with("ip.src in $office", &sets).unwrap().matches(&no_ip), "no address, no match");
+
+        // parsed without lists, the same expression names the list and matches nothing
+        let bare = Expr::parse("ip.src in $office or ip.src in $one and ip.src in $office").unwrap();
+        assert_eq!(bare.lists(), ["office", "one"]);
+        assert!(!bare.matches(&ReqInfo { ip: Some("203.0.113.23".parse().unwrap()), ..req() }));
+        assert!(Expr::parse(r#"http.request.uri.path contains "$office""#).unwrap().lists().is_empty(), "a string is not a list");
+        assert!(Expr::parse("").unwrap().lists().is_empty());
+    }
+
+    #[test]
+    fn ip_lists_go_with_ip_src_in_only() {
+        for bad in [
+            "ip.src in $Office",
+            "ip.src in $",
+            "ip.src in $office-2",
+            "ip.src in $office.x",
+            "ip.src in {$office}",
+            "ip.src eq $office",
+            "ip.src ne $office",
+            r#"http.host in $office"#,
+            "ip.geoip.asnum in $office",
+            "$office",
+            "ip.src in $office $one",
+            &format!("ip.src in ${}", "x".repeat(crate::lists::MAX_NAME + 1)),
+        ] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should fail");
+        }
+        let e = Expr::parse("ip.src in $Office").unwrap_err();
+        assert!(e.contains("lowercase"), "{e}");
+        let e = Expr::parse("http.host in $office").unwrap_err();
+        assert!(e.contains("ip.src"), "{e}");
+        assert!(Expr::parse(&format!("ip.src in ${}", "x".repeat(crate::lists::MAX_NAME))).is_ok());
     }
 }

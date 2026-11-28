@@ -11,6 +11,7 @@ use crate::items::{
     NodeTelemetry, OriginRule, PurgeOp, RateLimit, RedirectRule, Settings, SpectrumApp, SteerRule, TransformRule,
     WorkerRoute, WorkerScript,
 };
+use crate::lists::{IpList, ListSets};
 use crate::sync::{unix_ms, AcmeLease, DomainDelta, HlcClock, SyncMeta, SyncProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -184,6 +185,7 @@ pub struct Tombstones {
     pub purges: BTreeMap<String, SyncMeta>,
     pub acme_challenges: BTreeMap<String, SyncMeta>,
     pub node_telemetry: BTreeMap<String, SyncMeta>,
+    pub ip_lists: BTreeMap<String, SyncMeta>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -208,6 +210,8 @@ pub struct Data {
     pub purges: Vec<PurgeOp>,
     pub certificate_packs: Vec<CertificatePack>,
     pub acme_challenges: Vec<AcmeChallenge>,
+    /// Address lists that rule expressions name as `$name` (crate::lists).
+    pub ip_lists: Vec<IpList>,
     /// Legacy traffic-limit & GFW projections (synchronized from `node_telemetry`).
     pub limited_nodes: BTreeMap<String, crate::limits::State>,
     #[serde(default)]
@@ -337,10 +341,12 @@ pub struct Snapshot {
     pub purges: Vec<PurgeOp>,
 }
 
-/// Enabled rules of one zone, compiled, sorted by `key`.
+/// Enabled rules of one zone, compiled, sorted by `key`. `$name` in an
+/// expression is resolved against `lists` here, once per snapshot.
 fn compile<T: Item, K: Ord>(
     all: &[T],
     zone_id: &str,
+    lists: &ListSets,
     enabled: impl Fn(&T) -> bool,
     expr: impl Fn(&T) -> &str,
     key: impl Fn(&T) -> K,
@@ -348,7 +354,7 @@ fn compile<T: Item, K: Ord>(
     let mut out: Vec<(T, Expr)> = all
         .iter()
         .filter(|r| r.meta().zone_id == zone_id && enabled(r))
-        .filter_map(|r| Some((r.clone(), Expr::parse(expr(r)).ok()?)))
+        .filter_map(|r| Some((r.clone(), Expr::parse_with(expr(r), lists).ok()?)))
         .collect();
     out.sort_by_key(|(r, _)| key(r));
     out
@@ -356,6 +362,7 @@ fn compile<T: Item, K: Ord>(
 
 impl Snapshot {
     fn build(data: &Data) -> Self {
+        let lists = crate::lists::sets(&data.ip_lists);
         let mut by_id: HashMap<&str, ZoneSnap> = data
             .zones
             .iter()
@@ -371,12 +378,12 @@ impl Snapshot {
                     names: HashMap::new(),
                     nodes: HashSet::from([z.name.clone()]),
                     spectrum_names: HashSet::new(),
-                    firewall: compile(&data.firewall_rules, id, |r| r.enabled, |r| &r.expression, |r| r.priority),
-                    rate_limits: compile(&data.rate_limits, id, |r| r.enabled, |r| &r.expression, |_| 0),
-                    origin_rules: compile(&data.origin_rules, id, |r| r.enabled, |r| &r.expression, |r| r.priority),
-                    redirects: compile(&data.redirect_rules, id, |r| r.enabled, |r| &r.expression, |r| r.priority),
-                    transforms: compile(&data.transform_rules, id, |r| r.enabled, |r| &r.expression, |r| r.priority),
-                    cache_rules: compile(&data.cache_rules, id, |r| r.enabled, |r| &r.expression, |r| r.priority),
+                    firewall: compile(&data.firewall_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
+                    rate_limits: compile(&data.rate_limits, id, &lists, |r| r.enabled, |r| &r.expression, |_| 0),
+                    origin_rules: compile(&data.origin_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
+                    redirects: compile(&data.redirect_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
+                    transforms: compile(&data.transform_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
+                    cache_rules: compile(&data.cache_rules, id, &lists, |r| r.enabled, |r| &r.expression, |r| r.priority),
                     routes,
                     email_rules: data.email_rules.iter().filter(|r| r.enabled && r.meta.zone_id == z.id).cloned().collect(),
                     dnssec: z.dnssec.as_ref().and_then(|cfg| crate::dns::dnssec::DnssecSigner::from_config(&z.name, cfg)),
@@ -665,6 +672,9 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
     for c in &mut d.acme_challenges {
         bump(&mut c.sync);
     }
+    for l in &mut d.ip_lists {
+        bump(&mut l.sync);
+    }
     for t in d.node_telemetry.values_mut() {
         bump(&mut t.sync);
     }
@@ -718,6 +728,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         purges,
         acme_challenges,
         node_telemetry,
+        ip_lists,
     );
     sync_telemetry_projections(d);
     clock.advance_floor(max_ver.0, max_ver.1);
@@ -751,6 +762,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.steering, durable_ttl_ms);
     prune(&mut d.tombstones.local_proxy_rules, durable_ttl_ms);
     prune(&mut d.tombstones.node_telemetry, durable_ttl_ms);
+    prune(&mut d.tombstones.ip_lists, durable_ttl_ms);
     prune(&mut d.tombstones.purges, ephemeral_ttl_ms);
     prune(&mut d.tombstones.acme_challenges, ephemeral_ttl_ms);
 }
@@ -796,6 +808,8 @@ struct ConfigDeltaPayload {
     purges: Vec<PurgeOp>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     acme_challenges: Vec<AcmeChallenge>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ip_lists: Vec<IpList>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     node_telemetry: BTreeMap<String, NodeTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1235,6 +1249,50 @@ impl Store {
         let id_owned = id.to_string();
         self.mutate_async(move |d, clock, sync_node| apply_delete_steering(d, clock, sync_node, &id_owned))
             .await
+    }
+
+    // ---- IP lists (crate::lists) ----
+
+    /// Look at the configuration as it is, without copying all of it. `f`
+    /// runs under the store's lock, so it must be quick and must not wait.
+    pub fn inspect<T>(&self, f: impl FnOnce(&Data) -> T) -> T {
+        f(&self.data.lock().unwrap())
+    }
+
+    /// Add, change or remove one IP list in one write. `change` sees the
+    /// whole configuration (other lists' names, the rules that use the list)
+    /// and the list `id` names as it is now (`None` when adding); it answers
+    /// the list as it should be, or `None` to remove it. Ids, timestamps
+    /// and the checks belong to crate::lists; replication belongs here.
+    pub async fn change_ip_list_async<F>(&self, id: Option<String>, change: F) -> Result<Option<IpList>, StoreError>
+    where
+        F: FnOnce(&Data, Option<&IpList>) -> Result<Option<IpList>, StoreError> + Send + 'static,
+    {
+        self.mutate_async(move |d, clock, sync_node| {
+            let current = match &id {
+                Some(id) => Some(d.ip_lists.iter().find(|l| &l.id == id).cloned().ok_or(StoreError::NotFound)?),
+                None => None,
+            };
+            match (change(d, current.as_ref())?, current) {
+                (Some(mut list), current) => {
+                    if let Some(c) = current {
+                        list.id = c.id;
+                    }
+                    list.sync = stamp_next(d, clock, sync_node, false);
+                    d.tombstones.ip_lists.remove(&list.id);
+                    upsert(&mut d.ip_lists, list.clone(), |l| &l.id);
+                    Ok(Some(list))
+                }
+                (None, Some(old)) => {
+                    d.ip_lists.retain(|l| l.id != old.id);
+                    let tomb = stamp_next(d, clock, sync_node, true);
+                    d.tombstones.ip_lists.insert(old.id, tomb);
+                    Ok(None)
+                }
+                (None, None) => Ok(None),
+            }
+        })
+        .await
     }
 
     // ---- local proxy rules ----
@@ -2294,6 +2352,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
         local_proxy_rules: d.local_proxy_rules.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         purges: d.purges.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         acme_challenges: d.acme_challenges.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
+        ip_lists: d.ip_lists.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         node_telemetry: d
             .node_telemetry
             .iter()
@@ -2322,6 +2381,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             purges: filter_tombs(&d.tombstones.purges, since),
             acme_challenges: filter_tombs(&d.tombstones.acme_challenges, since),
             node_telemetry: filter_tombs(&d.tombstones.node_telemetry, since),
+            ip_lists: filter_tombs(&d.tombstones.ip_lists, since),
         },
     };
     Ok(DomainDelta {
@@ -2463,7 +2523,7 @@ fn merge_delta_data(
     // may already have expired on the peer by removing items absent from the full snapshot.
     if delta.full_resync && is_accelerate {
         let z_ids: HashSet<String> = payload.zones.iter().map(|z| z.id.clone()).collect();
-        let before = (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len());
+        let before = (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len(), d.ip_lists.len());
         d.zones.retain(|z| z_ids.contains(&z.id));
         let r_ids: HashSet<String> = payload.records.iter().map(|r| r.id.clone()).collect();
         d.records.retain(|r| r_ids.contains(&r.id));
@@ -2473,9 +2533,11 @@ fn merge_delta_data(
         d.nodes.retain(|n| n_ids.contains(&n.id));
         let s_ids: HashSet<String> = payload.steering.iter().map(|s| s.id.clone()).collect();
         d.steering.retain(|s| s_ids.contains(&s.id));
+        let l_ids: HashSet<String> = payload.ip_lists.iter().map(|l| l.id.clone()).collect();
+        d.ip_lists.retain(|l| l_ids.contains(&l.id));
         let c_keys: HashSet<String> = payload.acme_challenges.iter().map(AcmeChallenge::sync_key).collect();
         d.acme_challenges.retain(|c| c_keys.contains(&c.sync_key()));
-        if (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len()) != before {
+        if (d.zones.len(), d.records.len(), d.workers.len(), d.nodes.len(), d.steering.len(), d.ip_lists.len()) != before {
             changed = true;
         }
     }
@@ -2518,6 +2580,7 @@ fn merge_delta_data(
     changed |= merge_collection(&mut rev, clock, &mut d.workers, &mut d.tombstones.workers, payload.workers, payload.tombstones.workers, |w| w.name.clone(), |w| &w.sync, |w| &mut w.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.nodes, &mut d.tombstones.nodes, payload.nodes, payload.tombstones.nodes, |n| n.id.clone(), |n| &n.sync, |n| &mut n.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.steering, &mut d.tombstones.steering, payload.steering, payload.tombstones.steering, |s| s.id.clone(), |s| &s.sync, |s| &mut s.sync);
+    changed |= merge_collection(&mut rev, clock, &mut d.ip_lists, &mut d.tombstones.ip_lists, payload.ip_lists, payload.tombstones.ip_lists, |l| l.id.clone(), |l| &l.sync, |l| &mut l.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.local_proxy_rules, &mut d.tombstones.local_proxy_rules, payload.local_proxy_rules, payload.tombstones.local_proxy_rules, |r| r.id.clone(), |r| &r.sync, |r| &mut r.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.purges, &mut d.tombstones.purges, payload.purges, payload.tombstones.purges, |p| p.id.clone(), |p| &p.sync, |p| &mut p.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.acme_challenges, &mut d.tombstones.acme_challenges, payload.acme_challenges, payload.tombstones.acme_challenges, AcmeChallenge::sync_key, |c| &c.sync, |c| &mut c.sync);

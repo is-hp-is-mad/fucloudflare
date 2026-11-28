@@ -69,12 +69,17 @@ pub enum Area {
     AuditLogs,
     Backup,
     Tokens,
+    /// IP lists (crate::lists): kept for the whole account, used by the
+    /// rules of any zone.
+    Lists,
 }
 
 impl Area {
     fn scope(self) -> Scope {
         match self {
-            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup => Scope::Account,
+            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup | Area::Lists => {
+                Scope::Account
+            }
             Area::Tokens => Scope::User,
             _ => Scope::Zone,
         }
@@ -133,6 +138,8 @@ groups! {
     "b89a480218d04ceb98b4fe57ca29dc1f" "Account Analytics Read" AccountAnalytics false "Read account-wide analytics";
     "b05b28e839c54467a7d6cba5d3abb5a3" "Audit Logs Read" AuditLogs false "Read the audit log";
     "7d8e7f405b0d4be7f4a9b5c6d7e8f9a0" "Backup Read" Backup false "Download a full backup (everything, secrets included: guard the token)";
+    "1ac9ee17d4e442a0ad48b35521db27f3" "Account Filter Lists Read" Lists false "Read IP lists and their items";
+    "9766e73b0e034208a4262fa492b80b2a" "Account Filter Lists Write" Lists true "Change IP lists and their items (the rules that use a list follow it)";
     "0cc3a61731504c89b99ec1be78b77aa0" "API Tokens Read" Tokens false "List your API tokens";
     "686d18d5ac6c441c867cbf6771e58a0a" "API Tokens Write" Tokens true "Create, change, roll and delete your API tokens";
 }
@@ -195,6 +202,7 @@ pub fn need(path: &str) -> Need {
         ["audit", ..] => Need::Account(Area::AuditLogs),
         ["backup"] => Need::Account(Area::Backup),
         ["analytics", ..] => Need::Account(Area::AccountAnalytics),
+        ["rules", "lists", ..] => Need::Account(Area::Lists),
         ["fleet", ..] | ["nodes", ..] | ["steering", ..] | ["proxy", ..] | ["system", ..] | ["releases", ..] | ["warp", ..] | ["email", "status"] => {
             Need::Account(Area::Fleet)
         }
@@ -489,6 +497,39 @@ mod tests {
         assert!(account.allows("POST", "/user/tokens", "u"));
         assert!(!account.allows("POST", "/user/tokens", "someone-else"));
         assert!(!account.allows("POST", "/account/password", "u"));
+    }
+
+    #[test]
+    fn ip_lists_are_an_account_area_that_zone_tokens_do_not_reach() {
+        assert_eq!(need("/rules/lists"), Need::Account(Area::Lists));
+        assert_eq!(need("/rules/lists/l1/items"), Need::Account(Area::Lists));
+        assert_eq!(need("/rules/lists/bulk_operations/op1"), Need::Account(Area::Lists));
+        assert_eq!(need("/rules"), Need::Closed);
+        assert_eq!(need("/rules/other"), Need::Closed);
+        let account = json!({ format!("com.cloudflare.api.account.{}", account_id()): "*" });
+        let read = Grant { token_id: "t".into(), policies: vec![policy("allow", account.clone(), &["Account Filter Lists Read"])] };
+        assert!(read.allows("GET", "/rules/lists", "u") && read.allows("GET", "/rules/lists/l1/items", "u"));
+        for (method, path) in [("POST", "/rules/lists"), ("PUT", "/rules/lists/l1"), ("DELETE", "/rules/lists/l1"), ("POST", "/rules/lists/l1/items"), ("DELETE", "/rules/lists/l1/items")] {
+            assert!(!read.allows(method, path, "u"), "read only: {method} {path}");
+        }
+        let write = Grant { token_id: "t".into(), policies: vec![policy("allow", account.clone(), &["Account Filter Lists Write"])] };
+        assert!(write.allows("PUT", "/rules/lists/l1/items", "u") && write.allows("GET", "/rules/lists", "u"));
+        assert!(!write.allows("GET", "/zones/z1/firewall/rules", "u"), "lists give no zone");
+        let zones = Grant {
+            token_id: "t".into(),
+            policies: vec![policy("allow", json!({ "com.cloudflare.api.account.zone.*": "*" }), &["Firewall Services Write", "Zone Write"])],
+        };
+        assert!(!zones.allows("GET", "/rules/lists", "u") && !zones.allows("POST", "/rules/lists/l1/items", "u"), "a zone token cannot touch lists");
+        let zones_in_account = Grant {
+            token_id: "t".into(),
+            policies: vec![policy("allow", json!({ format!("com.cloudflare.api.account.{}", account_id()): { "com.cloudflare.api.account.zone.*": "*" } }), &["Firewall Services Write"])],
+        };
+        assert!(!zones_in_account.allows("GET", "/rules/lists", "u"));
+        let denied = Grant {
+            token_id: "t".into(),
+            policies: vec![policy("allow", account.clone(), &["Account Filter Lists Write"]), policy("deny", account, &["Account Filter Lists Write"])],
+        };
+        assert!(!denied.allows("GET", "/rules/lists", "u"), "deny wins");
     }
 
     #[test]

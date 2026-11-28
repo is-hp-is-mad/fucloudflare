@@ -120,7 +120,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 权限：`need()` 里按 `phase` 映射到对应的现有 `Area`；不带阶段的路径用 `Area::Firewall`。
 - 测试：每个阶段"Cloudflare JSON → 现有对象 → Cloudflare JSON"往返一致；`PUT` 替换后的顺序与删除；未知动作被拒绝。
 
-### [ ] T4 IP 列表
+### [x] T4 IP 列表
 
 - 目标：可复用的地址列表，规则里写 `ip.src in $office`。
 - 存储：全局对象 `IpList { id, name, description, items: [{ id, ip, comment }] }`，`ip` 是单个地址或 CIDR。名字只允许小写字母、数字、下划线。
@@ -250,6 +250,13 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 为了不放宽：只跳过一部分的 `skip` 被拒（这里的 skip 会跳过安全级别、限速和托管规则）；限速只按 `cf.colo.id` + `ip.src` 计数，别的 characteristics、`counting_expression`、`requests_to_origin` 都拒。自动防火墙的规则不显示也不会被替换。
 - 拿不准、留给能连 Cloudflare 的人核对：重定向的 `status_code` 现在是必填（没查到 Cloudflare 的默认值，宁可要求写明）；规则集的 `version` 恒为 `"1"`、`name` 不保存，Terraform 是否在意没法在这里验证；共享的改写规则经一个阶段重排会影响它在别的阶段里的顺序；限速不能重排。
 - 面板：域名的"规则"页最下面有 Rulesets 卡片，每个阶段可以按 Cloudflare JSON 查看和整体替换。
+
+### T4
+
+- `src/lists.rs`：全局对象 `IpList`，表达式 `ip.src in $name`（`src/expr.rs` 新增 `Expr::parse_with`），列表在 `Snapshot::build` 时解析一次；名字不存在的列表不匹配任何地址，但保存引用了不存在列表的规则直接 400。
+- 被规则引用（停用的规则也算）的列表，删除或改名都回 409 并列出规则；带主机位的网段、IPv4 映射地址、同一请求里重复的地址一律拒绝。条目写操作照 Cloudflare 返回 `operation_id`，操作状态只在本节点内存里。
+- 权限：账户级 `Area::Lists`（Account Filter Lists Read / Write）；`/accounts/{id}/rules/lists…` 经 `account_path` 映射。`account_path` 现在改写路径后清空 extensions，顺带修好了带 id 的账户路径（之前 KV namespace 这类会拿到 3 个路径参数）；以后在账户路径下加 WebSocket 要另想办法。
+- 拿不准：Cloudflare 是否允许改名、重复追加时是否覆盖备注；权限组 id 不是 Cloudflare 的真实 id；条目没有游标分页。`ip_lists` 进了同步和全量对账：滚动升级时还没升级的节点若做全量对账的来源，可能把列表清掉，建议全部节点升级后再建列表。
 
 ## 5. 部署（通过 Komari）
 

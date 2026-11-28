@@ -73,8 +73,11 @@ fn invalid<T>(msg: impl Into<String>) -> Result<T, StoreError> {
     Err(StoreError::Invalid(msg.into()))
 }
 
-fn check_expr(src: &str) -> Result<(), StoreError> {
-    Expr::parse(src).map(|_| ()).map_err(|e| StoreError::Invalid(format!("invalid expression: {e}")))
+/// The expression parses, and every IP list it names (`$name`) exists.
+fn check_expr(src: &str, d: &Data) -> Result<(), StoreError> {
+    Expr::parse(src)
+        .and_then(|e| crate::lists::check_refs(&e, d))
+        .map_err(|e| StoreError::Invalid(format!("invalid expression: {e}")))
 }
 
 fn one_of(what: &str, value: &str, allowed: &[&str]) -> Result<(), StoreError> {
@@ -259,8 +262,8 @@ pub struct FirewallRule {
 
 impl Item for FirewallRule {
     item_boilerplate!(firewall_rules);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         one_of("action", &self.action, &["block", "js_challenge", "managed_challenge", "log", "skip"])
     }
 }
@@ -296,8 +299,8 @@ impl RateLimit {
 
 impl Item for RateLimit {
     item_boilerplate!(rate_limits);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         one_of("action", &self.action, &["block", "log"])?;
         if self.threshold == 0 || !(1..=86400).contains(&self.period) || self.mitigation_timeout > 86400 {
             return invalid("threshold must be >= 1, period 1-86400 and mitigation_timeout 0-86400");
@@ -342,8 +345,8 @@ pub struct OriginRule {
 
 impl Item for OriginRule {
     item_boilerplate!(origin_rules);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         for (what, field) in
             [("host_header", &mut self.host_header), ("sni", &mut self.sni), ("origin_host", &mut self.origin_host)]
         {
@@ -858,8 +861,8 @@ impl RedirectRule {
 
 impl Item for RedirectRule {
     item_boilerplate!(redirect_rules);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         let t = &self.target_url;
         let well_formed = (t.starts_with("https://") || t.starts_with("http://") || t.starts_with('/'))
             && t.bytes().all(|b| b.is_ascii_graphic());
@@ -904,8 +907,8 @@ pub struct TransformRule {
 
 impl Item for TransformRule {
     item_boilerplate!(transform_rules);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         const PROTECTED: &[&str] = &["host", "content-length", "transfer-encoding", "connection", "upgrade"];
         let check_name = |n: &str| {
             let name = n.to_ascii_lowercase();
@@ -970,8 +973,8 @@ pub struct CacheRule {
 
 impl Item for CacheRule {
     item_boilerplate!(cache_rules);
-    fn validate(&mut self, _: &Zone, _: &Data) -> Result<(), StoreError> {
-        check_expr(&self.expression)?;
+    fn validate(&mut self, _: &Zone, d: &Data) -> Result<(), StoreError> {
+        check_expr(&self.expression, d)?;
         if self.edge_ttl.is_some_and(|t| t == 0 || t > 31_536_000) {
             return invalid("edge_ttl must be between 1 and 31536000 seconds");
         }

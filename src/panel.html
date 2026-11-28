@@ -1415,12 +1415,13 @@ const NAV = [
   ["zones", "域名列表", "globe"],
   ["fleet", "机群与节点", "server"],
   ["steering", "调度与 DNS 屏蔽", "route"],
+  ["lists", "IP 列表", "list"],
   ["workers", "Workers & 存储", "code"],
   ["proxy", "反向代理 (Caddy)", "proxy"],
   ["account", "账户与安全", "lock"],
   ["users", "用户与审计", "shield", "admin"],
 ];
-const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, fleet: viewFleet, account: viewAccount, users: viewUsers };
+const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, lists: viewLists, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, fleet: viewFleet, account: viewAccount, users: viewUsers };
 function parseHash() {
   const p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (p[0] === "zone" && p[1]) return { view: "zone", zone: p[1], tab: p[2] || "overview" };
@@ -1898,6 +1899,68 @@ const A = {
   },
   workerDel: d => del("/workers/scripts/" + d.name, "脚本 " + d.name),
 };
+
+// ------------------------------------------------------------- IP lists ----
+// Account-wide address lists that rules use as `ip.src in $name` (src/lists.rs).
+const LUI = { list: "" };
+const ipLines = text => String(text || "").split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#")).map(l => {
+  const [ip, ...rest] = l.split(/\s+/), comment = rest.join(" ");
+  return comment ? { ip, comment } : { ip };
+});
+const ITEMS_FIELD = { k: "lines", label: "地址或网段（每行一个，空格后可写备注）", type: "textarea", tall: 1, hint: "如 198.51.100.0/24 总部；网段的主机位须为零，IPv6 也可以" };
+async function viewLists() {
+  const lists = await api("GET", "/rules/lists");
+  C.ipLists = lists;
+  const edit = me.role !== "viewer";
+  if (LUI.list && !lists.some(l => l.id === LUI.list)) LUI.list = "";
+  if (!LUI.list && lists.length) LUI.list = lists[0].id;
+  const cur = lists.find(l => l.id === LUI.list);
+  let itemsCard = "";
+  if (cur) {
+    const items = await api("GET", `/rules/lists/${encodeURIComponent(cur.id)}/items`);
+    C.ipItems = items;
+    itemsCard = card(`条目 · <span class="mono">$${esc(cur.name)}</span> <span class="cnt">${items.length}</span>`,
+      edit ? btn("ipItemsAdd", "添加条目", { id: cur.id }, "pri sm") + btn("ipItemsReplace", "整体替换", { id: cur.id }, "sm") : "",
+      table([
+        { label: "地址 / 网段", fmt: i => `<b class="mono">${esc(i.ip)}</b>` },
+        { label: "备注", fmt: i => show(i.comment) },
+        { label: "修改时间", fmt: i => when(i.modified_on) },
+      ], items, edit ? i => lk("ipItemDel", "删除", { list: cur.id, id: i.id, ip: i.ip }, "bad") : null,
+      `<b>列表还是空的</b>空列表不匹配任何地址。${edit ? "<br><br>" + btn("ipItemsAdd", "添加条目", { id: cur.id }, "pri") : ""}`));
+  }
+  return { title: "IP 列表", sub: "整个账户共用的地址与网段列表。任何域名的防火墙、限速、重定向、改写、缓存、回源规则都可以写 ip.src in $名字；列表一改，用它的规则立即跟着变。被规则用着的列表不能删除或改名。",
+    acts: edit ? btn("ipListEdit", "新建列表", {}, "pri") : "", body:
+    `<div class="note">例：<code>http.request.uri.path contains "/admin" and not ip.src in $office</code></div>` +
+    card(`列表 <span class="cnt">${lists.length}</span>`, "", table([
+      { label: "名称", fmt: l => `<b class="mono">$${esc(l.name)}</b>${l.id === LUI.list ? ' <span class="tag pri">查看中</span>' : ""}` },
+      { label: "说明", fmt: l => show(l.description) },
+      { label: "条目", fmt: l => esc(l.num_items), cls: "num" },
+      { label: "被规则引用", fmt: l => (l.num_referencing_filters ? `<span class="tag">${esc(l.num_referencing_filters)} 条规则</span>` : '<span class="hint">未使用</span>') },
+      { label: "修改时间", fmt: l => when(l.modified_on) },
+    ], lists, l => lk("ipListOpen", "条目", { id: l.id }) + (edit ? rowActs("ipListEdit", "ipListDel", { id: l.id, name: l.name }) : ""),
+    `<b>还没有 IP 列表</b>把办公室、合作方或要封禁的网段放进一个列表，在规则里用 <code>ip.src in $名字</code> 引用。${edit ? "<br><br>" + btn("ipListEdit", "新建列表", {}, "pri") : ""}`)) + itemsCard };
+}
+Object.assign(A, {
+  ipListOpen: d => { LUI.list = d.id; render(); },
+  ipListEdit: d => openForm(d.id ? "编辑列表" : "新建列表", [
+    { k: "name", label: "名称", hint: "小写字母、数字、下划线，最多 50 个；规则里写 $名称。被规则用着时不能改名" },
+    { k: "description", label: "说明" },
+  ], byId("ipLists", d.id), v => api(d.id ? "PUT" : "POST", "/rules/lists" + (d.id ? "/" + encodeURIComponent(d.id) : ""), d.id ? v : { ...v, kind: "ip" })),
+  ipListDel: d => del("/rules/lists/" + encodeURIComponent(d.id), "列表 $" + d.name),
+  ipItemsAdd: d => openForm("添加条目", [ITEMS_FIELD], {}, async v => {
+    const items = ipLines(v.lines);
+    if (!items.length) throw new Error("请至少填写一个地址或网段");
+    await api("POST", `/rules/lists/${encodeURIComponent(d.id)}/items`, items);
+  }, true),
+  ipItemsReplace: d => openForm("整体替换条目", [ITEMS_FIELD, { type: "head", label: "保存后列表只包含上面这些条目（留空即清空）。" }],
+    { lines: (C.ipItems || []).map(i => i.comment ? `${i.ip} ${i.comment}` : i.ip).join("\n") },
+    v => api("PUT", `/rules/lists/${encodeURIComponent(d.id)}/items`, ipLines(v.lines)), true),
+  ipItemDel: async d => {
+    if (!(await confirmBox(`删除 ${d.ip}？`, "用这个列表的规则将不再匹配这个地址。"))) return;
+    await api("DELETE", `/rules/lists/${encodeURIComponent(d.list)}/items`, { items: [{ id: d.id }] });
+    toast("已删除"); render();
+  },
+});
 
 document.addEventListener("click", e => {
   const copy = e.target.closest("[data-copy]");

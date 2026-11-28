@@ -13,7 +13,7 @@
 | 规则 | 重定向规则、请求/响应改写规则、缓存规则 |
 | 电子邮件 | SMTP 收信与转发路由（不落盘）：按地址 / `+tag` / `*` 兜底转发或丢弃，SRS 发件人改写与退信回溯，支持外发中继（submission 587/465） |
 | 分析 | 全机群的时间序列（分钟级 1 天、小时级 30 天）：请求数、流量、状态码、缓存命中、拦截数、协议版本，按节点、国家、主机名、路径拆分；重启不丢 |
-| WAF | 自定义规则、限速、托管规则集、人机验证（`js_challenge` / `managed_challenge`）、按 IP 威胁分的安全级别与 Under Attack 模式、自动防火墙、安全事件日志（全机群汇总） |
+| WAF | 自定义规则、限速、托管规则集、人机验证（`js_challenge` / `managed_challenge`）、按 IP 威胁分的安全级别与 Under Attack 模式、自动防火墙、安全事件日志（全机群汇总）、规则共用的 IP 列表（`ip.src in $名字`） |
 | 回源规则 | 按表达式改写回源地址 / 端口 / 协议 / Host 头 / SNI |
 | Spectrum | 任意 TCP / UDP 端口转发，可选 PROXY protocol v1 |
 | Workers | 在边缘节点运行 JavaScript（Fetch API 子集） |
@@ -155,6 +155,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   `ip.geoip.country` `ip.geoip.continent` `ip.geoip.asnum` `ip.geoip.as_org`（需要 GeoIP 库）
 - 运算符：`eq ne contains matches in lt le gt ge`（及 `== != ~ < <= > >=`），`and or not`（及 `&& || !`）
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
+- IP 列表：`ip.src in $office`（见下面的"IP 列表"）。
 - 空表达式匹配所有请求。
 
 防火墙动作：`block`、`js_challenge`（人机验证，浏览器看起来可疑时才要点击）、`managed_challenge`（总是要点击一次）、`log`、`skip`（放行并跳过限速与托管规则）。按 `priority` 升序执行。
@@ -411,6 +412,29 @@ DNS 记录的 Cloudflare 兼容补充：
 - 限速没有优先级，按创建顺序执行：可以在最后追加，不能重排。自动防火墙的规则不显示、不会被替换；回源规则的 `origin_node`、`origin_scheme`
   在 Cloudflare 里没有对应写法，不显示，修改时保持原样。
 - 令牌：带阶段的路径（阶段名或规则集 id）要该阶段对应的权限；列表和 `POST /rulesets` 要 Firewall Services，POST 另外还要该阶段的权限。
+
+## IP 列表（兼容 Cloudflare）
+
+一组有名字的地址和网段，整个账户共用，任何域名的规则都可以写 `ip.src in $office`。接口照 Cloudflare 的账户列表
+（`/accounts/{account id}/rules/lists…` 也能用），面板在账户导航的"IP 列表"里。
+
+```
+/rules/lists                         GET 全部；POST {"name", "description", "kind": "ip"}
+/rules/lists/{id}                    GET；PUT / PATCH 改名字或说明；DELETE
+/rules/lists/{id}/items              GET（?search=）；POST [{"ip", "comment"}] 追加；PUT [...] 整体替换；DELETE {"items": [{"id"}]}
+/rules/lists/bulk_operations/{id}    条目改动返回的 operation_id，这里查到的总是 completed（改动在返回前已经完成）
+```
+
+- 名字只能是小写字母、数字和下划线，1 到 50 个字符，不能重名。只有 IP 列表：主机名、ASN、重定向列表一律拒绝。
+- 条目是单个 IPv4 / IPv6 地址或 CIDR 网段。网段的主机位必须为零（`192.0.2.1/24` 会被拒绝，并提示应写 `192.0.2.0/24`）；
+  `/32`、`/128` 存成不带前缀的地址；IPv4 映射的 IPv6 地址（`::ffff:192.0.2.1`）请直接写 IPv4。同一请求里重复的地址会被拒绝；
+  追加已有的地址不会多出一条，给了备注就更新备注。
+- 上限：100 个列表，每个列表 10000 条；说明和备注最多 500 个字符。
+- 规则按名字引用列表，所以被规则用着的列表（无论规则是否启用、在哪个域名下）既不能删也不能改名，返回 409 并列出是哪些规则；
+  规则里写不存在的列表名会被拒绝。万一名字暂时找不到列表（比如对等节点还没同步到），`ip.src in $名字` 不匹配任何地址，
+  `not ip.src in $名字` 则匹配所有地址。
+- 列表一改，用它的规则立即跟着变：快照重建时规则会用新的地址重新编译。
+- 令牌：账户级的 Account Filter Lists Read / Write；只有域名权限的令牌碰不到列表。
 
 ## 自动防火墙
 

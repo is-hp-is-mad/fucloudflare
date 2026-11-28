@@ -203,6 +203,18 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/zones/{zone_id}/rulesets/{ruleset_id}", get(get_ruleset).put(put_ruleset).delete(delete_ruleset))
         .route("/zones/{zone_id}/rulesets/{ruleset_id}/rules", post(add_ruleset_rule))
         .route("/zones/{zone_id}/rulesets/{ruleset_id}/rules/{rule_id}", axum::routing::patch(patch_ruleset_rule).delete(delete_ruleset_rule))
+        .route("/rules/lists", get(list_ip_lists).post(create_ip_list))
+        .route("/rules/lists/bulk_operations/{operation_id}", get(ip_list_operation))
+        .route("/rules/lists/{list_id}", get(get_ip_list).put(update_ip_list).patch(update_ip_list).delete(delete_ip_list))
+        .route(
+            "/rules/lists/{list_id}/items",
+            get(list_ip_list_items)
+                .post(append_ip_list_items)
+                .put(replace_ip_list_items)
+                .delete(delete_ip_list_items)
+                .layer(axum::extract::DefaultBodyLimit::max(4 << 20)),
+        )
+        .route("/rules/lists/{list_id}/items/{item_id}", get(get_ip_list_item))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -213,7 +225,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .layer(middleware::from_fn(security_headers))
         .with_state(state);
     // Cloudflare's account-level paths (`/accounts/{id}/workers/...`, `.../storage/kv/...`,
-    // `.../d1/...`, `.../tokens`) are the same as the ones here without the account
+    // `.../d1/...`, `.../tokens`, `.../rules/lists`) are the same as the ones here without the account
     let inner = app.clone();
     let by_account = axum::routing::any(move |req: Request| {
         let mut inner = inner.clone();
@@ -246,11 +258,20 @@ fn account_path(mut req: Request) -> Result<Request, ApiError> {
         format!("/user/{rest}")
     } else if under("audit_logs") {
         "/audit".to_string()
+    } else if under("rules/lists") {
+        format!("/{rest}")
     } else {
         return Err(ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()));
     };
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     *req.uri_mut() = format!("/client/v4{mapped}{query}").parse().map_err(|_| bad("bad path"))?;
+    // The outer route's own path parameters (account id, rest) ride in the
+    // extensions, and the inner router adds its parameters to them instead
+    // of starting afresh: a handler taking one (`/rules/lists/{list_id}`)
+    // would be handed three. Nothing else here needs them: the client is
+    // read from headers, the server adds no ConnectInfo, and no API route
+    // upgrades the connection (hyper's upgrade handle goes with the rest).
+    *req.extensions_mut() = axum::http::Extensions::new();
     Ok(req)
 }
 
@@ -1985,6 +2006,54 @@ async fn patch_ruleset_rule(State(st): St, Path((zone_id, id, rule_id)): Path<(S
 
 async fn delete_ruleset_rule(State(st): St, Path((zone_id, id, rule_id)): Path<(String, String, String)>) -> ApiResult {
     ok(crate::rulesets::delete_rule(&st.store, &zone_id, &id, &rule_id).await?)
+}
+
+// ------------------------------------------------------------ IP lists ----
+
+/// Address lists for `ip.src in $name` (crate::lists), at Cloudflare's
+/// account paths too (see `account_path`).
+async fn list_ip_lists(State(st): St) -> ApiResult {
+    ok(crate::lists::list(&st.store))
+}
+
+async fn create_ip_list(State(st): St, bytes: Bytes) -> ApiResult {
+    ok(crate::lists::create(&st.store, body(&bytes)?).await?)
+}
+
+async fn get_ip_list(State(st): St, Path(id): Path<String>) -> ApiResult {
+    ok(crate::lists::get(&st.store, &id)?)
+}
+
+async fn update_ip_list(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::lists::update(&st.store, &id, body(&bytes)?).await?)
+}
+
+async fn delete_ip_list(State(st): St, Path(id): Path<String>) -> ApiResult {
+    ok(crate::lists::delete(&st.store, &id).await?)
+}
+
+async fn list_ip_list_items(State(st): St, Path(id): Path<String>, Query(q): Params) -> ApiResult {
+    ok(crate::lists::items(&st.store, &id, q.get("search").map(String::as_str))?)
+}
+
+async fn get_ip_list_item(State(st): St, Path((id, item_id)): Path<(String, String)>) -> ApiResult {
+    ok(crate::lists::item(&st.store, &id, &item_id)?)
+}
+
+async fn append_ip_list_items(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::lists::append_items(&st.store, &id, body(&bytes)?).await?)
+}
+
+async fn replace_ip_list_items(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::lists::replace_items(&st.store, &id, body(&bytes)?).await?)
+}
+
+async fn delete_ip_list_items(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(crate::lists::delete_items(&st.store, &id, body(&bytes)?).await?)
+}
+
+async fn ip_list_operation(Path(id): Path<String>) -> ApiResult {
+    ok(crate::lists::operation(&id)?)
 }
 
 // ------------------------------------------------ managed certificates ----
@@ -3764,5 +3833,121 @@ mod tests {
         let (uri, secure) = oauth_redirect_uri(&cfg, &headers, Some("dashboard.fucloudflare.com"));
         assert_eq!(uri, "https://auth.example.com/client/v4/auth/oauth/callback");
         assert!(secure);
+    }
+
+    #[tokio::test]
+    async fn ip_lists_answer_on_cloudflare_account_paths_and_tokens_need_the_lists_permission() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-lists-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let session = match st.accounts.login("admin@example.com", "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => token,
+            _ => panic!("expected signed in"),
+        };
+        let zone = st.store.create_zone("example.com").unwrap();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let as_session = format!("Bearer {session}");
+        let base = format!("/client/v4/accounts/{}/rules/lists", crate::tokens::account_id());
+
+        // the fleet's own token, on Cloudflare's account path
+        let (sc, b) = call(&mut app, "POST", &base, br#"{"name":"office","kind":"ip","description":"the office"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let (sc, b) = call(&mut app, "POST", &format!("{base}/{id}/items"), br#"[{"ip":"192.0.2.0/24","comment":"desks"},{"ip":"2001:db8::1"}]"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let op = json_of(&b)["result"]["operation_id"].as_str().unwrap().to_string();
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/bulk_operations/{op}"), vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"]["status"].clone()), (StatusCode::OK, json!("completed")));
+        let (sc, _) = call(&mut app, "GET", &format!("{base}/bulk_operations/nope"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, b) = call(&mut app, "GET", &format!("/client/v4/rules/lists/{id}/items"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let items = json_of(&b)["result"].clone();
+        assert_eq!(items.as_array().unwrap().len(), 2);
+        let item_id = items[1]["id"].as_str().unwrap().to_string();
+        let (sc, b) = call(&mut app, "GET", &format!("{base}/{id}/items/{item_id}"), vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"]["ip"].clone()), (StatusCode::OK, json!("2001:db8::1")));
+        let (sc, b) = call(&mut app, "POST", &format!("{base}/{id}/items"), br#"[{"ip":"192.0.2.1/24"}]"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        let (sc, _) = call(&mut app, "POST", &format!("{base}/{id}/items"), b"not json".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        let (sc, _) = call(&mut app, "GET", "/client/v4/accounts/0000/rules/lists", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND, "another account");
+        let (sc, _) = call(&mut app, "GET", &format!("{base}/nope/items"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        // the other account paths with an id in them get theirs, too
+        let (_, b) = call(&mut app, "POST", "/client/v4/kv/namespaces", br#"{"title":"sessions"}"#.to_vec()).await;
+        let ns = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let kv = format!("/client/v4/accounts/{}/storage/kv/namespaces/{ns}", crate::tokens::account_id());
+        let (sc, b) = call(&mut app, "GET", &kv, vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"]["title"].clone()), (StatusCode::OK, json!("sessions")), "{}", String::from_utf8_lossy(&b));
+
+        // a rule uses it: the edge follows the list, and the list cannot be deleted
+        let rule = json!({ "expression": "ip.src in $office", "action": "block" });
+        let (sc, b) = call(&mut app, "POST", &format!("/client/v4/zones/{}/firewall/rules", zone.id), rule.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let rule_id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let (sc, b) = call(&mut app, "POST", &format!("/client/v4/zones/{}/firewall/rules", zone.id), br#"{"expression":"ip.src in $absent","action":"block"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        let (sc, b) = call(&mut app, "DELETE", &format!("{base}/{id}"), vec![]).await;
+        assert_eq!(sc, StatusCode::CONFLICT);
+        let err = json_of(&b);
+        assert_eq!(err["success"], json!(false));
+        assert!(err["errors"][0]["message"].as_str().unwrap().contains(&rule_id), "{err}");
+        let (sc, _) = call(&mut app, "PUT", &format!("{base}/{id}"), br#"{"name":"moved"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::CONFLICT, "a rename would leave the rule behind");
+        let (sc, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"][0]["num_referencing_filters"].clone()), (StatusCode::OK, json!(1)));
+
+        // tokens: read only, zone only
+        let token = |groups: Value, resources: Value| json!({ "name": "lists", "policies": [{ "effect": "allow", "resources": resources, "permission_groups": groups }] });
+        let account = json!({ format!("com.cloudflare.api.account.{}", crate::tokens::account_id()): "*" });
+        let mut bearers = vec![];
+        for spec in [
+            token(json!([{ "name": "Account Filter Lists Read" }]), account.clone()),
+            token(json!([{ "name": "Firewall Services Write" }, { "name": "Zone Write" }]), json!({ format!("com.cloudflare.api.account.zone.{}", zone.id): "*" })),
+            token(json!([{ "name": "Account Filter Lists Write" }]), account),
+        ] {
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", vec![("authorization", &as_session), ("content-type", "application/json")], spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            bearers.push(format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap()));
+        }
+        let (read, zone_only, write) = (&bearers[0], &bearers[1], &bearers[2]);
+        let items_uri = format!("{base}/{id}/items");
+        let add = br#"[{"ip":"203.0.113.9"}]"#.to_vec();
+        let (sc, _, _) = call_raw(&mut app, "GET", &items_uri, vec![("authorization", read)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "POST", &items_uri, vec![("authorization", read)], add.clone()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "read only");
+        let (sc, _, _) = call_raw(&mut app, "POST", &base, vec![("authorization", read)], br#"{"name":"x"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        for (method, uri) in [("GET", base.as_str()), ("GET", items_uri.as_str()), ("POST", items_uri.as_str())] {
+            let (sc, _, _) = call_raw(&mut app, method, uri, vec![("authorization", zone_only)], add.clone()).await;
+            assert_eq!(sc, StatusCode::FORBIDDEN, "a zone token: {method} {uri}");
+        }
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{}/firewall/rules", zone.id), vec![("authorization", zone_only)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK, "the zone token itself works");
+        let (sc, _, b) = call_raw(&mut app, "POST", &items_uri, vec![("authorization", write), ("content-type", "application/json")], add).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+
+        // the rule lets go; delete takes Cloudflare's body
+        let (sc, _) = call(&mut app, "DELETE", &format!("/client/v4/zones/{}/firewall/rules/{rule_id}", zone.id), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "DELETE", &items_uri, vec![]).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "a delete names the items");
+        let del = json!({ "items": [{ "id": item_id }] });
+        let (sc, b) = call(&mut app, "DELETE", &items_uri, del.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (sc, b) = call(&mut app, "PUT", &items_uri, b"[]".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (sc, b) = call(&mut app, "PATCH", &format!("{base}/{id}"), br#"{"name":"moved"}"#.to_vec()).await;
+        assert_eq!((sc, json_of(&b)["result"]["name"].clone()), (StatusCode::OK, json!("moved")));
+        let (sc, _) = call(&mut app, "DELETE", &format!("{base}/{id}"), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app, "GET", &format!("{base}/{id}"), vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
