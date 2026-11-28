@@ -25,7 +25,51 @@ scripts/deploy/panel-dns.sh
 scripts/deploy/steering.sh
 scripts/deploy/verify-tls.sh
 scripts/deploy/verify.sh
-scripts/ui/node_modules/
+
+# certificates and keys (any format), and whole certificate stores
+*.crt
+*.cer
+*.der
+*.csr
+*.p12
+*.pfx
+*.jks
+certs/
+caddy_data/
+caddy_config/
+.acme.sh/
+letsencrypt/
+
+# secrets for local tools
+.dev.vars*
+.wrangler/
+*.secret
+*-token
+*.token
+
+# node-specific configs and dumps pulled from servers
+Caddyfile
+!docs/**/Caddyfile
+haproxy.cfg
+*.env.prev
+*.prev
+core
+core.[0-9]*
+*.core
+
+# logs, backups, editor files
+*.log
+*.bak
+*.bak-*
+*.orig
+*.swp
+*~
+.idea/
+.vscode/
+.claude/
+
+# UI screenshots (CI artifacts) and their tooling
+node_modules/
 scripts/ui/package*.json
 shots/
 edge-pages/

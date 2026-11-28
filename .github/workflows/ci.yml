@@ -136,3 +136,15 @@ jobs:
             edge-pages/
             /tmp/fucf-ui.log
           retention-days: 14
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks git --redact --no-banner --exit-code 1 .
