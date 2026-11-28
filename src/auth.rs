@@ -412,6 +412,9 @@ struct User {
     failed: u32,
     #[serde(default)]
     locked_until: i64,
+    /// Digest of the Global API Key (X-Auth-Email + X-Auth-Key), if one was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
     sync: SyncMeta,
 }
@@ -448,6 +451,71 @@ struct Session {
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
     sync: SyncMeta,
 }
+
+/// An API token (Cloudflare style): what it may do is in its policies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiToken {
+    id: String,
+    /// Digest of the value (the value itself is shown once).
+    digest: String,
+    user_id: String,
+    name: String,
+    /// active or disabled
+    status: String,
+    #[serde(default)]
+    policies: Vec<crate::tokens::Policy>,
+    #[serde(default)]
+    condition: crate::tokens::Condition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_on: Option<String>,
+    issued_on: String,
+    modified_on: String,
+    #[serde(default)]
+    last_used: i64,
+    #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
+    sync: SyncMeta,
+}
+
+impl ApiToken {
+    fn view(&self) -> Value {
+        json!({
+            "id": self.id, "name": self.name, "status": self.status, "issued_on": self.issued_on,
+            "modified_on": self.modified_on, "not_before": self.not_before, "expires_on": self.expires_on,
+            "last_used_on": (self.last_used > 0).then(|| crate::store::rfc3339(self.last_used)),
+            "policies": self.policies, "condition": self.condition,
+        })
+    }
+}
+
+/// What a token is to become (create, or update with PUT).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TokenSpec {
+    pub name: Option<String>,
+    pub status: Option<String>,
+    pub policies: Option<Vec<crate::tokens::Policy>>,
+    pub condition: Option<crate::tokens::Condition>,
+    pub not_before: Option<String>,
+    pub expires_on: Option<String>,
+}
+
+/// An RFC 3339 time as kept (UTC, seconds); empty means none.
+fn token_time(what: &str, v: Option<String>) -> Result<Option<String>, AuthError> {
+    match v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => chrono::DateTime::parse_from_rfc3339(&v)
+            .map(|t| Some(t.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string()))
+            .map_err(|_| AuthError::invalid(format!("{what} must be an RFC 3339 time like 2030-01-01T00:00:00Z"))),
+    }
+}
+
+fn token_secs(v: &Option<String>) -> Option<i64> {
+    v.as_deref().and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok()).map(|t| t.timestamp())
+}
+
+const TOKENS_PER_USER: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuditEntry {
@@ -526,6 +594,10 @@ struct Data {
     #[serde(default)]
     deleted_sessions: BTreeMap<String, SyncMeta>,
     #[serde(default)]
+    tokens: Vec<ApiToken>,
+    #[serde(default)]
+    deleted_tokens: BTreeMap<String, SyncMeta>,
+    #[serde(default)]
     spent_jti: BTreeMap<String, i64>,
     #[serde(default)]
     spent_jti_rev: BTreeMap<String, u64>,
@@ -544,12 +616,36 @@ pub struct Principal {
     pub role: Role,
     pub session_id: Option<String>,
     pub must_change_password: bool,
+    /// How the request was let in.
+    pub via: Via,
+    /// For a user's API token: what it may do.
+    pub grant: Option<Arc<crate::tokens::Grant>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// Signed in to the panel.
+    Session,
+    /// The fleet's own API token.
+    System,
+    /// A user's API token.
+    Token,
+    /// A user's Global API Key.
+    ApiKey,
 }
 
 impl Principal {
     /// The API token: the fleet's own tooling.
     pub fn system() -> Principal {
-        Principal { user_id: None, email: "api-token".into(), role: Role::Admin, session_id: None, must_change_password: false }
+        Principal {
+            user_id: None,
+            email: "api-token".into(),
+            role: Role::Admin,
+            session_id: None,
+            must_change_password: false,
+            via: Via::System,
+            grant: None,
+        }
     }
 }
 
@@ -757,6 +853,13 @@ fn normalize_loaded_accounts(d: &mut Data, clock: &HlcClock) {
         m.deleted = true;
         bump(m);
     }
+    for t in &mut d.tokens {
+        bump(&mut t.sync);
+    }
+    for m in d.deleted_tokens.values_mut() {
+        m.deleted = true;
+        bump(m);
+    }
     for jti in d.spent_jti.keys() {
         d.spent_jti_rev.entry(jti.clone()).or_insert_with(|| {
             d.local_rev = d.local_rev.saturating_add(1);
@@ -808,6 +911,13 @@ fn gc_account_state(d: &mut Data, now_secs: i64, now_ms: u64) {
         }
         keep
     });
+    d.deleted_tokens.retain(|_, m| {
+        let keep = now_ms.saturating_sub(m.updated_ms) <= DURABLE_TOMBSTONE_TTL_MS;
+        if !keep {
+            d.gc_floor_rev = d.gc_floor_rev.max(m.local_rev);
+        }
+        keep
+    });
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -829,6 +939,10 @@ struct AccountsDeltaPayload {
     deleted_passkeys: BTreeMap<String, SyncMeta>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     deleted_sessions: BTreeMap<String, SyncMeta>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tokens: Vec<ApiToken>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    deleted_tokens: BTreeMap<String, SyncMeta>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     spent_jti: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -1040,6 +1154,7 @@ impl Accounts {
                 last_login_on: None,
                 failed: 0,
                 locked_until: 0,
+                api_key: None,
                 sync,
             };
             let view = user.view();
@@ -1179,6 +1294,12 @@ impl Accounts {
             for sid in rm_sessions {
                 let t = stamp_acc(&mut data, &self.clock, &node, true);
                 data.deleted_sessions.insert(sid, t);
+            }
+            let rm_tokens: Vec<String> = data.tokens.iter().filter(|t| t.user_id == id).map(|t| t.id.clone()).collect();
+            data.tokens.retain(|t| t.user_id != id);
+            for tid in rm_tokens {
+                let t = stamp_acc(&mut data, &self.clock, &node, true);
+                data.deleted_tokens.insert(tid, t);
             }
             Self::record(&mut data, &self.clock, &node, &actor.email, "user.delete", email, &client.ip);
             data.clone()
@@ -1435,6 +1556,8 @@ impl Accounts {
                 role: user.role,
                 session_id: Some(session_id),
                 must_change_password: user.must_change_password,
+                via: Via::Session,
+                grant: None,
             };
             (principal, stale)
         };
@@ -1469,6 +1592,7 @@ impl Accounts {
         let user = data.users.iter().find(|u| u.id == user_id)?;
         let mut view = user.view();
         view["backup_codes_left"] = json!(user.backup_codes.len());
+        view["api_key"] = json!(user.api_key.is_some());
         view["passkey_list"] = user.passkeys.iter().map(|p| json!({ "id": p.id, "name": p.name, "alg": p.alg, "created_on": p.created_on, "last_used_on": p.last_used_on })).collect();
         view["sessions"] = data
             .sessions
@@ -1893,6 +2017,7 @@ impl Accounts {
                 last_login_on: None,
                 failed: 0,
                 locked_until: 0,
+                api_key: None,
                 sync,
             };
             d.users.push(user);
@@ -1905,6 +2030,240 @@ impl Accounts {
         drop(d);
         self.commit_snapshot(snap);
         Ok((token, user_view))
+    }
+
+    // ------------------------------------------------------- API tokens ----
+
+    /// Who does this API token belong to, and may it be used now and from
+    /// there? Nothing if it is no token at all.
+    pub fn token(&self, value: &str, ip: Option<std::net::IpAddr>) -> Option<Result<Principal, AuthError>> {
+        let digest = hex(&sha256(value.as_bytes()));
+        let at = now();
+        let (result, stale) = {
+            let mut data = self.data.lock().unwrap();
+            let pos = data.tokens.iter().position(|t| ct_eq(t.digest.as_bytes(), digest.as_bytes()))?;
+            let t = &data.tokens[pos];
+            let refused = |code: u32, message: String| Some(Err(AuthError::new(if code == 9109 { 403 } else { 401 }, code, message)));
+            if t.status != "active" {
+                return refused(1000, "Invalid API Token: it is disabled".into());
+            }
+            if token_secs(&t.not_before).is_some_and(|nb| nb > at) || token_secs(&t.expires_on).is_some_and(|ex| ex <= at) {
+                return refused(1000, "Invalid API Token: it is not valid at this time".into());
+            }
+            if !crate::tokens::ip_allowed(&t.condition, ip) {
+                let from = ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into());
+                return refused(9109, format!("Cannot use the access token from location: {from}"));
+            }
+            let Some(user) = data.users.iter().find(|u| u.id == t.user_id && !u.disabled) else {
+                return refused(1000, "Invalid API Token: its owner cannot sign in".into());
+            };
+            let principal = Principal {
+                user_id: Some(user.id.clone()),
+                email: user.email.clone(),
+                role: user.role,
+                session_id: None,
+                must_change_password: false,
+                via: Via::Token,
+                grant: Some(Arc::new(crate::tokens::Grant { token_id: t.id.clone(), policies: t.policies.clone() })),
+            };
+            let stale = at - t.last_used > 300;
+            if stale {
+                data.tokens[pos].last_used = at;
+            }
+            (Ok(principal), stale)
+        };
+        if stale && !self.read_only.load(Ordering::Relaxed) {
+            self.writer.kick_async();
+        }
+        Some(result)
+    }
+
+    /// The caller's tokens (all of them for the fleet's own API token).
+    pub fn tokens(&self, actor: &Principal) -> Vec<Value> {
+        let data = self.data.lock().unwrap();
+        data.tokens.iter().filter(|t| actor.user_id.as_deref().is_none_or(|u| u == t.user_id)).map(ApiToken::view).collect()
+    }
+
+    pub fn token_view(&self, actor: &Principal, id: &str) -> Result<Value, AuthError> {
+        let data = self.data.lock().unwrap();
+        data.tokens
+            .iter()
+            .find(|t| t.id == id && actor.user_id.as_deref().is_none_or(|u| u == t.user_id))
+            .map(ApiToken::view)
+            .ok_or_else(|| AuthError::new(404, 1003, "no such token"))
+    }
+
+    fn token_fields(spec: TokenSpec, base: Option<&ApiToken>) -> Result<ApiToken, AuthError> {
+        let name = spec.name.or_else(|| base.map(|b| b.name.clone())).map(|n| n.trim().to_string()).unwrap_or_default();
+        if name.is_empty() || name.chars().count() > 120 {
+            return Err(AuthError::invalid("a token needs a name (at most 120 characters)"));
+        }
+        let status = spec.status.or_else(|| base.map(|b| b.status.clone())).unwrap_or_else(|| "active".into());
+        if status != "active" && status != "disabled" {
+            return Err(AuthError::invalid("status must be active or disabled"));
+        }
+        let mut policies = spec.policies.or_else(|| base.map(|b| b.policies.clone())).unwrap_or_default();
+        let condition = spec.condition.unwrap_or_default();
+        crate::tokens::validate(&mut policies, &condition).map_err(AuthError::invalid)?;
+        let not_before = token_time("not_before", spec.not_before)?;
+        let expires_on = token_time("expires_on", spec.expires_on)?;
+        if let (Some(a), Some(b)) = (token_secs(&not_before), token_secs(&expires_on)) {
+            if a >= b {
+                return Err(AuthError::invalid("expires_on must come after not_before"));
+            }
+        }
+        let at = crate::store::now();
+        Ok(ApiToken {
+            id: base.map(|b| b.id.clone()).unwrap_or_else(|| hex(&random(16))),
+            digest: base.map(|b| b.digest.clone()).unwrap_or_default(),
+            user_id: base.map(|b| b.user_id.clone()).unwrap_or_default(),
+            name,
+            status,
+            policies,
+            condition,
+            not_before,
+            expires_on,
+            issued_on: base.map(|b| b.issued_on.clone()).unwrap_or_else(|| at.clone()),
+            modified_on: at,
+            last_used: base.map(|b| b.last_used).unwrap_or(0),
+            sync: SyncMeta::default(),
+        })
+    }
+
+    /// A new token; its value is returned this once.
+    pub fn create_token(&self, actor: &Principal, spec: TokenSpec, client: &Client) -> Result<(Value, String), AuthError> {
+        self.check_writable()?;
+        let user_id = Self::own_id(actor)?.to_string();
+        let mut token = Self::token_fields(spec, None)?;
+        let value = b64(&random(30));
+        token.digest = hex(&sha256(value.as_bytes()));
+        token.user_id = user_id.clone();
+        let node = self.sync_node();
+        let (view, snap) = {
+            let mut data = self.data.lock().unwrap();
+            if data.tokens.iter().filter(|t| t.user_id == user_id).count() >= TOKENS_PER_USER {
+                return Err(AuthError::conflict("too many API tokens: delete some first"));
+            }
+            token.sync = stamp_acc(&mut data, &self.clock, &node, false);
+            data.deleted_tokens.remove(&token.id);
+            let view = token.view();
+            Self::record(&mut data, &self.clock, &node, &actor.email, "token.create", token.name.clone(), &client.ip);
+            data.tokens.push(token);
+            (view, data.clone())
+        };
+        self.commit_snapshot(snap);
+        Ok((view, value))
+    }
+
+    fn change_token<T>(&self, actor: &Principal, id: &str, what: &str, change: impl FnOnce(&mut ApiToken) -> Result<T, AuthError>, client: &Client) -> Result<T, AuthError> {
+        self.check_writable()?;
+        let node = self.sync_node();
+        let (out, snap) = {
+            let mut data = self.data.lock().unwrap();
+            let pos = data
+                .tokens
+                .iter()
+                .position(|t| t.id == id && actor.user_id.as_deref().is_none_or(|u| u == t.user_id))
+                .ok_or_else(|| AuthError::new(404, 1003, "no such token"))?;
+            let out = change(&mut data.tokens[pos])?;
+            data.tokens[pos].sync = stamp_acc(&mut data, &self.clock, &node, false);
+            let name = data.tokens[pos].name.clone();
+            Self::record(&mut data, &self.clock, &node, &actor.email, what, name, &client.ip);
+            (out, data.clone())
+        };
+        self.commit_snapshot(snap);
+        Ok(out)
+    }
+
+    /// PUT: what is given replaces what was (the value stays).
+    pub fn update_token(&self, actor: &Principal, id: &str, spec: TokenSpec, client: &Client) -> Result<Value, AuthError> {
+        self.change_token(
+            actor,
+            id,
+            "token.update",
+            |t| {
+                *t = Self::token_fields(spec, Some(&*t))?;
+                Ok(t.view())
+            },
+            client,
+        )
+    }
+
+    /// A new value for a token; the old one stops working.
+    pub fn roll_token(&self, actor: &Principal, id: &str, client: &Client) -> Result<String, AuthError> {
+        let value = b64(&random(30));
+        let digest = hex(&sha256(value.as_bytes()));
+        self.change_token(
+            actor,
+            id,
+            "token.roll",
+            |t| {
+                t.digest = digest;
+                t.modified_on = crate::store::now();
+                Ok(())
+            },
+            client,
+        )?;
+        Ok(value)
+    }
+
+    pub fn delete_token(&self, actor: &Principal, id: &str, client: &Client) -> Result<(), AuthError> {
+        self.check_writable()?;
+        let node = self.sync_node();
+        let snap = {
+            let mut data = self.data.lock().unwrap();
+            let pos = data
+                .tokens
+                .iter()
+                .position(|t| t.id == id && actor.user_id.as_deref().is_none_or(|u| u == t.user_id))
+                .ok_or_else(|| AuthError::new(404, 1003, "no such token"))?;
+            let gone = data.tokens.remove(pos);
+            let tomb = stamp_acc(&mut data, &self.clock, &node, true);
+            data.deleted_tokens.insert(gone.id.clone(), tomb);
+            Self::record(&mut data, &self.clock, &node, &actor.email, "token.delete", gone.name, &client.ip);
+            data.clone()
+        };
+        self.commit_snapshot(snap);
+        Ok(())
+    }
+
+    // --------------------------------------------------- Global API Key ----
+
+    /// Somebody presenting X-Auth-Email and X-Auth-Key.
+    pub fn api_key(&self, email: &str, key: &str) -> Option<Principal> {
+        let digest = hex(&sha256(key.trim().as_bytes()));
+        let data = self.data.lock().unwrap();
+        let user = data.users.iter().find(|u| u.email.eq_ignore_ascii_case(email.trim()) && !u.disabled)?;
+        let kept = user.api_key.as_deref()?;
+        if !ct_eq(kept.as_bytes(), digest.as_bytes()) {
+            return None;
+        }
+        Some(Principal {
+            user_id: Some(user.id.clone()),
+            email: user.email.clone(),
+            role: user.role,
+            session_id: None,
+            must_change_password: false,
+            via: Via::ApiKey,
+            grant: None,
+        })
+    }
+
+    /// A new Global API Key (the password again); shown this once. `remove`
+    /// takes it away instead.
+    pub fn roll_api_key(&self, actor: &Principal, password: &str, remove: bool, client: &Client) -> Result<Option<String>, AuthError> {
+        let user_id = Self::own_id(actor)?.to_string();
+        let key = (!remove).then(|| hex(&random(19))[..37].to_string());
+        let digest = key.as_ref().map(|k| hex(&sha256(k.as_bytes())));
+        let what = if remove { "api_key.remove" } else { "api_key.roll" };
+        let email = actor.email.clone();
+        let ip = client.ip.clone();
+        self.with_password(&user_id, password, move |data, at, clock, node| {
+            data.users[at].api_key = digest;
+            Self::record(data, clock, node, &email, what, String::new(), &ip);
+            Ok(())
+        })?;
+        Ok(key)
     }
 
     /// What happened lately, newest first.
@@ -1946,6 +2305,8 @@ impl SyncProvider for Accounts {
             deleted_users: d.deleted_users.iter().filter(|(_, m)| full_resync || m.local_rev > since).map(|(k, v)| (k.clone(), v.clone())).collect(),
             deleted_passkeys: d.deleted_passkeys.iter().filter(|(_, m)| full_resync || m.local_rev > since).map(|(k, v)| (k.clone(), v.clone())).collect(),
             deleted_sessions: d.deleted_sessions.iter().filter(|(_, m)| full_resync || m.local_rev > since).map(|(k, v)| (k.clone(), v.clone())).collect(),
+            tokens: d.tokens.iter().filter(|t| full_resync || t.sync.local_rev > since).cloned().collect(),
+            deleted_tokens: d.deleted_tokens.iter().filter(|(_, m)| full_resync || m.local_rev > since).map(|(k, v)| (k.clone(), v.clone())).collect(),
             spent_jti: d
                 .spent_jti
                 .iter()
@@ -1982,6 +2343,11 @@ impl SyncProvider for Accounts {
                 if d.users.len() != u_ids.len() || d.sessions.len() != s_ids.len() {
                     d.users.retain(|u| u_ids.contains(&u.id));
                     d.sessions.retain(|s| s_ids.contains(&s.id));
+                    changed = true;
+                }
+                let t_ids: HashSet<String> = payload.tokens.iter().map(|t| t.id.clone()).collect();
+                if d.tokens.len() != t_ids.len() {
+                    d.tokens.retain(|t| t_ids.contains(&t.id));
                     changed = true;
                 }
             }
@@ -2213,6 +2579,55 @@ impl SyncProvider for Accounts {
                 }
             }
 
+            // Merge API tokens (last writer wins; last use only moves forward)
+            for mut t in payload.tokens {
+                if t.sync.updated_ms > 0 {
+                    t.sync.clamp_skew(now_ms);
+                    clock.observe(t.sync.updated_ms, t.sync.seq);
+                }
+                if d.deleted_tokens.get(&t.id).is_some_and(|tomb| !t.sync.wins_over(tomb)) {
+                    continue;
+                }
+                if d.deleted_users.get(&t.user_id).is_some_and(|tomb| !t.sync.wins_over(tomb)) {
+                    continue;
+                }
+                d.deleted_tokens.remove(&t.id);
+                if let Some(pos) = d.tokens.iter().position(|cur| cur.id == t.id) {
+                    let last = d.tokens[pos].last_used.max(t.last_used);
+                    if t.sync.wins_over(&d.tokens[pos].sync) {
+                        rev = rev.saturating_add(1);
+                        t.sync.local_rev = rev;
+                        t.last_used = last;
+                        d.tokens[pos] = t;
+                        changed = true;
+                    } else if last > d.tokens[pos].last_used {
+                        d.tokens[pos].last_used = last;
+                        changed = true;
+                    }
+                } else {
+                    rev = rev.saturating_add(1);
+                    t.sync.local_rev = rev;
+                    d.tokens.push(t);
+                    changed = true;
+                }
+            }
+            for (tid, mut tomb) in payload.deleted_tokens {
+                tomb.deleted = true;
+                if tomb.updated_ms > 0 {
+                    tomb.clamp_skew(now_ms);
+                    clock.observe(tomb.updated_ms, tomb.seq);
+                }
+                let local_sync = d.tokens.iter().find(|t| t.id == tid).map(|t| &t.sync);
+                let cur_best = local_sync.into_iter().chain(d.deleted_tokens.get(&tid)).max_by(|a, b| a.version_key().cmp(&b.version_key()));
+                if cur_best.is_none_or(|b| tomb.wins_over(b)) {
+                    rev = rev.saturating_add(1);
+                    tomb.local_rev = rev;
+                    d.tokens.retain(|t| t.id != tid);
+                    d.deleted_tokens.insert(tid, tomb);
+                    changed = true;
+                }
+            }
+
             // Merge audit log (union by id, sorted chronologically, capped at AUDIT_KEPT)
             let mut audit_added = false;
             let existing_ids: HashSet<String> = d.audit.iter().map(|e| e.id.clone()).collect();
@@ -2311,6 +2726,90 @@ mod tests {
 
     fn principal(accounts: &Accounts, token: &str) -> Principal {
         accounts.session(token).unwrap()
+    }
+
+    #[test]
+    fn api_tokens_sync_roll_expire_and_the_global_key() {
+        let a = accounts();
+        a.set_sync_identity(Arc::new(HlcClock::default()), "au".into());
+        let b = accounts();
+        b.set_sync_identity(Arc::new(HlcClock::default()), "eu".into());
+        a.create_user("owner@example.com", Role::Admin, Some("a good password"), "owner@example.com", &client()).unwrap();
+        let session = sign_in(&a, "owner@example.com", "a good password");
+        let owner = principal(&a, &session);
+        let spec = |extra: Value| -> TokenSpec {
+            let mut v = json!({
+                "name": "certbot",
+                "policies": [{ "effect": "allow", "resources": { "com.cloudflare.api.account.zone.*": "*" }, "permission_groups": [{ "id": "4755a26eedb94da69e1066d98aa820be" }] }],
+                "condition": { "request.ip": { "in": ["198.51.100.0/24"] } },
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let (view, value) = a.create_token(&owner, spec(json!({})), &client()).unwrap();
+        assert_eq!(value.len(), 40);
+        assert_eq!(view["policies"][0]["permission_groups"][0]["name"], "DNS Write");
+        assert!(view.get("digest").is_none() && view.get("value").is_none());
+        let id = view["id"].as_str().unwrap().to_string();
+        let here: Option<std::net::IpAddr> = Some("198.51.100.7".parse().unwrap());
+        let who = a.token(&value, here).unwrap().unwrap();
+        assert_eq!((who.via, who.email.as_str(), who.role), (Via::Token, "owner@example.com", Role::Admin));
+        assert_eq!(a.token(&value, Some("203.0.113.1".parse().unwrap())).unwrap().unwrap_err().code, 9109);
+        assert!(a.token("not a token", here).is_none());
+        assert_eq!(a.tokens(&owner).len(), 1);
+        assert!(a.create_token(&owner, spec(json!({ "policies": [] })), &client()).is_err());
+        assert!(a.create_token(&owner, spec(json!({ "expires_on": "tomorrow" })), &client()).is_err());
+
+        // to the other node
+        assert!(b.merge_delta(&a.export_since(0, None).unwrap(), &b.clock).unwrap());
+        assert!(b.token(&value, here).unwrap().is_ok(), "a token made on one node works on the others");
+
+        // a new value; the old one stops working
+        let rolled = a.roll_token(&owner, &id, &client()).unwrap();
+        assert!(a.token(&value, here).is_none());
+        assert!(a.token(&rolled, here).unwrap().is_ok());
+        // PUT replaces: status off, and no address condition any more
+        a.update_token(&owner, &id, serde_json::from_value(json!({ "status": "disabled" })).unwrap(), &client()).unwrap();
+        assert_eq!(a.token(&rolled, None).unwrap().unwrap_err().code, 1000);
+        a.update_token(&owner, &id, serde_json::from_value(json!({ "status": "active" })).unwrap(), &client()).unwrap();
+        assert!(a.token(&rolled, None).unwrap().is_ok(), "the condition went with the PUT");
+
+        // out of its time
+        let (_, old) = a.create_token(&owner, spec(json!({ "expires_on": "2020-01-01T00:00:00Z" })), &client()).unwrap();
+        assert_eq!(a.token(&old, here).unwrap().unwrap_err().code, 1000);
+        let (_, later) = a.create_token(&owner, spec(json!({ "not_before": "2999-01-01T00:00:00+08:00" })), &client()).unwrap();
+        assert_eq!(a.token(&later, here).unwrap().unwrap_err().code, 1000);
+
+        // deleting reaches the other node too
+        a.delete_token(&owner, &id, &client()).unwrap();
+        assert!(a.token(&rolled, here).is_none());
+        b.merge_delta(&a.export_since(0, None).unwrap(), &b.clock).unwrap();
+        assert!(b.token(&value, here).is_none() && b.token(&rolled, here).is_none());
+        assert_eq!(b.tokens(&Principal::system()).len(), 2);
+
+        // the Global API Key takes the password, is shown once, and can be taken away
+        assert!(a.roll_api_key(&owner, "wrong password", false, &client()).is_err());
+        let key = a.roll_api_key(&owner, "a good password", false, &client()).unwrap().unwrap();
+        assert_eq!(key.len(), 37);
+        assert_eq!(a.api_key("OWNER@example.com", &key).unwrap().via, Via::ApiKey);
+        assert!(a.api_key("owner@example.com", "0123").is_none());
+        assert_eq!(a.me(owner.user_id.as_deref().unwrap(), None).unwrap()["api_key"], true);
+        assert_eq!(a.roll_api_key(&owner, "a good password", true, &client()).unwrap(), None);
+        assert!(a.api_key("owner@example.com", &key).is_none());
+
+        // the user goes, the tokens go
+        a.create_user("other@example.com", Role::Editor, Some("another good password"), "owner@example.com", &client()).unwrap();
+        let other_id = a.users().iter().find(|u| u["email"] == "other@example.com").unwrap()["id"].as_str().unwrap().to_string();
+        let mut other = owner.clone();
+        other.user_id = Some(other_id.clone());
+        other.email = "other@example.com".into();
+        let (_, theirs) = a.create_token(&other, spec(json!({})), &client()).unwrap();
+        assert!(a.token(&theirs, here).unwrap().is_ok());
+        assert!(a.tokens(&owner).len() == 2 && a.tokens(&other).len() == 1, "each sees their own");
+        a.delete_user(&other_id, &owner, &client()).unwrap();
+        assert!(a.token(&theirs, here).is_none());
     }
 
     fn sign_in(accounts: &Accounts, email: &str, password: &str) -> String {

@@ -9,7 +9,7 @@ use crate::items::{
     CacheRule, Certificate, CertificatePack, EmailRule, FirewallRule, Item, OriginRule, RateLimit, RedirectRule, SpectrumApp,
     TransformRule, WorkerRoute, WorkerScript,
 };
-use crate::auth::{Accounts, Assertion, AuthError, Client, Login, Principal, Proof, Registration, Role};
+use crate::auth::{Accounts, Assertion, AuthError, Client, Login, Principal, Proof, Registration, Role, TokenSpec, Via};
 use crate::store::{proxiable, Record, RecordInput, RecordOrigin, Store, StoreError, Zone};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
@@ -103,7 +103,15 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/audit", get(audit))
         .route("/fleet", get(fleet_overview))
         .route("/fleet/{node}/actions", post(fleet_action))
+        .route("/user", get(user_details))
+        .route("/user/tokens", get(list_tokens).post(create_token))
         .route("/user/tokens/verify", get(verify_token))
+        .route("/user/tokens/permission_groups", get(permission_groups))
+        .route("/user/tokens/{token_id}", get(get_token).put(update_token).delete(delete_token))
+        .route("/user/tokens/{token_id}/value", axum::routing::put(roll_token))
+        .route("/account/api_key", post(roll_api_key))
+        .route("/accounts", get(list_accounts))
+        .route("/accounts/{account_id}", get(get_account))
         .route("/system", get(system))
         .route("/replication/state", get(replication_state))
         .route("/replication/report", post(replication_report).layer(axum::extract::DefaultBodyLimit::max(32 << 20)))
@@ -138,6 +146,12 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/zones", get(list_zones).post(create_zone))
         .route("/zones/{zone_id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         .route("/zones/{zone_id}/dns_records", get(list_records).post(create_record))
+        .route("/zones/{zone_id}/dns_records/batch", post(batch_records))
+        .route("/zones/{zone_id}/dns_records/export", get(export_records))
+        .route(
+            "/zones/{zone_id}/dns_records/import",
+            post(import_records).layer(axum::extract::DefaultBodyLimit::max(4 << 20)),
+        )
         .route("/zones/{zone_id}/dnssec", get(get_dnssec).patch(patch_dnssec))
         .route(
             "/zones/{zone_id}/dns_records/{record_id}",
@@ -177,13 +191,53 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .merge(crud::<EmailRule>("/zones/{zone_id}/email/rules"))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
-    Router::new()
+    let app: Router = Router::new()
         .route("/", get(panel_html))
         .route("/fonts/{name}", get(font))
         .nest("/client/v4", open.merge(v4))
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()) })
         .layer(middleware::from_fn(security_headers))
-        .with_state(state)
+        .with_state(state);
+    // Cloudflare's account-level paths (`/accounts/{id}/workers/...`, `.../storage/kv/...`,
+    // `.../d1/...`, `.../tokens`) are the same as the ones here without the account
+    let inner = app.clone();
+    let by_account = axum::routing::any(move |req: Request| {
+        let mut inner = inner.clone();
+        async move {
+            match account_path(req) {
+                Ok(req) => tower_service::Service::call(&mut inner, req).await.unwrap_or_else(|never| match never {}),
+                Err(e) => e.into_response(),
+            }
+        }
+    });
+    Router::new().route("/client/v4/accounts/{account_id}/{*rest}", by_account).merge(app)
+}
+
+/// `/client/v4/accounts/{account}/{rest}` as the path it stands for here.
+fn account_path(mut req: Request) -> Result<Request, ApiError> {
+    let path = req.uri().path().to_string();
+    let rest = path.strip_prefix("/client/v4/accounts/").unwrap_or_default();
+    let (account, rest) = rest.split_once('/').unwrap_or((rest, ""));
+    if account != crate::tokens::account_id() {
+        return Err(ApiError(StatusCode::NOT_FOUND, 7003, "Could not route to this account: perhaps the identifier is wrong".into()));
+    }
+    let under = |prefix: &str| rest == prefix || rest.strip_prefix(prefix).is_some_and(|r| r.starts_with('/'));
+    let mapped = if under("workers/scripts") {
+        format!("/{rest}")
+    } else if under("storage/kv/namespaces") {
+        format!("/kv/{}", &rest["storage/kv/".len()..])
+    } else if under("d1/database") {
+        format!("/{rest}")
+    } else if under("tokens") {
+        format!("/user/{rest}")
+    } else if under("audit_logs") {
+        "/audit".to_string()
+    } else {
+        return Err(ApiError(StatusCode::NOT_FOUND, 7000, "No route for that URI".into()));
+    };
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    *req.uri_mut() = format!("/client/v4{mapped}{query}").parse().map_err(|_| bad("bad path"))?;
+    Ok(req)
 }
 
 async fn panel_html() -> Response {
@@ -342,7 +396,7 @@ async fn client_of(mut req: Request, next: Next) -> Response {
 fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
     let under = |prefix: &str| path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'));
     let reads = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
-    let own = under("/account");
+    let own = under("/account") || under("/user");
     let admins = under("/users")
         || under("/oauth")
         || under("/audit")
@@ -359,21 +413,27 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
 /// Who is asking: the API token (the fleet's own tooling), or somebody
 /// signed in to the panel.
 async fn auth(State(st): St, mut req: Request, next: Next) -> Response {
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim);
+    let from = client(req.headers());
+    let text = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty());
+    let presented = text(header::AUTHORIZATION.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
     let who = match presented {
-        Some(t) if ct_eq(t.as_bytes(), st.token.as_bytes()) => Some(Principal::system()),
-        Some(t) => st.accounts.session(t),
-        None => None,
+        Some(t) if ct_eq(t.as_bytes(), st.token.as_bytes()) => Ok(Some(Principal::system())),
+        Some(t) if t.starts_with("fucf_s_") => Ok(st.accounts.session(t)),
+        // a user's API token, Cloudflare style
+        Some(t) => st.accounts.token(t, from.ip.parse().ok()).transpose(),
+        // or the Global API Key
+        None => match (text("x-auth-email"), text("x-auth-key")) {
+            (Some(email), Some(key)) => Ok(st.accounts.api_key(email, key)),
+            _ => Ok(None),
+        },
     };
-    let Some(who) = who else {
-        return ApiError(StatusCode::UNAUTHORIZED, 10000, "Authentication error".into()).into_response();
+    let who = match who {
+        Ok(Some(who)) => who,
+        Ok(None) => return ApiError(StatusCode::UNAUTHORIZED, 10000, "Authentication error".into()).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
+    let path = path.as_str();
     if who.must_change_password
         && !matches!((req.method().as_str(), path), ("GET", "/account") | ("POST", "/account/password") | ("POST", "/account/logout"))
     {
@@ -382,7 +442,15 @@ async fn auth(State(st): St, mut req: Request, next: Next) -> Response {
     if !permitted(who.role, req.method(), path) {
         return ApiError(StatusCode::FORBIDDEN, 2010, "your role does not allow this".into()).into_response();
     }
-    let from = client(req.headers());
+    let token_allows = match who.via {
+        Via::Token => who.grant.as_ref().is_some_and(|g| g.allows(req.method().as_str(), path, who.user_id.as_deref().unwrap_or_default())),
+        // the key opens what its owner may do, but not the owner's credentials
+        Via::ApiKey => !(path == "/account" || path.starts_with("/account/") || path.starts_with("/replication")),
+        Via::Session | Via::System => true,
+    };
+    if !token_allows {
+        return ApiError(StatusCode::FORBIDDEN, 9109, "Unauthorized to access requested resource".into()).into_response();
+    }
     req.extensions_mut().insert(who);
     req.extensions_mut().insert(from);
     next.run(req).await
@@ -1079,8 +1147,109 @@ async fn fleet_action(State(st): St, axum::Extension(who): Who, axum::Extension(
     ok(json!({ "node": node, "action": b.action, "message": said }))
 }
 
-async fn verify_token() -> ApiResult {
-    ok(json!({ "status": "active" }))
+async fn verify_token(State(st): St, axum::Extension(who): Who) -> ApiResult {
+    match &who.grant {
+        Some(g) => {
+            let view = st.accounts.token_view(&who, &g.token_id)?;
+            ok(json!({ "id": g.token_id, "status": "active", "not_before": view["not_before"], "expires_on": view["expires_on"] }))
+        }
+        None => ok(json!({ "status": "active" })),
+    }
+}
+
+/// `/user`: who the credentials belong to.
+async fn user_details(axum::Extension(who): Who) -> ApiResult {
+    ok(json!({
+        "id": who.user_id, "email": who.email, "role": who.role,
+        "has_pro_zones": false, "has_business_zones": false, "has_enterprise_zones": false, "suspended": false,
+        "two_factor_authentication_enabled": false,
+    }))
+}
+
+fn account_json() -> Value {
+    json!({
+        "id": crate::tokens::account_id(), "name": crate::tokens::ACCOUNT_NAME, "type": "standard",
+        "settings": { "enforce_twofactor": false }, "created_on": "2026-01-01T00:00:00Z",
+    })
+}
+
+async fn list_accounts(Query(q): Params) -> ApiResult {
+    paginated(vec![account_json()], &q, 20)
+}
+
+async fn get_account(Path(account_id): Path<String>) -> ApiResult {
+    if account_id != crate::tokens::account_id() {
+        return Err(StoreError::NotFound.into());
+    }
+    ok(account_json())
+}
+
+async fn permission_groups(Query(q): Params) -> ApiResult {
+    paginated(crate::tokens::groups_json(), &q, 100)
+}
+
+async fn list_tokens(State(st): St, axum::Extension(who): Who, Query(q): Params) -> ApiResult {
+    paginated(st.accounts.tokens(&who), &q, 20)
+}
+
+async fn get_token(State(st): St, axum::Extension(who): Who, Path(id): Path<String>) -> ApiResult {
+    ok(st.accounts.token_view(&who, &id)?)
+}
+
+fn writable(st: &ApiState) -> Result<(), ApiError> {
+    if st.role.is_accelerate() {
+        return Err(StoreError::ReadOnly.into());
+    }
+    Ok(())
+}
+
+async fn create_token(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    writable(&st)?;
+    let spec: TokenSpec = body(&bytes)?;
+    let (mut view, value) = accounts_blocking(&st, move |accounts| Ok(accounts.create_token(&who, spec, &from)?)).await?;
+    push_auth_critical(&st).await;
+    view["value"] = json!(value);
+    ok(view)
+}
+
+async fn update_token(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    writable(&st)?;
+    let spec: TokenSpec = body(&bytes)?;
+    let view = accounts_blocking(&st, move |accounts| Ok(accounts.update_token(&who, &id, spec, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(view)
+}
+
+async fn roll_token(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>) -> ApiResult {
+    writable(&st)?;
+    let value = accounts_blocking(&st, move |accounts| Ok(accounts.roll_token(&who, &id, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!(value))
+}
+
+async fn delete_token(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, Path(id): Path<String>) -> ApiResult {
+    writable(&st)?;
+    let gone = id.clone();
+    accounts_blocking(&st, move |accounts| Ok(accounts.delete_token(&who, &gone, &from)?)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "id": id }))
+}
+
+#[derive(Deserialize)]
+struct ApiKeyBody {
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    remove: bool,
+}
+
+/// A new Global API Key for oneself (`remove` takes it away); the password again.
+async fn roll_api_key(State(st): St, axum::Extension(who): Who, axum::Extension(from): Caller, bytes: Bytes) -> ApiResult {
+    writable(&st)?;
+    let b: ApiKeyBody = body(&bytes)?;
+    let key = hashing(&st, move |accounts| accounts.roll_api_key(&who, &b.password, b.remove, &from)).await?;
+    push_auth_critical(&st).await;
+    ok(json!({ "api_key": key }))
 }
 
 // --------------------------------------------------------------- zones ----
@@ -1090,13 +1259,24 @@ fn zone_json(z: &Zone) -> Value {
         "id": z.id, "name": z.name, "status": z.status, "paused": z.paused, "type": z.kind,
         "settings": z.settings,
         "name_servers": z.name_servers, "created_on": z.created_on, "modified_on": z.modified_on,
+        "account": { "id": crate::tokens::account_id(), "name": crate::tokens::ACCOUNT_NAME },
+        "plan": { "id": "free", "name": "Free Website", "price": 0, "currency": "USD", "is_subscribed": true, "can_subscribe": false },
+        "permissions": [],
     })
 }
 
-async fn list_zones(State(st): St, Query(q): Params) -> ApiResult {
+async fn list_zones(State(st): St, axum::Extension(who): Who, Query(q): Params) -> ApiResult {
     let name = q.get("name").map(|n| n.trim_end_matches('.').to_ascii_lowercase());
+    let status = q.get("status");
     let zones = st.store.list_zones();
-    let items = zones.iter().filter(|z| name.as_ref().is_none_or(|n| &z.name == n)).map(zone_json).collect();
+    let items = zones
+        .iter()
+        .filter(|z| name.as_ref().is_none_or(|n| &z.name == n))
+        .filter(|z| status.is_none_or(|s| &z.status == s))
+        // a token sees the zones it names
+        .filter(|z| who.grant.as_ref().is_none_or(|g| g.sees_zone(&z.id)))
+        .map(zone_json)
+        .collect();
     paginated(items, &q, 20)
 }
 
@@ -1142,6 +1322,8 @@ fn record_json(z: &Zone, r: &Record) -> Value {
         "id": r.id, "zone_id": r.zone_id, "zone_name": z.name, "name": r.name, "type": r.rtype,
         "content": r.content, "ttl": r.ttl, "proxied": r.proxied, "proxiable": proxiable(&r.rtype),
         "comment": r.comment, "origin": r.origin, "created_on": r.created_on, "modified_on": r.modified_on,
+        "tags": [], "settings": {}, "locked": false,
+        "meta": { "auto_added": false, "managed_by_apps": false, "managed_by_argo_tunnel": false },
     });
     if let Some(p) = r.priority {
         v["priority"] = json!(p);
@@ -1161,15 +1343,37 @@ struct RecordBody {
     comment: Option<String>,
     /// Origin options of a proxied record; an empty object removes them.
     origin: Option<RecordOrigin>,
+    /// Cloudflare's structured content (SRV, CAA), used when there is no `content`.
+    data: Option<Value>,
+}
+
+/// Cloudflare's `data` for SRV and CAA records as content (and priority).
+fn content_of_data(rtype: &str, data: &Value) -> Result<(String, Option<u16>), ApiError> {
+    let num = |k: &str| data[k].as_u64().ok_or_else(|| bad(format!("data.{k} must be a number")));
+    let text = |k: &str| data[k].as_str().map(str::to_string).ok_or_else(|| bad(format!("data.{k} must be text")));
+    match rtype.to_ascii_uppercase().as_str() {
+        "SRV" => {
+            let priority = u16::try_from(num("priority")?).map_err(|_| bad("data.priority is too large"))?;
+            Ok((format!("{} {} {}", num("weight")?, num("port")?, text("target")?), Some(priority)))
+        }
+        "CAA" => Ok((format!("{} {} \"{}\"", num("flags")?, text("tag")?, text("value")?.replace('"', "")), None)),
+        other => Err(bad(format!("'data' is for SRV and CAA records here, not {other}: use 'content'"))),
+    }
 }
 
 impl RecordBody {
     /// Build a full record, taking missing fields from `base` (PATCH) or
     /// requiring them (POST/PUT).
-    fn into_input(self, base: Option<&Record>) -> Result<RecordInput, ApiError> {
+    fn into_input(mut self, base: Option<&Record>) -> Result<RecordInput, ApiError> {
         let need = |v: Option<String>, old: Option<&String>, field: &str| {
             v.or_else(|| old.cloned()).ok_or_else(|| bad(format!("'{field}' is required")))
         };
+        if let (None, Some(data)) = (&self.content, &self.data) {
+            let rtype = self.rtype.clone().or_else(|| base.map(|b| b.rtype.clone())).unwrap_or_default();
+            let (content, priority) = content_of_data(&rtype, data)?;
+            self.content = Some(content);
+            self.priority = self.priority.or(priority);
+        }
         Ok(RecordInput {
             rtype: need(self.rtype, base.map(|b| &b.rtype), "type")?,
             name: need(self.name, base.map(|b| &b.name), "name")?,
@@ -1183,19 +1387,428 @@ impl RecordBody {
     }
 }
 
+type RecordTest = Box<dyn Fn(&Record) -> bool>;
+
+/// Cloudflare's record filters: `type`, `proxied`, `search`, and for name,
+/// content and comment `x`, `x.exact`, `x.contains`, `x.startswith`,
+/// `x.endswith` (comment also `.present` / `.absent`); `match=any|all`.
+fn record_tests(q: &HashMap<String, String>) -> Result<Vec<RecordTest>, ApiError> {
+    let mut tests: Vec<RecordTest> = Vec::new();
+    let fields: [(&str, fn(&Record) -> String); 3] = [
+        ("name", |r| r.name.clone()),
+        ("content", |r| r.content.clone()),
+        ("comment", |r| r.comment.clone().unwrap_or_default()),
+    ];
+    for (field, get) in fields {
+        for (key, raw) in q {
+            let Some(rest) = key.strip_prefix(field) else { continue };
+            let op = match rest {
+                "" => "exact",
+                _ => match rest.strip_prefix('.') {
+                    Some(op) => op,
+                    None => continue,
+                },
+            };
+            // content compares as given; names and comments regardless of case
+            let fold = |v: &str| if field == "content" { v.to_string() } else { v.to_ascii_lowercase() };
+            let want = if field == "name" { fold(raw.trim_end_matches('.')) } else { fold(raw) };
+            let test: RecordTest = match op {
+                "exact" => Box::new(move |r| fold_of(field, &get(r)) == want),
+                "contains" => Box::new(move |r| fold_of(field, &get(r)).contains(&want)),
+                "startswith" => Box::new(move |r| fold_of(field, &get(r)).starts_with(&want)),
+                "endswith" => Box::new(move |r| fold_of(field, &get(r)).ends_with(&want)),
+                "present" => Box::new(move |r| !get(r).is_empty()),
+                "absent" => Box::new(move |r| get(r).is_empty()),
+                _ => return Err(bad(format!("unknown filter '{key}'"))),
+            };
+            tests.push(test);
+        }
+    }
+    if let Some(t) = q.get("type") {
+        let t = t.to_ascii_uppercase();
+        tests.push(Box::new(move |r| r.rtype == t));
+    }
+    if let Some(p) = q.get("proxied") {
+        let p = p == "true";
+        tests.push(Box::new(move |r| r.proxied == p));
+    }
+    if let Some(s) = q.get("search").map(|s| s.to_ascii_lowercase()).filter(|s| !s.is_empty()) {
+        tests.push(Box::new(move |r| {
+            r.name.contains(&s) || r.content.to_ascii_lowercase().contains(&s) || r.comment.as_deref().is_some_and(|c| c.to_ascii_lowercase().contains(&s))
+        }));
+    }
+    Ok(tests)
+}
+
+fn fold_of(field: &str, v: &str) -> String {
+    if field == "content" {
+        v.to_string()
+    } else {
+        v.to_ascii_lowercase()
+    }
+}
+
 async fn list_records(State(st): St, Path(zone_id): Path<String>, Query(q): Params) -> ApiResult {
-    let (zone, records) = st.store.list_records(&zone_id)?;
-    let rtype = q.get("type").map(|t| t.to_ascii_uppercase());
-    let name = q.get("name").map(|n| n.trim_end_matches('.').to_ascii_lowercase());
-    let content = q.get("content");
-    let items = records
-        .iter()
-        .filter(|r| rtype.as_ref().is_none_or(|t| &r.rtype == t))
-        .filter(|r| name.as_ref().is_none_or(|n| &r.name == n))
-        .filter(|r| content.is_none_or(|c| &r.content == c))
-        .map(|r| record_json(&zone, r))
-        .collect();
+    let (zone, mut records) = st.store.list_records(&zone_id)?;
+    let tests = record_tests(&q)?;
+    let any = q.get("match").is_some_and(|m| m == "any");
+    records.retain(|r| tests.is_empty() || if any { tests.iter().any(|t| t(r)) } else { tests.iter().all(|t| t(r)) });
+    match q.get("order").map(String::as_str) {
+        Some("type") => records.sort_by(|a, b| a.rtype.cmp(&b.rtype).then(a.name.cmp(&b.name))),
+        Some("name") => records.sort_by(|a, b| a.name.cmp(&b.name).then(a.rtype.cmp(&b.rtype))),
+        Some("content") => records.sort_by(|a, b| a.content.cmp(&b.content)),
+        Some("ttl") => records.sort_by_key(|r| r.ttl),
+        Some("proxied") => records.sort_by_key(|r| r.proxied),
+        _ => {}
+    }
+    if q.get("direction").is_some_and(|d| d == "desc") {
+        records.reverse();
+    }
+    let items = records.iter().map(|r| record_json(&zone, r)).collect();
     paginated(items, &q, 100)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BatchBody {
+    deletes: Vec<Value>,
+    patches: Vec<Value>,
+    puts: Vec<Value>,
+    posts: Vec<Value>,
+}
+
+/// `POST /dns_records/batch`: deletes, then patches, puts and posts, in
+/// that order. Everything is checked first; should a change still fail
+/// half way, the ones before it stay done (the error says where it stopped).
+async fn batch_records(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let b: BatchBody = body(&bytes)?;
+    if b.deletes.len() + b.patches.len() + b.puts.len() + b.posts.len() > 1000 {
+        return Err(bad("at most 1000 changes in one batch"));
+    }
+    let id_of = |v: &Value, at: &str| v["id"].as_str().map(str::to_string).ok_or_else(|| bad(format!("{at}: 'id' is required")));
+    let mut parsed_patches = Vec::new();
+    for (i, v) in b.patches.iter().enumerate() {
+        let id = id_of(v, &format!("patches[{i}]"))?;
+        let rb: RecordBody = serde_json::from_value(v.clone()).map_err(|e| bad(format!("patches[{i}]: {e}")))?;
+        parsed_patches.push((id, rb));
+    }
+    let mut parsed_puts = Vec::new();
+    for (i, v) in b.puts.iter().enumerate() {
+        let id = id_of(v, &format!("puts[{i}]"))?;
+        let rb: RecordBody = serde_json::from_value(v.clone()).map_err(|e| bad(format!("puts[{i}]: {e}")))?;
+        parsed_puts.push((id, rb.into_input(None).map_err(|e| bad(format!("puts[{i}]: {}", e.2)))?));
+    }
+    let mut parsed_posts = Vec::new();
+    for (i, v) in b.posts.iter().enumerate() {
+        let rb: RecordBody = serde_json::from_value(v.clone()).map_err(|e| bad(format!("posts[{i}]: {e}")))?;
+        parsed_posts.push(rb.into_input(None).map_err(|e| bad(format!("posts[{i}]: {}", e.2)))?);
+    }
+    let mut deletes = Vec::new();
+    for (i, v) in b.deletes.iter().enumerate() {
+        let id = id_of(v, &format!("deletes[{i}]"))?;
+        deletes.push(st.store.get_record(&zone_id, &id).map_err(|e| bad(format!("deletes[{i}]: {}", ApiError::from(e).2)))?);
+    }
+    let changed = parsed_patches.iter().map(|(id, _)| ("patches", id)).chain(parsed_puts.iter().map(|(id, _)| ("puts", id)));
+    for (what, id) in changed {
+        st.store.get_record(&zone_id, id).map_err(|e| bad(format!("{what}: {id}: {}", ApiError::from(e).2)))?;
+    }
+    let stopped = |what: &str, i: usize, e: StoreError| {
+        let e = ApiError::from(e);
+        ApiError(e.0, e.1, format!("{what}[{i}]: {} (the changes before it were made)", e.2))
+    };
+    let mut out = json!({ "deletes": [], "patches": [], "puts": [], "posts": [] });
+    for (i, (zone, rec)) in deletes.into_iter().enumerate() {
+        st.store.delete_record_async(&zone_id, &rec.id).await.map_err(|e| stopped("deletes", i, e))?;
+        out["deletes"].as_array_mut().unwrap().push(record_json(&zone, &rec));
+    }
+    for (i, (id, rb)) in parsed_patches.into_iter().enumerate() {
+        let (_, existing) = st.store.get_record(&zone_id, &id).map_err(|e| stopped("patches", i, e))?;
+        let input = rb.into_input(Some(&existing)).map_err(|e| ApiError(e.0, e.1, format!("patches[{i}]: {}", e.2)))?;
+        let (zone, rec) = st.store.update_record_async(&zone_id, &id, input).await.map_err(|e| stopped("patches", i, e))?;
+        out["patches"].as_array_mut().unwrap().push(record_json(&zone, &rec));
+    }
+    for (i, (id, input)) in parsed_puts.into_iter().enumerate() {
+        let (zone, rec) = st.store.update_record_async(&zone_id, &id, input).await.map_err(|e| stopped("puts", i, e))?;
+        out["puts"].as_array_mut().unwrap().push(record_json(&zone, &rec));
+    }
+    for (i, input) in parsed_posts.into_iter().enumerate() {
+        let (zone, rec) = st.store.create_record_async(&zone_id, input).await.map_err(|e| stopped("posts", i, e))?;
+        out["posts"].as_array_mut().unwrap().push(record_json(&zone, &rec));
+    }
+    ok(out)
+}
+
+/// A name as it goes in a zone file.
+fn dotted(name: &str) -> String {
+    if name.is_empty() {
+        ".".into()
+    } else {
+        format!("{}.", name.trim_end_matches('.'))
+    }
+}
+
+/// `GET /dns_records/export`: the zone as a BIND file (Cloudflare's
+/// `cf_tags=cf-proxied:true` marks the proxied ones).
+async fn export_records(State(st): St, Path(zone_id): Path<String>) -> Result<Response, ApiError> {
+    let (zone, records) = st.store.list_records(&zone_id)?;
+    let mut out = format!(";;\n;; Domain:     {}.\n;; Exported:   {}\n;;\n$ORIGIN {}.\n", zone.name, crate::store::now(), zone.name);
+    for r in &records {
+        let ttl = if r.ttl == 1 { 300 } else { r.ttl };
+        let content = match r.rtype.as_str() {
+            "CNAME" | "NS" | "PTR" => dotted(&r.content),
+            "MX" => format!("{} {}", r.priority.unwrap_or(10), dotted(&r.content)),
+            "SRV" => {
+                let f: Vec<&str> = r.content.split_whitespace().collect();
+                match (f.len(), r.priority) {
+                    (3, Some(p)) => format!("{p} {} {} {}", f[0], f[1], dotted(f[2])),
+                    (4, _) => format!("{} {} {} {}", f[0], f[1], f[2], dotted(f[3])),
+                    _ => r.content.clone(),
+                }
+            }
+            "TXT" if !r.content.starts_with('"') => format!("\"{}\"", r.content.replace('\\', "\\\\").replace('"', "\\\"")),
+            _ => r.content.clone(),
+        };
+        let mut tags = Vec::new();
+        if r.proxied {
+            tags.push("cf_tags=cf-proxied:true".to_string());
+        }
+        if let Some(c) = r.comment.as_deref().filter(|c| !c.is_empty()) {
+            tags.push(c.replace('\n', " "));
+        }
+        let note = if tags.is_empty() { String::new() } else { format!(" ; {}", tags.join(" ")) };
+        out.push_str(&format!("{}\t{ttl}\tIN\t{}\t{content}{note}\n", dotted(&r.name), r.rtype));
+    }
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], out).into_response())
+}
+
+/// Words of a zone file line, quotes kept together; what follows `;` is the note.
+fn zone_words(line: &str) -> (Vec<String>, String) {
+    let (mut words, mut cur, mut quoted, mut escaped) = (Vec::new(), String::new(), false, false);
+    for (i, c) in line.char_indices() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => {
+                cur.push(c);
+                escaped = true;
+            }
+            '"' => {
+                cur.push(c);
+                quoted = !quoted;
+            }
+            ';' if !quoted => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+                return (words, line[i + 1..].trim().to_string());
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    (words, String::new())
+}
+
+/// A zone file line without its note and without parentheses outside
+/// quotes; the note; whether a parenthesis is still open.
+fn without_parens(line: &str) -> (String, String, bool) {
+    let (mut out, mut depth, mut quoted, mut escaped) = (String::new(), 0i32, false, false);
+    for (i, c) in line.char_indices() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => {
+                out.push(c);
+                escaped = true;
+            }
+            '"' => {
+                out.push(c);
+                quoted = !quoted;
+            }
+            ';' if !quoted => return (out, line[i + 1..].trim().to_string(), depth > 0),
+            '(' if !quoted => {
+                depth += 1;
+                out.push(' ');
+            }
+            ')' if !quoted => {
+                depth -= 1;
+                out.push(' ');
+            }
+            c => out.push(c),
+        }
+    }
+    (out, String::new(), depth > 0)
+}
+
+/// Records of a BIND zone file (SOA and the apex NS are the platform's and left out).
+fn parse_zone_file(text: &str, zone: &str, proxied_default: bool) -> (Vec<RecordInput>, Vec<String>) {
+    let (mut out, mut skipped) = (Vec::new(), Vec::new());
+    let mut origin = zone.to_string();
+    let mut default_ttl = 1u32;
+    let mut last_name = zone.to_string();
+    let mut pending = String::new();
+    let fqdn = |n: &str, origin: &str| -> String {
+        if n == "@" {
+            origin.to_string()
+        } else if let Some(abs) = n.strip_suffix('.') {
+            abs.to_ascii_lowercase()
+        } else {
+            format!("{}.{origin}", n.to_ascii_lowercase())
+        }
+    };
+    for (no, raw) in text.lines().enumerate() {
+        // records spread over lines with ( ... )
+        let line = if pending.is_empty() { raw.to_string() } else { format!("{pending} {raw}") };
+        let (code, note, open) = without_parens(&line);
+        if open {
+            pending = code;
+            continue;
+        }
+        pending.clear();
+        let line = if note.is_empty() { code } else { format!("{code};{note}") };
+        let starts_blank = line.starts_with([' ', '\t']);
+        let (words, note) = zone_words(&line);
+        if words.is_empty() {
+            continue;
+        }
+        match words[0].to_ascii_uppercase().as_str() {
+            "$ORIGIN" => {
+                if let Some(o) = words.get(1) {
+                    origin = o.trim_end_matches('.').to_ascii_lowercase();
+                }
+                continue;
+            }
+            "$TTL" => {
+                default_ttl = words.get(1).and_then(|t| t.parse().ok()).unwrap_or(default_ttl);
+                continue;
+            }
+            w if w.starts_with('$') => {
+                skipped.push(format!("line {}: {w} is not supported", no + 1));
+                continue;
+            }
+            _ => {}
+        }
+        let mut it = words.iter();
+        let name = if starts_blank { last_name.clone() } else { fqdn(it.next().map(String::as_str).unwrap_or("@"), &origin) };
+        last_name = name.clone();
+        let mut ttl = default_ttl;
+        let mut rtype = String::new();
+        for w in it.by_ref() {
+            if let Ok(t) = w.parse::<u32>() {
+                ttl = t;
+                continue;
+            }
+            let up = w.to_ascii_uppercase();
+            if matches!(up.as_str(), "IN" | "CH" | "HS") {
+                continue;
+            }
+            rtype = up;
+            break;
+        }
+        let rest: Vec<String> = it.cloned().collect();
+        if rtype.is_empty() || rest.is_empty() {
+            skipped.push(format!("line {}: not a record", no + 1));
+            continue;
+        }
+        if rtype == "SOA" || (rtype == "NS" && name == zone) {
+            continue;
+        }
+        if !crate::dns::wire::SUPPORTED_TYPES.contains(&rtype.as_str()) {
+            skipped.push(format!("line {}: {rtype} records are not supported", no + 1));
+            continue;
+        }
+        let target = |n: &str| if n == "." { ".".to_string() } else { fqdn(n, &origin) };
+        let (content, priority) = match rtype.as_str() {
+            "CNAME" | "NS" | "PTR" => (target(&rest[0]), None),
+            "MX" if rest.len() >= 2 => (target(&rest[1]), rest[0].parse().ok()),
+            "SRV" if rest.len() >= 4 => (format!("{} {} {}", rest[1], rest[2], target(&rest[3])), rest[0].parse().ok()),
+            _ => (rest.join(" "), None),
+        };
+        let proxied = crate::store::proxiable(&rtype) && !note.contains("cf-proxied:false") && (proxied_default || note.contains("cf-proxied:true"));
+        let comment = note
+            .split_whitespace()
+            .filter(|w| !w.starts_with("cf_tags="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(RecordInput {
+            rtype,
+            name,
+            content,
+            ttl: if ttl <= 1 { 1 } else { ttl.clamp(30, 86400) },
+            priority,
+            proxied,
+            comment: (!comment.is_empty()).then_some(comment),
+            origin: None,
+        });
+    }
+    (out, skipped)
+}
+
+/// The file of a `multipart/form-data` upload (field `file`), and the
+/// other fields; any other body is the file itself.
+fn upload(content_type: &str, bytes: &[u8]) -> (String, HashMap<String, String>) {
+    let mut fields = HashMap::new();
+    let boundary = content_type
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("boundary="))
+        .next()
+        .map(|b| b.trim_matches('"').to_string());
+    let (Some(boundary), true) = (boundary, content_type.starts_with("multipart/form-data")) else {
+        return (String::from_utf8_lossy(bytes).into_owned(), fields);
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let mut file = String::new();
+    for part in text.split(&format!("--{boundary}")) {
+        let Some((head, body)) = part.split_once("\r\n\r\n").or_else(|| part.split_once("\n\n")) else { continue };
+        let body = body.strip_suffix("\r\n").or_else(|| body.strip_suffix('\n')).unwrap_or(body);
+        let name = head
+            .split(';')
+            .filter_map(|p| p.trim().strip_prefix("name="))
+            .next()
+            .map(|n| n.split(['\r', '\n']).next().unwrap_or(n).trim_matches('"').to_string())
+            .unwrap_or_default();
+        if name == "file" {
+            file = body.to_string();
+        } else if !name.is_empty() {
+            fields.insert(name, body.trim().to_string());
+        }
+    }
+    (file, fields)
+}
+
+/// `POST /dns_records/import`: a BIND file (multipart field `file`, as
+/// Cloudflare takes it, or the body itself); `proxied=true` proxies what can be.
+async fn import_records(State(st): St, Path(zone_id): Path<String>, Query(q): Params, headers: header::HeaderMap, bytes: Bytes) -> ApiResult {
+    let zone = st.store.get_zone(&zone_id)?;
+    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let (file, fields) = upload(content_type, &bytes);
+    let proxied = fields.get("proxied").or(q.get("proxied")).is_some_and(|p| p == "true");
+    let (records, mut skipped) = parse_zone_file(&file, &zone.name, proxied);
+    let total = records.len() + skipped.len();
+    let mut added = 0;
+    for r in records {
+        let line = format!("{} {} {}", r.name, r.rtype, r.content);
+        match st.store.create_record_async(&zone_id, r).await {
+            Ok(_) => added += 1,
+            Err(e) => skipped.push(format!("{line}: {}", ApiError::from(e).2)),
+        }
+    }
+    let mut v = ok(json!({ "recs_added": added, "total_records_parsed": total }))?;
+    v.0["messages"] = skipped.iter().map(|m| json!({ "code": 0, "message": m })).collect();
+    Ok(v)
 }
 
 async fn create_record(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
@@ -2707,6 +3320,177 @@ mod tests {
             push_body,
         ).await;
         assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cloudflare_style_tokens_keys_and_dns() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-tokens-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        let session = match st.accounts.login("admin@example.com", "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => token,
+            _ => panic!("expected signed in"),
+        };
+        let one = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.org").unwrap();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let as_session = format!("Bearer {session}");
+
+        // a token for DNS on one zone only
+        let spec = json!({
+            "name": "certbot",
+            "policies": [{
+                "effect": "allow",
+                "resources": { format!("com.cloudflare.api.account.zone.{}", one.id): "*" },
+                "permission_groups": [{ "name": "Zone Read" }, { "id": "4755a26eedb94da69e1066d98aa820be" }],
+            }],
+        });
+        let (sc, _, b) = call_raw(
+            &mut app,
+            "POST",
+            "/client/v4/user/tokens",
+            vec![("authorization", &as_session), ("content-type", "application/json")],
+            spec.to_string().into_bytes(),
+        )
+        .await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let created = json_of(&b)["result"].clone();
+        let value = created["value"].as_str().unwrap().to_string();
+        let token_id = created["id"].as_str().unwrap().to_string();
+        let bearer = format!("Bearer {value}");
+        let auth = || vec![("authorization", bearer.as_str()), ("content-type", "application/json")];
+
+        let (sc, _, b) = call_raw(&mut app, "GET", "/client/v4/user/tokens/verify", auth(), vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"]["id"].as_str()), (StatusCode::OK, Some(token_id.as_str())));
+        let (sc, _, b) = call_raw(&mut app, "GET", "/client/v4/zones", auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let zones = json_of(&b)["result"].clone();
+        assert_eq!(zones.as_array().unwrap().len(), 1, "only the zone the token names: {zones}");
+        assert_eq!(zones[0]["account"]["id"], crate::tokens::account_id());
+
+        let rec = json!({ "type": "TXT", "name": "_acme-challenge", "content": "\"abc\"", "ttl": 120 });
+        let uri = format!("/client/v4/zones/{}/dns_records", one.id);
+        let (sc, _, b) = call_raw(&mut app, "POST", &uri, auth(), rec.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let other_uri = format!("/client/v4/zones/{}/dns_records", other.id);
+        let (sc, _, _) = call_raw(&mut app, "POST", &other_uri, auth(), rec.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "not on another zone");
+        let (sc, _, _) = call_raw(&mut app, "POST", &format!("/client/v4/zones/{}/purge_cache", one.id), auth(), b"{}".to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "no cache purge in the token");
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/users", auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "users are never for tokens");
+        let (sc, _, _) = call_raw(&mut app, "POST", "/client/v4/account/password", auth(), b"{}".to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        // proxied, with an own origin port, and SRV through `data`
+        let proxied = json!({ "type": "A", "name": "www", "content": "192.0.2.10", "proxied": true, "origin": { "port": 8443, "scheme": "https" } });
+        let (sc, _, b) = call_raw(&mut app, "POST", &uri, auth(), proxied.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let www = json_of(&b)["result"].clone();
+        assert_eq!((www["proxied"].as_bool(), www["origin"]["port"].as_u64()), (Some(true), Some(8443)));
+        let srv = json!({ "type": "SRV", "name": "_sip._tcp", "data": { "priority": 10, "weight": 5, "port": 5060, "target": "sip.example.com" } });
+        let (sc, _, b) = call_raw(&mut app, "POST", &uri, auth(), srv.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(json_of(&b)["result"]["priority"], 10);
+
+        // filters
+        let (_, _, b) = call_raw(&mut app, "GET", &format!("{uri}?name.startswith=www&proxied=true"), auth(), vec![]).await;
+        assert_eq!(json_of(&b)["result"].as_array().unwrap().len(), 1);
+        let (_, _, b) = call_raw(&mut app, "GET", &format!("{uri}?type=TXT&type=A&match=any&name.contains=acme"), auth(), vec![]).await;
+        assert!(!json_of(&b)["result"].as_array().unwrap().is_empty());
+        let (_, _, b) = call_raw(&mut app, "GET", &format!("{uri}?order=type&direction=desc"), auth(), vec![]).await;
+        assert_eq!(json_of(&b)["result"][0]["type"], "TXT");
+
+        // batch: drop the TXT, move www, add one
+        let txt_id = {
+            let (_, _, b) = call_raw(&mut app, "GET", &format!("{uri}?type=TXT"), auth(), vec![]).await;
+            json_of(&b)["result"][0]["id"].as_str().unwrap().to_string()
+        };
+        let batch = json!({
+            "deletes": [{ "id": txt_id }],
+            "patches": [{ "id": www["id"], "content": "192.0.2.11" }],
+            "posts": [{ "type": "AAAA", "name": "v6", "content": "2001:db8::1" }],
+        });
+        let (sc, _, b) = call_raw(&mut app, "POST", &format!("{uri}/batch"), auth(), batch.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let done = json_of(&b)["result"].clone();
+        assert_eq!((done["deletes"].as_array().unwrap().len(), done["patches"][0]["content"].as_str(), done["posts"].as_array().unwrap().len()), (1, Some("192.0.2.11"), 1));
+        let (sc, _, b) = call_raw(&mut app, "POST", &format!("{uri}/batch"), auth(), json!({ "deletes": [{ "id": "nope" }] }).to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+
+        // export, and import into the other zone (as the admin's session)
+        let (sc, _, b) = call_raw(&mut app, "GET", &format!("{uri}/export"), auth(), vec![]).await;
+        let file = String::from_utf8(b).unwrap();
+        assert_eq!(sc, StatusCode::OK);
+        assert!(file.contains("www.example.com.\t300\tIN\tA\t192.0.2.11 ; cf_tags=cf-proxied:true"), "{file}");
+        assert!(file.contains("_sip._tcp.example.com.\t300\tIN\tSRV\t10 5 5060 sip.example.com."), "{file}");
+        let imported = "$ORIGIN example.org.\n$TTL 3600\n@ IN SOA ns1 hostmaster ( 1 ; serial\n 7200 3600 1209600 300 )\nwww 300 IN A 192.0.2.20 ; cf_tags=cf-proxied:true\n  IN TXT \"a;b\" ; note\nmail IN MX 10 mx.example.net.\nx IN LOC 1 2 3\n";
+        let multipart = format!("--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"z.txt\"\r\nContent-Type: text/plain\r\n\r\n{imported}\r\n--XyZ--\r\n");
+        let (sc, _, b) = call_raw(
+            &mut app,
+            "POST",
+            &format!("{other_uri}/import"),
+            vec![("authorization", &as_session), ("content-type", "multipart/form-data; boundary=XyZ")],
+            multipart.into_bytes(),
+        )
+        .await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let res = json_of(&b);
+        assert_eq!((res["result"]["recs_added"].as_u64(), res["result"]["total_records_parsed"].as_u64()), (Some(3), Some(4)), "{res}");
+        let (_, recs) = st.store.list_records(&other.id).unwrap();
+        let www_org = recs.iter().find(|r| r.name == "www.example.org").unwrap();
+        assert!(www_org.proxied && www_org.ttl == 300);
+        let txt = recs.iter().find(|r| r.rtype == "TXT").unwrap();
+        assert_eq!((txt.name.as_str(), txt.ttl, txt.comment.as_deref()), ("www.example.org", 3600, Some("note")));
+        assert!(txt.content.contains("a;b"));
+
+        // Cloudflare's account paths, and the account itself
+        let (sc, _, b) = call_raw(&mut app, "GET", "/client/v4/accounts", auth(), vec![]).await;
+        assert_eq!((sc, json_of(&b)["result"][0]["id"].as_str()), (StatusCode::OK, Some(crate::tokens::account_id())));
+        let kv = format!("/client/v4/accounts/{}/storage/kv/namespaces", crate::tokens::account_id());
+        let (sc, _, _) = call_raw(&mut app, "GET", &kv, auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN, "no KV in the token");
+        let (sc, _, b) = call_raw(&mut app, "GET", &kv, vec![("authorization", &as_session)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/accounts/0000/storage/kv/namespaces", vec![("authorization", &as_session)], vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+        let (sc, _, b) = call_raw(&mut app, "GET", "/client/v4/user/tokens/permission_groups", vec![("authorization", &as_session)], vec![]).await;
+        assert!(sc == StatusCode::OK && json_of(&b)["result"].as_array().unwrap().iter().any(|g| g["name"] == "DNS Write"));
+
+        // roll: the old value stops working; deleting ends it
+        let (sc, _, b) = call_raw(&mut app, "PUT", &format!("/client/v4/user/tokens/{token_id}/value"), vec![("authorization", &as_session)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let rolled = format!("Bearer {}", json_of(&b)["result"].as_str().unwrap());
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/user/tokens/verify", auth(), vec![]).await;
+        assert_eq!(sc, StatusCode::UNAUTHORIZED);
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/user/tokens/verify", vec![("authorization", &rolled)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "DELETE", &format!("/client/v4/user/tokens/{token_id}"), vec![("authorization", &as_session)], vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/user/tokens/verify", vec![("authorization", &rolled)], vec![]).await;
+        assert_eq!(sc, StatusCode::UNAUTHORIZED);
+
+        // the Global API Key: what the owner may do, but not the owner's credentials
+        let (sc, _, b) = call_raw(
+            &mut app,
+            "POST",
+            "/client/v4/account/api_key",
+            vec![("authorization", &as_session), ("content-type", "application/json")],
+            br#"{"password":"strong-pass-123"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let key = json_of(&b)["result"]["api_key"].as_str().unwrap().to_string();
+        let by_key = vec![("x-auth-email", "admin@example.com"), ("x-auth-key", key.as_str())];
+        let (sc, _, _) = call_raw(&mut app, "GET", &format!("/client/v4/zones/{}/dns_records", other.id), by_key.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/account", by_key.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+        let (sc, _, _) = call_raw(&mut app, "GET", "/client/v4/zones", vec![("x-auth-email", "admin@example.com"), ("x-auth-key", "wrong")], vec![]).await;
+        assert_eq!(sc, StatusCode::UNAUTHORIZED);
 
         let _ = std::fs::remove_dir_all(dir);
     }

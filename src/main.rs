@@ -19,6 +19,7 @@ mod spectrum;
 mod store;
 mod site_acme;
 mod sync;
+mod tokens;
 mod workers;
 
 use anyhow::Context;
