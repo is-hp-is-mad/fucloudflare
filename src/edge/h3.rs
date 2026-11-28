@@ -59,6 +59,7 @@ pub async fn serve_with_proxy(endpoint: quinn::Endpoint, edge: Arc<Edge>, is_pro
         tokio::spawn(async move {
             let Ok(conn) = incoming.await else { return };
             let peer = conn.remote_address();
+            edge.measured(peer.ip(), conn.rtt());
             let Ok(mut h3) = h3::server::builder()
                 .enable_extended_connect(true)
                 .build::<_, Bytes>(h3_quinn::Connection::new(conn))

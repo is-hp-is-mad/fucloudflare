@@ -142,6 +142,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/nodes/{node_id}", get(get_node).put(update_node).patch(update_node).delete(delete_node))
         .route("/steering", get(list_steering).post(create_steering))
         .route("/steering/test", get(test_steering))
+        .route("/steering/measured", get(measured_steering))
         .route("/steering/{rule_id}", axum::routing::put(update_steering).patch(update_steering).delete(delete_steering))
         .route("/proxy/rules", get(list_proxy_rules).post(create_proxy_rule))
         .route(
@@ -2663,6 +2664,8 @@ struct TelemetryPush {
     usage: Option<crate::limits::Usage>,
     #[serde(default)]
     status: Value,
+    #[serde(default)]
+    rtt: HashMap<String, crate::rtt::Measure>,
 }
 
 #[derive(Deserialize)]
@@ -2726,6 +2729,7 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
                     events: tele.events,
                     usage: tele.usage,
                     status: tele.status,
+                    rtt: tele.rtt,
                 },
                 true,
             );
@@ -2860,6 +2864,7 @@ async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
             events: report.events,
             usage: report.usage,
             status: report.status,
+            rtt: Default::default(),
         },
         true,
     );
@@ -2914,11 +2919,22 @@ async fn test_steering(State(st): St, Query(q): Params) -> ApiResult {
         "databases": { "country": geo.has_country_db(), "cn_provinces": geo.has_cn_db() },
         "rule": rule.map(|r| json!({ "id": r.id, "name": r.name, "action": r.action, "nodes": r.nodes, "priority": r.priority })),
         "continent_nodes": continent,
+        // what a `fastest` rule goes by: the nodes that measured this visitor's network, fastest first
+        "measured": st.edge.rtt.ranking(&loc, &snap.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), &st.node()).map(|(network, order)| json!({
+            "network": network,
+            "nodes": order.iter().map(|(name, ms)| json!({ "name": name, "ms": ms })).collect::<Vec<_>>(),
+        })),
         "reputation": st.edge.reputation.get().map(|r| json!({
             "assessment": r.assess(ip, loc.asn.unwrap_or(0) as i64, loc.as_org.as_deref().unwrap_or(""), q.get("ua").map(String::as_str).unwrap_or("")),
             "lists": r.loaded().into_iter().map(|(name, n)| json!({ "name": name, "networks": n })).collect::<Vec<_>>(),
         })),
     }))
+}
+
+/// The round trips the nodes measured with their visitors, per network
+/// (`CN-JS/4134`, `CN/4134`, `CN-JS`, `CN`) and node: what `fastest` steering rules go by.
+async fn measured_steering(State(st): St) -> ApiResult {
+    ok(st.edge.rtt.table(&st.node()))
 }
 
 async fn create_steering(State(st): St, bytes: Bytes) -> ApiResult {
@@ -3030,7 +3046,7 @@ mod tests {
             front: None,
         });
         Arc::new(ApiState {
-            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), || "au".to_string())),
+            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), || "au".to_string())),
             store,
             token: "test-token".into(),
             cache,

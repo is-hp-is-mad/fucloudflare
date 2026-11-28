@@ -21,6 +21,7 @@ mod mail;
 mod node;
 mod release;
 mod reports;
+mod rtt;
 mod spectrum;
 mod store;
 mod site_acme;
@@ -188,8 +189,9 @@ struct Args {
     #[arg(long, env = "FUCF_H3_FRONT_PORT", default_value_t = 443)]
     h3_front_port: u16,
 
-    /// TTL in seconds of DNS answers under the CNAME base. A node that goes
-    /// down or over its traffic allowance keeps getting visitors for this long.
+    /// TTL in seconds of the DNS answers that point at the edge (at most 300
+    /// for proxied records). A node that goes down or over its traffic
+    /// allowance keeps getting visitors for this long.
     #[arg(long, env = "FUCF_EDGE_TTL", default_value_t = 300)]
     edge_ttl: u32,
 
@@ -515,6 +517,8 @@ async fn main() -> anyhow::Result<()> {
     // Challenge clearances are derived from the token: the nodes of a fleet
     // share it, so they accept each other's, and restarts do not void them.
     let waf = Arc::new(edge::waf::Waf::with_secret(token.as_bytes()));
+    // so are TLS session tickets: a visitor the DNS moves to another node resumes there
+    edge::tls::share_tickets(token.as_bytes());
     let telemetry = if accel {
         waf.set_outbox_only();
         Arc::new(Telemetry {
@@ -775,6 +779,7 @@ async fn main() -> anyhow::Result<()> {
         h3_front: front,
         edge_ttl: args.edge_ttl.max(1),
         accelerate: accel,
+        rtt: edge.rtt.clone(),
     });
 
     let mut dns_listeners = Vec::new();
@@ -834,7 +839,7 @@ async fn main() -> anyhow::Result<()> {
     // what the nodes report is taken here and kept for the peers: every peer has the whole fleet's
     let reports = {
         let (store, ips, name) = (store.clone(), args.edge_ips.clone(), args.node_name.clone());
-        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
+        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
     };
     if !accel {
         reports.load(&telemetry.reports_path);

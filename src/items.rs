@@ -1278,10 +1278,10 @@ impl SteerRule {
             }
         }
         self.as_orgs = self.as_orgs.iter().map(|o| o.trim().to_ascii_lowercase()).filter(|o| !o.is_empty()).collect();
-        one_of("action", &self.action, &["route", "block"])?;
+        one_of("action", &self.action, &["route", "fastest", "block"])?;
         if self.action == "block" {
             self.nodes.clear();
-        } else if self.nodes.is_empty() {
+        } else if self.nodes.is_empty() && self.action == "route" {
             return invalid("a routing rule needs at least one node");
         }
         for n in &self.nodes {

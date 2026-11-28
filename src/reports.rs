@@ -43,6 +43,8 @@ pub struct Report {
     pub events: Vec<Event>,
     pub usage: Option<Usage>,
     pub status: Value,
+    /// What it measured of its visitors' round trips since its report before (see crate::rtt).
+    pub rtt: HashMap<String, crate::rtt::Measure>,
 }
 
 struct Kept {
@@ -64,6 +66,7 @@ pub struct Reports {
     stats: Arc<Stats>,
     waf: Arc<Waf>,
     fleet: Arc<Fleet>,
+    rtt: Arc<crate::rtt::Rtt>,
     /// The name of this node: its own reports come back from the peers.
     me: Box<dyn Fn() -> String + Send + Sync>,
     /// One run of this process: a peer that knew another one starts over.
@@ -75,11 +78,12 @@ pub struct Reports {
 }
 
 impl Reports {
-    pub fn new(stats: Arc<Stats>, waf: Arc<Waf>, fleet: Arc<Fleet>, me: impl Fn() -> String + Send + Sync + 'static) -> Reports {
+    pub fn new(stats: Arc<Stats>, waf: Arc<Waf>, fleet: Arc<Fleet>, rtt: Arc<crate::rtt::Rtt>, me: impl Fn() -> String + Send + Sync + 'static) -> Reports {
         Reports {
             stats,
             waf,
             fleet,
+            rtt,
             me: Box::new(me),
             epoch: uuid::Uuid::new_v4().simple().to_string(),
             floor: AtomicU64::new(now_secs()),
@@ -135,6 +139,7 @@ impl Reports {
         }
         self.stats.absorb(&report.node, &report.stats);
         self.waf.absorb(&report.node, report.events.clone());
+        self.rtt.merge(&report.node, &report.rtt);
         if latest && now.saturating_sub(report.at) < LIVE_SECS {
             self.fleet.heard(&report.node, &report.version, &report.build, &report.role);
             if let Some(usage) = report.usage.clone() {
@@ -220,7 +225,7 @@ mod tests {
 
     fn node(name: &'static str) -> Node {
         let (stats, fleet) = (Arc::new(Stats::default()), Arc::new(Fleet::default()));
-        let reports = Reports::new(stats.clone(), Arc::new(Waf::new()), fleet.clone(), move || name.to_string());
+        let reports = Reports::new(stats.clone(), Arc::new(Waf::new()), fleet.clone(), Arc::default(), move || name.to_string());
         reports.floor.store(0, Ordering::Relaxed);
         Node { stats, fleet, reports }
     }

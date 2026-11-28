@@ -1012,6 +1012,8 @@ pub struct Edge {
     pub d1: std::sync::OnceLock<Arc<crate::workers::db::D1Store>>,
     /// Configured node name (for `LocalProxyRule.nodes` matching).
     pub node_name: std::sync::OnceLock<String>,
+    /// How long the visitors' handshakes with this node take, per network (see crate::rtt).
+    pub rtt: Arc<crate::rtt::Rtt>,
     /// True when this node runs in `--role accelerate` mode.
     pub accelerate: std::sync::atomic::AtomicBool,
     /// Explicitly trust `X-Forwarded-Host` from the local HTTP/3 front.
@@ -1283,6 +1285,7 @@ impl Edge {
             kv: Default::default(),
             d1: Default::default(),
             node_name: Default::default(),
+            rtt: Default::default(),
             accelerate: std::sync::atomic::AtomicBool::new(false),
             trust_forwarded_host: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2370,6 +2373,20 @@ impl Edge {
     }
 }
 
+impl Edge {
+    /// One round trip with the visitor at `ip`, as its handshake with this node
+    /// showed it: what the DNS steers by (see crate::rtt). Not the nodes of the
+    /// fleet among themselves, nor this host.
+    pub fn measured(&self, ip: IpAddr, rtt: Duration) {
+        let ip = ip.to_canonical();
+        let Some(geo) = self.geo.get() else { return };
+        if ip.is_loopback() || cgi::is_fucf_node(ip, &self.store.snapshot().nodes) {
+            return;
+        }
+        self.rtt.sample(&geo.locate(ip), rtt);
+    }
+}
+
 /// Run the pipeline and stamp the edge's own response headers.
 pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<Body>) -> Response<Body> {
     let ray = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
@@ -2764,8 +2781,14 @@ async fn serve_with_options(
                         .and_then(|name| edge.store.snapshot().find_zone(&name).map(|z| z.zone.settings.http2))
                         .unwrap_or(true);
                     let config = if http2 { both } else { h1_only };
+                    // from here the handshake waits for the visitor once: one round trip
+                    let asked = std::time::Instant::now();
                     if let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(10), start.into_stream(config)).await {
                         let session = tls.get_ref().1;
+                        // (TLS 1.2 waits for the visitor twice: not a measure of one round trip)
+                        if session.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
+                            edge.measured(peer.ip(), asked.elapsed());
+                        }
                         let alpn_h2 = session.alpn_protocol() == Some(b"h2");
                         let info = TlsInfo {
                             version: match session.protocol_version() {
