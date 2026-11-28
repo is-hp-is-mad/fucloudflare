@@ -25,8 +25,7 @@
 use super::waf::{Waf, CLEARANCE_COOKIE};
 use super::{bi, escape, full, Body, EdgeError, Lang, LANG_SCRIPT, PAGE_CSS, PAGE_MARK};
 use base64::Engine;
-use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
@@ -332,11 +331,18 @@ async fn answer_of(waf: std::sync::Arc<Waf>, ip: IpAddr, ssl: bool, req: Request
     if req.method() != Method::POST {
         return answer(StatusCode::METHOD_NOT_ALLOWED, json!({ "ok": false, "code": "post_only" }));
     }
-    let (parts, body) = req.into_parts();
-    let bytes: Bytes = match Limited::new(body, MAX_ANSWER).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return answer(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "code": "too_large" })),
-    };
+    let (parts, mut body) = req.into_parts();
+    // frame by frame (http_body_util::Limited trips a higher-ranked lifetime bug of rustc here)
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { return answer(StatusCode::BAD_REQUEST, json!({ "ok": false, "code": "unreadable" })) };
+        if let Some(data) = frame.data_ref() {
+            bytes.extend_from_slice(data);
+        }
+        if bytes.len() > MAX_ANSWER {
+            return answer(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "code": "too_large" }));
+        }
+    }
     let Ok(report) = serde_json::from_slice::<Value>(&bytes) else {
         return answer(StatusCode::BAD_REQUEST, json!({ "ok": false, "code": "unreadable" }));
     };
