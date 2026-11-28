@@ -875,6 +875,10 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    if !accel {
+        // bans from the security events (zones that switched it on)
+        edge::autofw::spawn(store.clone(), waf.clone());
+    }
     let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {
         store,

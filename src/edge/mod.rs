@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod certdir;
 pub mod cgi;
+pub mod autofw;
 pub mod challenge;
 pub mod files;
 pub mod compress;

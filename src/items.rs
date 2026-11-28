@@ -144,6 +144,15 @@ pub struct Settings {
     /// fails, plain HTTP is hung up on. Enumerating the zone's names by
     /// resolving them tells nothing then.
     pub decoy_subdomains: bool,
+    /// The automatic firewall (crate::edge::autofw): addresses with
+    /// `auto_firewall_threshold` attacks within `auto_firewall_window`
+    /// seconds are banned for `auto_firewall_ban` seconds, by a firewall rule
+    /// with `auto_firewall_action` (block or managed_challenge).
+    pub auto_firewall: bool,
+    pub auto_firewall_threshold: u32,
+    pub auto_firewall_window: u32,
+    pub auto_firewall_ban: u32,
+    pub auto_firewall_action: String,
 }
 
 impl Default for Settings {
@@ -163,6 +172,11 @@ impl Default for Settings {
             grpc: true,
             email_routing: false,
             decoy_subdomains: false,
+            auto_firewall: false,
+            auto_firewall_threshold: 10,
+            auto_firewall_window: 600,
+            auto_firewall_ban: 86400,
+            auto_firewall_action: "block".into(),
         }
     }
 }
@@ -172,6 +186,13 @@ impl Settings {
         one_of("ssl", &self.ssl, &["flexible", "full", "strict"])?;
         one_of("waf", &self.waf, &["off", "log", "block"])?;
         one_of("security_level", &self.security_level, &["medium", "under_attack"])?;
+        one_of("auto_firewall_action", &self.auto_firewall_action, &["block", "managed_challenge", "js_challenge"])?;
+        if !(1..=100_000).contains(&self.auto_firewall_threshold)
+            || !(60..=86_400).contains(&self.auto_firewall_window)
+            || !(60..=30 * 86_400).contains(&self.auto_firewall_ban)
+        {
+            return invalid("auto_firewall_threshold is 1 to 100000, auto_firewall_window 60 to 86400 and auto_firewall_ban 60 to 2592000 seconds");
+        }
         if self.browser_cache_ttl > 31_536_000 || self.hsts_max_age > 63_072_000 {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");
         }
@@ -197,6 +218,13 @@ pub struct FirewallRule {
     /// Lower runs first.
     #[serde(default)]
     pub priority: i32,
+    /// `auto_firewall` for the rule the automatic firewall keeps (see
+    /// crate::edge::autofw); empty for rules people write.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub managed_by: String,
+    /// The automatic rule's addresses and until when (unix seconds) each is banned.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auto_bans: BTreeMap<String, u64>,
 }
 
 impl Item for FirewallRule {
