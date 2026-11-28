@@ -16,6 +16,8 @@ const MAX_EVENTS: usize = 5000;
 /// Events a replica holds for the primary while it cannot be reached.
 const MAX_OUTBOX: usize = 2000;
 const CLEARANCE_SECS: u64 = 1800;
+/// An origin that keeps failing is logged once per this many seconds (per zone, host and status).
+const ORIGIN_ERROR_EVERY: u64 = 60;
 pub const CLEARANCE_COOKIE: &str = "fucf_clearance";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +168,8 @@ pub struct Waf {
     /// `accelerate` mode: keep only the outbox, skipping 5,000-event journal in RAM.
     outbox_only: AtomicBool,
     counters: Mutex<HashMap<(String, IpAddr), Counter>>,
+    /// When an origin error was last logged, per (zone, host, status).
+    origin_logged: Mutex<HashMap<(String, String, u16), u64>>,
     key: hmac::Key,
 }
 
@@ -198,6 +202,7 @@ impl Waf {
             reporting: AtomicBool::new(false),
             outbox_only: AtomicBool::new(false),
             counters: Mutex::default(),
+            origin_logged: Mutex::default(),
             key,
         }
     }
@@ -290,6 +295,64 @@ impl Waf {
             uri: info.uri().chars().take(2048).collect(),
             user_agent: info.header("user-agent").chars().take(512).collect(),
         };
+        self.record(event);
+    }
+
+    /// The origin of a site could not be reached (source `origin`). The
+    /// description says what kind of failure it was and, where known, how to
+    /// fix it: this is for the dashboard, visitors only see the kind. A
+    /// failing origin is logged at most once a minute per host and status.
+    #[allow(clippy::too_many_arguments)]
+    pub fn origin_error(
+        &self,
+        zone_id: &str,
+        ray: &str,
+        status: u16,
+        reason: super::Reason,
+        hint: Option<&str>,
+        host: &str,
+        line: &str,
+        ip: IpAddr,
+        country: &str,
+    ) {
+        let now = unix_now();
+        {
+            let mut logged = self.origin_logged.lock().unwrap();
+            if logged.len() > 10_000 {
+                logged.retain(|_, at| now < *at + ORIGIN_ERROR_EVERY);
+            }
+            let key = (zone_id.to_string(), host.to_string(), status);
+            if logged.get(&key).is_some_and(|at| now < at + ORIGIN_ERROR_EVERY) {
+                return;
+            }
+            logged.insert(key, now);
+        }
+        // `line` is "<version> <method> <uri>"
+        let mut parts = line.splitn(3, ' ').skip(1);
+        let (method, uri) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+        let description = match hint {
+            Some(hint) => format!("{}：{hint}", reason.zh),
+            None => reason.zh.to_string(),
+        };
+        self.record(Event {
+            ray_id: ray.to_string(),
+            occurred_at: crate::store::now(),
+            zone_id: zone_id.to_string(),
+            source: "origin".to_string(),
+            rule_id: status.to_string(),
+            description,
+            action: "origin_error".to_string(),
+            client_ip: ip.to_string(),
+            country: country.to_string(),
+            node: String::new(),
+            host: host.to_string(),
+            method: method.to_string(),
+            uri: uri.chars().take(2048).collect(),
+            user_agent: String::new(),
+        });
+    }
+
+    fn record(&self, event: Event) {
         let mut journal = self.journal.lock().unwrap();
         if self.reporting.load(Ordering::Relaxed) {
             if journal.outbox.len() >= MAX_OUTBOX {

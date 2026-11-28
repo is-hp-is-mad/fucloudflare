@@ -424,7 +424,14 @@ async fn origin_rules_and_errors() {
     // origin down -> 521 error page; plain HTTP redirected when always_use_https is on
     rule(json!({ "expression": "http.request.uri.path eq \"/down\"", "origin_port": 1, "priority": 0 }));
     let down = get(&env, "example.com", "/down").await;
-    assert!(down.status == 521 && down.body.contains("Web server is down"), "{} {}", down.status, down.body);
+    assert!(down.status == 521 && down.body.contains(ORIGIN_ERROR) && down.body.contains(ORIGIN_DOWN.zh), "{} {}", down.status, down.body);
+    // the visitor learns the kind of failure, not where the origin is
+    assert!(!down.body.contains("127.0.0.1") && !down.body.contains(":1 ") && !down.body.contains("refused ("), "{}", down.body);
+    let logged = env.edge.waf.events(&env.zone, 100);
+    let e = logged.iter().find(|e| e.source == "origin").expect("origin error is logged for the dashboard");
+    assert!(e.rule_id == "521" && e.description == ORIGIN_DOWN.zh && e.uri == "/down" && e.method == "GET", "{e:?}");
+    let _ = get(&env, "example.com", "/down").await;
+    assert_eq!(env.edge.waf.events(&env.zone, 100).iter().filter(|e| e.source == "origin").count(), 1, "once a minute per host and status");
     env.store.update_setting(&env.zone, "always_use_https", json!(true)).unwrap();
     let redirect = get(&env, "example.com", "/a?b=1").await;
     assert_eq!((redirect.status, redirect.header("location")), (301, Some("https://example.com/a?b=1")));
@@ -1427,7 +1434,7 @@ async fn proxies_grpc() {
     let (parts, data, _) = unary("grpc.example.com", "/pkg.Echo/down", "application/grpc").await;
     let (code, kind, grpc_status, message) = status(&parts);
     assert_eq!((code, kind.as_str(), grpc_status.as_str(), data.as_str()), (200, "application/grpc", "14", ""));
-    assert!(message.starts_with("Web server is down"), "{message}");
+    assert_eq!(message, format!("Origin error: {}", ORIGIN_DOWN.en));
     let (parts, _, _) = unary("grpc.example.com", "/pkg.Echo/forbidden", "application/grpc").await;
     assert_eq!(status(&parts).2, "7");
     let (parts, _, _) = unary("grpc.example.com", "/pkg.Echo/no-h2", "application/grpc").await;
@@ -1812,4 +1819,21 @@ async fn serves_http2_websocket_rfc8441() {
         let n = tokio::time::timeout(Duration::from_secs(3), io.read(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[..n], msg);
     }
+}
+
+#[tokio::test]
+async fn origin_that_is_the_edge_itself_is_explained_on_the_dashboard_only() {
+    let env = setup().await;
+    // an edge whose own address is the one the records point at (127.0.0.1)
+    let edge = Arc::new(Edge::new(env.store.clone(), Arc::new(Cache::new(1 << 20)), Arc::new(Waf::new()), vec!["127.0.0.1".parse().unwrap()]).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve(listener, edge.clone(), None, false));
+    let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let r = exchange(s, raw("GET", "example.com", "/x", "", "")).await;
+    assert!(r.status == 530 && r.body.contains(ORIGIN_ERROR) && r.body.contains(ORIGIN_MISCONFIGURED.zh), "{} {}", r.status, r.body);
+    assert!(!r.body.contains("127.0.0.1") && !r.body.contains("origin_node") && !r.body.contains("FUCF_EDGE_IPS"), "no detail for visitors: {}", r.body);
+    let events = edge.waf.events(&env.zone, 10);
+    let e = events.iter().find(|e| e.source == "origin").expect("logged for the dashboard");
+    assert!(e.rule_id == "530" && e.description.contains("origin_node") && e.description.starts_with(ORIGIN_MISCONFIGURED.zh), "{e:?}");
 }

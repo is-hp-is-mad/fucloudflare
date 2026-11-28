@@ -73,22 +73,95 @@ fn streaming(body: Incoming) -> Body {
 pub struct EdgeError {
     pub status: u16,
     pub title: &'static str,
+    /// What went wrong, in full. For origin errors this may name origin
+    /// addresses: it goes to the log, never to the visitor.
     pub detail: String,
+    /// Set for errors in reaching the origin, see [`OriginFault`].
+    pub origin: Option<OriginFault>,
 }
+
+/// Why the origin could not be reached, told without naming it.
+#[derive(Clone, Copy, Debug)]
+pub struct OriginFault {
+    /// What visitors see: the kind of failure, nothing about the origin itself.
+    pub reason: Reason,
+    /// For the site's admins only (dashboard): how this comes about and how to fix it.
+    pub hint: Option<&'static str>,
+}
+
+/// A kind of origin failure, in the visitor's terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reason {
+    pub zh: &'static str,
+    pub en: &'static str,
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}（{}）。", self.zh, self.en)
+    }
+}
+
+/// The title of every error page about the origin.
+pub const ORIGIN_ERROR: &str = "回源错误 Origin error";
 
 impl EdgeError {
     pub fn new(status: u16, title: &'static str, detail: impl Into<String>) -> Self {
-        EdgeError { status, title, detail: detail.into() }
+        EdgeError { status, title, detail: detail.into(), origin: None }
+    }
+
+    /// The origin could not be reached or answered badly. `reason` is what the
+    /// visitor is told; `detail` is only logged.
+    pub fn origin(status: u16, reason: Reason, detail: impl Into<String>) -> Self {
+        EdgeError { status, title: ORIGIN_ERROR, detail: detail.into(), origin: Some(OriginFault { reason, hint: None }) }
+    }
+
+    /// Add a note for the dashboard on how to fix this (never shown to visitors).
+    pub fn hint(mut self, hint: &'static str) -> Self {
+        if let Some(fault) = self.origin.as_mut() {
+            fault.hint = Some(hint);
+        }
+        self
+    }
+
+    /// The text the visitor gets.
+    pub fn public_detail(&self) -> String {
+        match &self.origin {
+            Some(fault) => format!("{} 这个站点暂时无法访问；站点管理员可凭下面的 Ray ID 在面板或节点日志中查看原因。", fault.reason),
+            None => self.detail.clone(),
+        }
+    }
+
+    /// One line for clients that cannot read a page (gRPC): ASCII, nothing about the origin.
+    pub fn public_line(&self) -> String {
+        match &self.origin {
+            Some(fault) => format!("Origin error: {}", fault.reason.en),
+            None => format!("{}: {}", self.title, self.detail),
+        }
     }
 }
+
+/// Origin-side failures as visitors are told about them.
+pub const ORIGIN_DOWN: Reason = Reason { zh: "源站拒绝连接或无法连通", en: "connection refused or unreachable" };
+pub const ORIGIN_TIMEOUT: Reason = Reason { zh: "连接源站超时", en: "connection timed out" };
+pub const ORIGIN_TLS: Reason = Reason { zh: "与源站的 TLS 握手失败", en: "SSL handshake failed" };
+pub const ORIGIN_BAD_RESPONSE: Reason = Reason { zh: "源站的响应无效或中途断开", en: "bad gateway" };
+pub const ORIGIN_NOT_CONFIGURED: Reason = Reason { zh: "这个主机名没有配置源站", en: "no origin configured" };
+pub const ORIGIN_UNRESOLVED: Reason = Reason { zh: "源站地址无法解析", en: "origin DNS error" };
+pub const ORIGIN_MISCONFIGURED: Reason = Reason { zh: "源站配置有误", en: "origin misconfigured" };
+
+/// Dashboard note for an origin that is this very edge node.
+pub const HINT_ORIGIN_IS_EDGE: &str = "这条记录的源站地址是处理请求的边缘节点自己的公网 IP（在 FUCF_EDGE_IPS 里），\
+fucf 会把它当作回环而拒绝回源。修复：在该记录的回源设置里把“回源节点”(origin_node) 设为这个节点，\
+同一节点上会改为回源 127.0.0.1，其余节点回源到它的 IP；或者把源站改成真实的源站地址。";
 
 impl From<UpstreamError> for EdgeError {
     fn from(e: UpstreamError) -> Self {
         match e {
-            UpstreamError::Down(d) => EdgeError::new(521, "Web server is down", d),
-            UpstreamError::Timeout => EdgeError::new(522, "Connection timed out", "the origin did not respond in time"),
-            UpstreamError::Tls(d) => EdgeError::new(525, "SSL handshake failed", d),
-            UpstreamError::Other(d) => EdgeError::new(502, "Bad gateway", d),
+            UpstreamError::Down(d) => EdgeError::origin(521, ORIGIN_DOWN, d),
+            UpstreamError::Timeout => EdgeError::origin(522, ORIGIN_TIMEOUT, "the origin did not respond in time"),
+            UpstreamError::Tls(d) => EdgeError::origin(525, ORIGIN_TLS, d),
+            UpstreamError::Other(d) => EdgeError::origin(502, ORIGIN_BAD_RESPONSE, d),
         }
     }
 }
@@ -697,9 +770,9 @@ pub(crate) async fn open_upstream_websocket(
     let (target, upstream_pq) = if let Some(rule) = proxy::match_rule(&snap.local_proxy_rules, node_name, listener, &host, path)
         .or_else(|| proxy::match_fallback(&snap.local_proxy_rules, node_name, listener, &host, path))
     {
-        let up = rule.upstreams.first().ok_or_else(|| EdgeError::new(502, "Bad gateway", "no upstream available"))?;
+        let up = rule.upstreams.first().ok_or_else(|| EdgeError::origin(502, ORIGIN_NOT_CONFIGURED, "no upstream available"))?;
         let (mut target, base_path) = upstream::Target::from_proxy_url(&up.url, up.tls_insecure)
-            .map_err(|e| EdgeError::new(502, "Bad gateway", e))?;
+            .map_err(|e| EdgeError::origin(502, ORIGIN_MISCONFIGURED, e))?;
         if rule.preserve_host {
             target.host_header = raw_host;
         }
@@ -738,12 +811,12 @@ pub(crate) async fn open_upstream_websocket(
 
     let mut resp = edge.upstream.send(&target, out_req).await?;
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        return Err(EdgeError::new(502, "Bad gateway", "upstream rejected WebSocket upgrade"));
+        return Err(EdgeError::origin(502, ORIGIN_BAD_RESPONSE, "upstream rejected WebSocket upgrade"));
     }
     let ws_headers = resp.headers().clone();
     let origin_ws = hyper::upgrade::on(&mut resp)
         .await
-        .map_err(|e| EdgeError::new(502, "Bad gateway", format!("websocket upgrade failed: {e}")))?;
+        .map_err(|e| EdgeError::origin(502, ORIGIN_BAD_RESPONSE, format!("websocket upgrade failed: {e}")))?;
     Ok((ws_headers, origin_ws))
 }
 
@@ -834,7 +907,10 @@ impl Edge {
                     .nodes
                     .iter()
                     .find(|n| n.name.eq_ignore_ascii_case(&target_node))
-                    .ok_or_else(|| EdgeError::new(530, "Origin DNS error", format!("origin_node '{target_node}' not found")))?;
+                    .ok_or_else(|| {
+                        EdgeError::origin(530, ORIGIN_MISCONFIGURED, format!("origin_node '{target_node}' not found"))
+                            .hint("记录指定的回源节点不在节点列表里：在回源设置里改成存在的节点，或清空回源节点。")
+                    })?;
                 let mut ips = Vec::new();
                 if let Some(v4) = node.ipv4 {
                     ips.push(v4.to_string());
@@ -843,7 +919,8 @@ impl Edge {
                     ips.push(v6.to_string());
                 }
                 if ips.is_empty() {
-                    return Err(EdgeError::new(530, "Origin DNS error", format!("origin_node '{target_node}' has no IP")));
+                    return Err(EdgeError::origin(530, ORIGIN_MISCONFIGURED, format!("origin_node '{target_node}' has no IP"))
+                        .hint("记录指定的回源节点没有登记 IPv4/IPv6 地址：在“节点”里补上它的地址。"));
                 }
                 let primary = ips.remove(0);
                 (primary, ips)
@@ -866,7 +943,7 @@ impl Edge {
                         let cname = records
                             .iter()
                             .find(|r| r.rtype == "CNAME")
-                            .ok_or_else(|| EdgeError::new(530, "Origin DNS error", "no origin configured for this host"))?;
+                            .ok_or_else(|| EdgeError::origin(530, ORIGIN_NOT_CONFIGURED, "no origin configured for this host"))?;
                         options = cname.origin.as_ref();
                         let mut name = cname.content.clone();
                         let mut resolved = None;
@@ -882,9 +959,9 @@ impl Edge {
                             match recs.iter().find(|r| r.rtype == "CNAME") {
                                 Some(c) => name = c.content.clone(),
                                 None => {
-                                    return Err(EdgeError::new(
+                                    return Err(EdgeError::origin(
                                         530,
-                                        "Origin DNS error",
+                                        ORIGIN_UNRESOLVED,
                                         format!("CNAME target {name} has no address"),
                                     ))
                                 }
@@ -896,7 +973,8 @@ impl Edge {
             };
             let host = candidates.remove(0);
             if host.parse::<IpAddr>().is_ok_and(|ip| self.edge_ips.contains(&ip)) {
-                return Err(EdgeError::new(530, "Origin DNS error", "the origin points back at the edge"));
+                return Err(EdgeError::origin(530, ORIGIN_MISCONFIGURED, format!("the origin {host} is this edge node's own address"))
+                    .hint(HINT_ORIGIN_IS_EDGE));
             }
             (host, candidates)
         };
@@ -1028,7 +1106,7 @@ impl Edge {
         let mut body = Some(body);
         let outcome = loop {
             let Some(host) = hosts.pop() else {
-                break Err(EdgeError::new(530, "Origin DNS error", "no origin available"));
+                break Err(EdgeError::origin(530, ORIGIN_NOT_CONFIGURED, "no origin available"));
             };
             let replayable = matches!(body, Some(ReqBody::Buffered(_)));
             let attempt_body = if let Some(ReqBody::Buffered(b)) = &body {
@@ -1067,7 +1145,7 @@ impl Edge {
         // WebSocket and other protocol upgrades: splice the two connections.
         if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
             let Some(client_side) = on_upgrade else {
-                return Err(EdgeError::new(502, "Bad gateway", "unexpected protocol switch by the origin"));
+                return Err(EdgeError::origin(502, ORIGIN_BAD_RESPONSE, "unexpected protocol switch by the origin"));
             };
             let origin_side = hyper::upgrade::on(&mut resp);
             tokio::spawn(async move {
@@ -1116,7 +1194,7 @@ impl Edge {
             Decision::Dynamic
         };
         let length = parts.headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
-        let unreadable = |e: BoxError| EdgeError::new(502, "Bad gateway", format!("reading origin response: {e}"));
+        let unreadable = |e: BoxError| EdgeError::origin(502, ORIGIN_BAD_RESPONSE, format!("reading origin response: {e}"));
 
         // Read what is to be stored: a body of announced length entirely, one
         // of unknown length (chunked) as far as the limit allows.
@@ -1676,7 +1754,18 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
             });
             (r, by_waf)
         }
-        Err(e) => (page(e.status, e.title, &e.detail, &ray), Some(format!("{}: {}", e.title, e.detail))),
+        Err(e) => {
+            let public = e.public_detail();
+            if let Some(fault) = e.origin {
+                // the whole story (origin addresses included) is for the log and the dashboard only
+                let host = seen.as_ref().map(|s| s.host.as_str()).unwrap_or("-");
+                tracing::warn!(%ray, host, status = e.status, client = %peer.ip(), "origin error: {}", e.detail);
+                if let Some(s) = &seen {
+                    edge.waf.origin_error(&s.zone_id, &ray, e.status, fault.reason, fault.hint, &s.host, &line, peer.ip().to_canonical(), &s.country);
+                }
+            }
+            (page(e.status, e.title, &public, &ray), Some(e.public_line()))
+        }
     };
     // HTTP/3 is on offer where it works: through the front for the names its
     // certificate covers, else on our own QUIC listener. For the sites of a

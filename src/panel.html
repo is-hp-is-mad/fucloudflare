@@ -890,7 +890,9 @@ const ZONE = {
       await ruleSection(z.id, "email") };
   },
   async analytics(z) {
-    const [a, ev] = await Promise.all([api("GET", `/zones/${z.id}/analytics`), api("GET", `/zones/${z.id}/security/events?limit=100`)]);
+    const [a, all] = await Promise.all([api("GET", `/zones/${z.id}/analytics`), api("GET", `/zones/${z.id}/security/events?limit=200`)]);
+    // origin errors travel with the security events but are not security events
+    const ev = all.filter(e => e.source !== "origin").slice(0, 100), oe = all.filter(e => e.source === "origin");
     return { sub: "最近 24 小时，所有节点合计。", body:
       `<div class="tiles">${tile("请求数", num(a.requests), "边缘收到的全部请求", "", "chart")}${tile("流量", bytes(a.bytes), "发给访客的响应体", "", "data")}${tile("缓存命中", num(a.cached), a.requests ? (a.cached / a.requests * 100).toFixed(1) + "% 的请求" : "还没有请求", "", "bolt")}${tile("已拦截", num(a.threats), "防火墙、限速与 WAF", "", "shield")}</div>
       <div class="grid2">${card("状态码分布", "", `<div class="cb">${segBar([{ label: "2xx 成功", value: a.status_2xx, c: "--s1" }, { label: "3xx 跳转", value: a.status_3xx, c: "--s2" }, { label: "4xx 客户端错误", value: a.status_4xx, c: "--s3" }, { label: "5xx 服务端错误", value: a.status_5xx, c: "--s4" }], "状态码分布")}</div>`)}
@@ -898,7 +900,11 @@ const ZONE = {
       card(`最近的安全事件 <span class="cnt">${ev.length}</span>`, "", table([{ label: "时间", fmt: e => when(e.occurred_at) }, { label: "来源", fmt: e => esc(SRC[e.source] || e.source) },
         { label: "动作", fmt: e => `<span class="tag ${TONE[e.action] || ""}">${esc(ACT[e.action] || e.action)}</span>` }, { k: "description", label: "规则" },
         { label: "客户端", fmt: e => `<span class="mono">${esc(e.client_ip)}</span>` }, { label: "请求", fmt: e => `<span class="mono">${esc(e.method + " " + e.host + e.uri)}</span>` }], ev, null,
-        "<b>没有安全事件</b>被防火墙、限速或托管规则处理的请求会出现在这里。")) };
+        "<b>没有安全事件</b>被防火墙、限速或托管规则处理的请求会出现在这里。")) +
+      card(`最近的回源错误 <span class="cnt">${oe.length}</span>`, "", table([{ label: "时间", fmt: e => when(e.occurred_at) }, { label: "节点", fmt: e => esc(e.node || "本节点") },
+        { label: "状态码", fmt: e => `<span class="tag bad">${esc(e.rule_id)}</span>` }, { label: "原因与修复", fmt: e => `<div style="white-space:normal;max-width:46em">${esc(e.description)}</div>` },
+        { label: "请求", fmt: e => `<span class="mono">${esc(e.method + " " + e.host + e.uri)}</span>` }, { label: "Ray ID", fmt: e => `<span class="mono">${esc(e.ray_id)}</span>` }], oe, null,
+        "<b>没有回源错误</b>边缘连不上源站或源站配置有误时会记在这里（同一主机同一状态码每分钟最多一条），访客只看到错误类别；完整细节按 Ray ID 在节点日志（journalctl -u fucf）里查。")) };
   },
   async manage(z) {
     return { sub: "接入方式、暂停与删除。", body:

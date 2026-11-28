@@ -281,7 +281,7 @@ pub async fn forward(
 
     for (idx, up) in candidates.iter().enumerate() {
         let (mut target, base_path) = super::upstream::Target::from_proxy_url(&up.url, up.tls_insecure)
-            .map_err(|e| EdgeError::new(502, "Bad gateway", e))?;
+            .map_err(|e| EdgeError::origin(502, super::ORIGIN_MISCONFIGURED, e))?;
         if rule.preserve_host {
             target.host_header = orig_host_header.clone();
         }
@@ -321,12 +321,12 @@ pub async fn forward(
 
     let mut resp = match resp_opt {
         Some(r) => r,
-        None => return Err(last_err.unwrap_or_else(|| EdgeError::new(502, "Bad gateway", "no upstream available"))),
+        None => return Err(last_err.unwrap_or_else(|| EdgeError::origin(502, super::ORIGIN_NOT_CONFIGURED, "no upstream available"))),
     };
 
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_side) = on_upgrade else {
-            return Err(EdgeError::new(502, "Bad gateway", "unexpected protocol switch by upstream"));
+            return Err(EdgeError::origin(502, super::ORIGIN_BAD_RESPONSE, "unexpected protocol switch by upstream"));
         };
         let origin_side = hyper::upgrade::on(&mut resp);
         tokio::spawn(async move {
