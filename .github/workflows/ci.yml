@@ -86,3 +86,53 @@ jobs:
           name: fucf-linux-x86_64
           path: dist/
           retention-days: 30
+
+  ui-screenshots:
+    name: UI screenshots
+    needs: build-musl
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: fucf-linux-x86_64
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: start fucf
+        run: |
+          chmod +x dist/fucf-linux-x86_64
+          mkdir -p /tmp/fucf-ui
+          FUCF_DATA_DIR=/tmp/fucf-ui FUCF_API_TOKEN=ui-check-token FUCF_API_LISTEN=127.0.0.1:8787 \
+          FUCF_HTTP_LISTEN=127.0.0.1:18080 FUCF_HTTPS_LISTEN=off FUCF_HTTP3_LISTEN=off FUCF_DNS_LISTEN=127.0.0.1:15353 \
+          FUCF_EDGE_IPS=127.0.0.1 nohup ./dist/fucf-linux-x86_64 > /tmp/fucf-ui.log 2>&1 &
+          for i in $(seq 1 50); do curl -fsS -o /dev/null http://127.0.0.1:8787/ && break; sleep 0.2; done
+          tail -5 /tmp/fucf-ui.log
+      - name: seed an account, a zone and edge pages
+        run: |
+          api() { curl -fsS -X "$1" -H "Authorization: Bearer ui-check-token" -H "Content-Type: application/json" "http://127.0.0.1:8787/client/v4$2" ${3:+-d "$3"}; }
+          SESSION=$(curl -fsS -X POST -H "Content-Type: application/json" http://127.0.0.1:8787/client/v4/auth/setup \
+            -d '{"token":"ui-check-token","email":"owner@example.com","password":"a long ui check password"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["token"])')
+          ZONE=$(api POST /zones '{"name":"example.com"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["id"])')
+          api POST /zones/$ZONE/dns_records '{"type":"A","name":"example.com","content":"127.0.0.1","proxied":true}' >/dev/null
+          api POST /zones/$ZONE/dns_records '{"type":"A","name":"down.example.com","content":"192.0.2.1","proxied":true}' >/dev/null
+          mkdir -p edge-pages
+          # 530: the origin is this edge itself; 404: a host nobody proxies
+          curl -s -H "Host: example.com" http://127.0.0.1:18080/ -o edge-pages/530-origin-is-edge.html -w "%{http_code}\n"
+          curl -s -H "Host: nowhere.test" http://127.0.0.1:18080/ -o edge-pages/404-unknown-host.html -w "%{http_code}\n"
+          curl -s -m 20 -H "Host: down.example.com" http://127.0.0.1:18080/ -o edge-pages/52x-origin-down.html -w "%{http_code}\n" || true
+          echo "SESSION=$SESSION" >> $GITHUB_ENV; echo "ZONE=$ZONE" >> $GITHUB_ENV
+      - name: screenshots
+        run: |
+          cd scripts/ui && npm init -y >/dev/null && npm i --no-audit --no-fund playwright@1.49.1 >/dev/null && npx playwright install --with-deps chromium >/dev/null
+          node shots.mjs http://127.0.0.1:8787/ "$SESSION" "$ZONE" ../../shots ../../edge-pages/*.html
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: |
+            shots/
+            edge-pages/
+            /tmp/fucf-ui.log
+          retention-days: 14

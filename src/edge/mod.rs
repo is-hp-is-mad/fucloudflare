@@ -172,35 +172,77 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn page(status: u16, title: &str, detail: &str, ray: &str) -> Response<Body> {
+/// The look of the edge's own pages (errors, the browser check): warm
+/// neutrals, a serif headline and buttons that give a little when pressed.
+const PAGE_CSS: &str = "\
+:root{color-scheme:light dark;--bg:#faf9f5;--fg:#141413;--sub:#5e5d59;--faint:#87867f;--line:#e8e6dc;--chip:#f0eee6;--btn:#141413;--btnfg:#faf9f5;--clay:#d97757}\
+@media (prefers-color-scheme:dark){:root{--bg:#262624;--fg:#faf9f5;--sub:#b0aea5;--faint:#87867f;--line:#3d3d3a;--chip:#30302e;--btn:#faf9f5;--btnfg:#141413}}\
+*{box-sizing:border-box}html{height:100%}\
+body{margin:0;min-height:100%;display:grid;place-items:center;background:var(--bg);color:var(--fg);\
+font:16px/1.65 ui-sans-serif,system-ui,-apple-system,'Segoe UI','PingFang SC','Noto Sans SC','Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}\
+main{width:min(36rem,100%);padding:3rem 1.5rem}\
+.mark{display:block;width:40px;height:40px;margin-bottom:1.75rem;color:var(--clay)}\
+.code{display:inline-block;font:500 13px/1 ui-monospace,'SF Mono',Consolas,monospace;color:var(--sub);background:var(--chip);border-radius:999px;padding:6px 10px;margin-bottom:1rem}\
+h1{font:500 clamp(1.75rem,4vw,2.25rem)/1.2 ui-serif,'Iowan Old Style',Georgia,'Songti SC','Noto Serif SC',serif;letter-spacing:-.015em;margin:0 0 .75rem}\
+p{margin:0 0 1rem;color:var(--sub)}\
+.acts{display:flex;gap:12px;margin-top:1.75rem;flex-wrap:wrap}\
+button{position:relative;overflow:hidden;display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px 20px;border:0;border-radius:.6rem;\
+background:var(--btn);color:var(--btnfg);font-family:inherit;font-size:15px;font-weight:500;line-height:1.5;cursor:pointer;-webkit-user-select:none;user-select:none;backface-visibility:hidden;will-change:transform;\
+transition:transform .15s cubic-bezier(.165,.85,.45,1)}\
+button::after{content:'';position:absolute;inset:0;opacity:0;transform:translateY(8px);background:radial-gradient(at bottom,rgba(255,255,255,.2),transparent);transition:opacity .2s,transform .2s}\
+button:hover{transform:scaleY(1.015) scaleX(1.005)}button:hover::after{opacity:1;transform:none}button:active{transform:scale(.985)}\
+button:focus-visible{outline:2px solid #c46849;outline-offset:2px}\
+footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--line);font-size:13px;color:var(--faint);display:flex;gap:6px 16px;flex-wrap:wrap}\
+footer code{font:12.5px ui-monospace,'SF Mono',Consolas,monospace;color:var(--sub)}\
+.spin{width:28px;height:28px;border-radius:50%;border:2.5px solid var(--line);border-top-color:var(--clay);animation:r 0.9s linear infinite;margin-bottom:1.75rem}\
+@keyframes r{to{transform:rotate(360deg)}}\
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
+
+/// A small mark for the edge's pages (an open sector: the edge between visitor and origin).
+const PAGE_MARK: &str = "<svg class=\"mark\" viewBox=\"0 0 40 40\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M6 28a14 14 0 0 1 28 0\"/><path d=\"M20 28l8-10\"/><circle cx=\"20\" cy=\"28\" r=\"2\" fill=\"currentColor\"/></svg>";
+
+fn html_page(status: StatusCode, title: &str, body: &str) -> Response<Body> {
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{status} {t}</title>\
-         <style>body{{font:16px system-ui,sans-serif;max-width:40em;margin:12vh auto;padding:0 1em;color:#222}}\
-         h1{{font-size:1.6em}}small{{color:#777}}</style></head>\
-         <body><h1>{status} &middot; {t}</h1><p>{d}</p><hr><small>Ray ID: {ray} &middot; fucf</small></body></html>",
-        t = escape(title),
-        d = escape(detail),
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\">\
+         <title>{title}</title><style>{PAGE_CSS}</style></head><body><main>{body}</main></body></html>"
     );
     let mut resp = Response::new(full(html));
-    *resp.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    *resp.status_mut() = status;
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
     resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
+fn page(status: u16, title: &str, detail: &str, ray: &str) -> Response<Body> {
+    let (t, d) = (escape(title), escape(detail));
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    // a retry helps with what is temporary; a 4xx will not change by itself
+    let retry = if status >= 500 { "<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">重新加载</button></div>" } else { "" };
+    let when = crate::store::now();
+    html_page(
+        code,
+        &format!("{status} · {t}"),
+        &format!(
+            "{PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{t}</h1><p>{d}</p>{retry}\
+             <footer><span>Ray ID <code>{ray}</code></span><span>{when}</span><span>fucf</span></footer>"
+        ),
+    )
+}
+
 fn challenge_page(token: &str, ray: &str) -> Response<Body> {
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Just a moment...</title></head>\
-         <body><h1>Checking your browser...</h1><noscript>Please enable JavaScript to continue.</noscript>\
-         <script>document.cookie=\"{cookie}={token}; path=/; max-age=1800; SameSite=Lax\";location.reload();</script>\
-         <hr><small>Ray ID: {ray} &middot; fucf</small></body></html>",
-        cookie = waf::CLEARANCE_COOKIE,
-    );
-    let mut resp = Response::new(full(html));
-    *resp.status_mut() = StatusCode::FORBIDDEN;
-    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
+    html_page(
+        StatusCode::FORBIDDEN,
+        "Just a moment...",
+        &format!(
+            "<div class=\"spin\" aria-hidden=\"true\"></div><h1>Checking your browser...</h1>\
+             <p>正在确认您的浏览器，几秒后会自动继续。This takes a few seconds.</p>\
+             <noscript><p>Please enable JavaScript to continue. 请启用 JavaScript 后继续。</p></noscript>\
+             <script>document.cookie=\"{cookie}={token}; path=/; max-age=1800; SameSite=Lax\";location.reload();</script>\
+             <footer><span>Ray ID <code>{ray}</code></span><span>fucf</span></footer>",
+            cookie = waf::CLEARANCE_COOKIE,
+        ),
+    )
 }
 
 fn strip_hop_by_hop(headers: &mut HeaderMap) {

@@ -346,20 +346,20 @@ impl Limits {
 
 const STYLE: &str = "\
 html{height:100%}
-body{margin:0;min-height:100%;display:grid;place-items:center;background:#f4f1ea;color:#23211d;font:16px/1.7 system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif}
-main{max-width:34em;padding:2.5em 1.5em}
-.mark{display:block;width:72px;height:72px;margin-bottom:1.5em}
-h1{font-size:1.5em;line-height:1.3;margin:0 0 .8em;letter-spacing:.01em}
-p{margin:.6em 0}
-p.en{color:#6b665c;font-size:.9em}
-hr{border:0;border-top:1px solid #d9d3c5;margin:2em 0 1em}
-small{color:#8a8477}
-@media (prefers-color-scheme:dark){body{background:#191815;color:#e9e4d8}p.en{color:#a39d90}hr{border-color:#3a372f}small{color:#7d776b}}
+body{margin:0;min-height:100%;display:grid;place-items:center;background:#faf9f5;color:#141413;font:16px/1.65 ui-sans-serif,system-ui,-apple-system,'PingFang SC','Noto Sans SC','Microsoft YaHei',sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:36rem;padding:3rem 1.5rem}
+.mark{display:block;width:56px;height:56px;margin-bottom:1.75rem}
+h1{font:500 clamp(1.6rem,4vw,2.1rem)/1.25 ui-serif,'Iowan Old Style',Georgia,'Songti SC','Noto Serif SC',serif;letter-spacing:-.015em;margin:0 0 .9rem}
+p{margin:.6em 0;color:#3d3d3a}
+p.en{color:#73726c;font-size:.92em}
+hr{border:0;border-top:1px solid #e8e6dc;margin:2.2em 0 1em}
+small{color:#87867f;font-size:13px}
+@media (prefers-color-scheme:dark){body{background:#262624;color:#faf9f5}p{color:#d1cfc5}p.en{color:#9c9a92}hr{border-color:#3d3d3a}small{color:#87867f}}
 ";
 
 const MARK: &str = "\
-<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 72 72\" fill=\"none\" stroke=\"#c2571a\" stroke-width=\"4\" stroke-linecap=\"round\">\
-<path d=\"M10 50a26 26 0 1 1 52 0\"/><path d=\"M36 50 52 30\"/><circle cx=\"36\" cy=\"50\" r=\"3\" fill=\"#c2571a\"/>\
+<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 72 72\" fill=\"none\" stroke=\"#d97757\" stroke-width=\"4\" stroke-linecap=\"round\">\
+<path d=\"M10 50a26 26 0 1 1 52 0\"/><path d=\"M36 50 52 30\"/><circle cx=\"36\" cy=\"50\" r=\"3\" fill=\"#d97757\"/>\
 <path d=\"M10 62h52\" stroke-width=\"3\" stroke-dasharray=\"2 7\"/></svg>";
 
 fn answer(status: u16, content_type: &'static str, cache: &'static str, body: String) -> Response<Body> {
