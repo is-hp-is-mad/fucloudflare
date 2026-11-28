@@ -68,6 +68,7 @@ pub enum Area {
     AccountAnalytics,
     AuditLogs,
     Backup,
+    Notifications,
     Tokens,
     /// IP lists (crate::lists): kept for the whole account, used by the
     /// rules of any zone.
@@ -77,7 +78,7 @@ pub enum Area {
 impl Area {
     fn scope(self) -> Scope {
         match self {
-            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup | Area::Lists => {
+            Area::WorkersScripts | Area::WorkersKv | Area::D1 | Area::Fleet | Area::AccountAnalytics | Area::AuditLogs | Area::Backup | Area::Lists | Area::Notifications => {
                 Scope::Account
             }
             Area::Tokens => Scope::User,
@@ -140,6 +141,8 @@ groups! {
     "7d8e7f405b0d4be7f4a9b5c6d7e8f9a0" "Backup Read" Backup false "Download a full backup (everything, secrets included: guard the token)";
     "1ac9ee17d4e442a0ad48b35521db27f3" "Account Filter Lists Read" Lists false "Read IP lists and their items";
     "9766e73b0e034208a4262fa492b80b2a" "Account Filter Lists Write" Lists true "Change IP lists and their items (the rules that use a list follow it)";
+    "88f2d624e0de496d81a02bd4776852a1" "Notifications Read" Notifications false "Read alert channels (secrets masked) and the alerts that fire";
+    "8b36fa19ef584f57aa26509f91963eb5" "Notifications Write" Notifications true "Change alert channels and send test messages";
     "0cc3a61731504c89b99ec1be78b77aa0" "API Tokens Read" Tokens false "List your API tokens";
     "686d18d5ac6c441c867cbf6771e58a0a" "API Tokens Write" Tokens true "Create, change, roll and delete your API tokens";
 }
@@ -201,6 +204,7 @@ pub fn need(path: &str) -> Need {
         ["d1", ..] => Need::Account(Area::D1),
         ["audit", ..] => Need::Account(Area::AuditLogs),
         ["backup"] => Need::Account(Area::Backup),
+        ["alerts", ..] => Need::Account(Area::Notifications),
         ["analytics", ..] => Need::Account(Area::AccountAnalytics),
         ["rules", "lists", ..] => Need::Account(Area::Lists),
         ["fleet", ..] | ["nodes", ..] | ["steering", ..] | ["proxy", ..] | ["system", ..] | ["releases", ..] | ["warp", ..] | ["email", "status"] => {
@@ -443,6 +447,8 @@ mod tests {
         assert_eq!(need("/user/tokens/verify"), Need::Open);
         assert_eq!(need("/zones/z1/whatever"), Need::Closed);
         assert_eq!(need("/zones/z1/rulesets"), Need::Zone(Area::Firewall, Some("z1".into())));
+        assert_eq!(need("/alerts/channels/c1/test"), Need::Account(Area::Notifications));
+        assert_eq!(need("/alerts/active"), Need::Account(Area::Notifications));
         assert_eq!(
             need("/zones/z1/rulesets/phases/http_request_cache_settings/entrypoint"),
             Need::Zone(Area::CacheRules, Some("z1".into()))

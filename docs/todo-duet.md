@@ -140,7 +140,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 只替换给浏览器看的页面：gRPC、非页面请求（参见 `challenge::is_navigation`）、人机验证页保持原样。
 - 测试：占位符替换与转义；没配置时与现在完全一致；超长被拒绝。
 
-### [ ] T6 告警
+### [x] T6 告警
 
 - 目标：出事时主动通知。新文件 `src/alerts.rs`。
 - 通道：全局对象 `AlertChannel { id, name, kind, enabled, events, … }`，`kind` 为 `webhook`（POST JSON）或 `telegram`（机器人令牌加 chat id）。
@@ -257,6 +257,13 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 被规则引用（停用的规则也算）的列表，删除或改名都回 409 并列出规则；带主机位的网段、IPv4 映射地址、同一请求里重复的地址一律拒绝。条目写操作照 Cloudflare 返回 `operation_id`，操作状态只在本节点内存里。
 - 权限：账户级 `Area::Lists`（Account Filter Lists Read / Write）；`/accounts/{id}/rules/lists…` 经 `account_path` 映射。`account_path` 现在改写路径后清空 extensions，顺带修好了带 id 的账户路径（之前 KV namespace 这类会拿到 3 个路径参数）；以后在账户路径下加 WebSocket 要另想办法。
 - 拿不准：Cloudflare 是否允许改名、重复追加时是否覆盖备注；权限组 id 不是 Cloudflare 的真实 id；条目没有游标分页。`ip_lists` 进了同步和全量对账：滚动升级时还没升级的节点若做全量对账的来源，可能把列表清掉，建议全部节点升级后再建列表。
+
+### T6
+
+- 新文件 `src/alerts.rs`：Webhook 和 Telegram 两种通道（全局集合 `alert_channels`，为空时不参与序列化），覆盖 6 种事件。判定 `evaluate` 是纯函数，只在面板节点上（和自动防火墙同一个条件）每 30 秒检查一次；触发、恢复各通知一次，持续触发每 6 小时再提醒，启动后 2 分钟内的离线检查不计数。
+- 接口 `/alerts/channels`（增删改查）、`/alerts/channels/{id}/test`、`/alerts/active`。输出里令牌和 Webhook 地址打码，原样送回打码值保留原密钥；写操作只限管理员，令牌要新的账户级 Notifications Read / Write。Webhook 只接受 https 和公网地址，发送时也拒绝解析到内网的名字，不跟随跳转。
+- 近似处理：Fleet 没有"上次同步时间"，`sync_lagging` 用"在线但连续 5 分钟未同步"；`origin_errors` 阈值固定为 5 分钟内 3 次；证书只看证书包，不看各节点自己的站点证书。
+- 拿不准：多个 peer 都没设 `--panel-origin` 时，每个 peer 都满足条件，会各发一份；通道和其他全局密钥一样随配置同步、进备份；没有做 Cloudflare `/accounts/{id}/alerting` 的兼容路径。
 
 ## 5. 部署（通过 Komari）
 

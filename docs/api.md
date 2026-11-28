@@ -92,6 +92,7 @@ by `id` or by `name`:
 | Analytics Read | zone | `/zones/{id}/analytics` |
 | Workers Scripts, Workers KV Storage, D1 Read / Write | account | `/workers/scripts…`, `/kv/…`, `/d1/…` |
 | Fleet Read / Write | account | nodes, fleet actions, steering, local proxy rules, releases |
+| Notifications Read / Write | account | `/alerts…` (alert channels, test messages, active alerts) |
 | Account Analytics Read, Audit Logs Read | account | `/analytics`, `/audit` |
 | Backup Read | account | `GET /backup` (everything, secrets included: guard such a token) |
 | Account Filter Lists Read / Write | account | `/rules/lists…` (IP lists) |
@@ -631,6 +632,70 @@ A node with traffic limits:
 curl -s -X POST $BASE/nodes -H "Authorization: Bearer $TOKEN" -d '{
   "name": "nrt1", "ipv4": "203.0.113.10", "continents": ["AS"],
   "traffic_dns_gb": 1000, "traffic_throttle_gb": 1250, "traffic_limit_gb": 1400, "rate_limit_mbps": 10
+}'
+```
+
+### Alerts
+
+The node that runs the panel (the one without `--panel-origin`) looks at the fleet every 30 seconds
+and tells the alert channels what changed: once when an alert starts, every 6 hours while it lasts,
+and once when it is over. What fires is kept in memory only: after a restart, whatever still fires
+is told again.
+
+| Event | Fires when | Over when |
+| --- | --- | --- |
+| `node_offline` | an enabled node (not the panel's own) missed 3 checks in a row; never within 2 minutes of the start, and the checks count from then on | it reports again |
+| `sync_lagging` | a node has been online for 5 minutes without running this node's configuration version | it runs it, or goes offline |
+| `certificate_failing` | a certificate pack failed to issue (no certificate at all), or the one in use ends within 14 days | it is renewed or deleted |
+| `traffic_limit` | a node is past a threshold of its traffic allowance (`dns_limited`, `throttled`, `limited`); a new tier is told again | it is back under |
+| `under_attack` | the automatic firewall switched a zone to under attack mode (not when it was set by hand) | the zone is switched back |
+| `origin_errors` | 3 origin error events of one zone within 5 minutes (each failing host is logged at most once a minute per status and node) | 5 minutes pass without one |
+
+```
+GET    /alerts/channels
+POST   /alerts/channels                   {"name", "kind": "webhook|telegram", "enabled", "events": [...],
+                                           "url" (webhook), "bot_token", "chat_id" (telegram)}
+GET    /alerts/channels/{id}
+PUT    /alerts/channels/{id}  PATCH       the fields given change (PUT and PATCH alike)
+DELETE /alerts/channels/{id}
+POST   /alerts/channels/{id}/test         one test message, on or off; 502 with the reason if it did not arrive
+GET    /alerts/active                     {"evaluating", "checked_at", "alerts": [{"key", "event", "subject", "level",
+                                           "message", "since", "last_sent"}]}; "evaluating" is false on nodes that do not check
+```
+
+- `events` names at least one of the events above; an empty list is refused (a channel told of
+  nothing is a mistake), and so are unknown names.
+- A webhook `url` must be `https://`, name a public host (no `localhost`, no private, loopback or
+  reserved address, no `user:password@`) and is never sent to a private address whatever its name
+  resolves to. Redirects are not followed; anything but a 2xx answer counts as not delivered.
+- `bot_token` is the token BotFather gives (`<bot id>:<secret>`); `chat_id` is a numeric chat id
+  (negative for groups and channels) or `@channelname`. Messages go to the Bot API's `sendMessage`
+  as plain text.
+- At most 20 channels. Writes need an administrator (editors and viewers read); tokens need
+  Notifications Read / Write, which Fleet permissions do not include.
+- Secrets never come back: `url` shows as `https://host/***` and `bot_token` as `***`. Sending the
+  masked value back (or an empty one) keeps the stored secret, so a channel can be read, changed and
+  put back whole. Channels are part of the configuration (and of backups), secrets included.
+
+A webhook gets:
+
+```json
+{
+  "source": "fucf", "node": "eu-1", "sent_at": "2026-11-28T12:00:30.000000Z", "test": false,
+  "alerts": [{ "event": "node_offline", "subject": "us-1", "state": "firing", "repeat": false, "level": "",
+               "message": "节点 us-1 连续 3 次检查不在线 · node us-1 missed 3 checks in a row",
+               "since": "2026-11-28T12:00:30.000000Z", "at": "2026-11-28T12:00:30.000000Z" }],
+  "text": "fucf 告警 · alerts from eu-1\n\n触发 · FIRING node_offline us-1\n…"
+}
+```
+
+`state` is `firing` or `resolved`; `repeat` marks the 6-hourly reminder. A test message has
+`"test": true` and no alerts. Everything found in one check goes out as one message per channel.
+
+```sh
+curl -s -X POST $BASE/alerts/channels -H "Authorization: Bearer $TOKEN" -d '{
+  "name": "ops", "kind": "webhook", "url": "https://hooks.example.com/fucf",
+  "events": ["node_offline", "certificate_failing", "under_attack"]
 }'
 ```
 

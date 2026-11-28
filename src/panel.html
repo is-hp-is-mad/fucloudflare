@@ -1418,10 +1418,11 @@ const NAV = [
   ["lists", "IP 列表", "list"],
   ["workers", "Workers & 存储", "code"],
   ["proxy", "反向代理 (Caddy)", "proxy"],
+  ["alerts", "告警", "bolt"],
   ["account", "账户与安全", "lock"],
   ["users", "用户与审计", "shield", "admin"],
 ];
-const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, lists: viewLists, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, fleet: viewFleet, account: viewAccount, users: viewUsers };
+const VIEWS = { overview: viewOverview, zones: viewZones, zone: viewZone, steering: viewSteer, lists: viewLists, workers: viewWorkers, kv: viewWorkers, d1: viewWorkers, proxy: viewProxy, alerts: viewAlerts, fleet: viewFleet, account: viewAccount, users: viewUsers };
 function parseHash() {
   const p = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (p[0] === "zone" && p[1]) return { view: "zone", zone: p[1], tab: p[2] || "overview" };
@@ -1960,6 +1961,49 @@ Object.assign(A, {
     await api("DELETE", `/rules/lists/${encodeURIComponent(d.list)}/items`, { items: [{ id: d.id }] });
     toast("已删除"); render();
   },
+});
+
+// --------------------------------------------------------------- alerts ----
+// Channels that are told when something goes wrong; the checks run on the panel's node only.
+const ALERT_EVENTS = [
+  ["node_offline", "节点离线（连续 3 次检查）"], ["sync_lagging", "同步落后（在线但 5 分钟未同步）"], ["certificate_failing", "证书签发失败或 14 天内到期"],
+  ["traffic_limit", "节点流量到档"], ["under_attack", "被自动切到受攻击模式"], ["origin_errors", "5 分钟内回源错误达到阈值"]];
+const ALERT_EV = Object.fromEntries(ALERT_EVENTS);
+async function viewAlerts() {
+  const [channels, act] = await Promise.all([api("GET", "/alerts/channels"), api("GET", "/alerts/active")]);
+  C.alertCh = channels;
+  const admin = me.role === "admin";
+  const how = c => c.kind === "telegram" ? `Telegram · <span class="mono">${esc(c.chat_id)}</span>` : `Webhook · <span class="mono">${esc(c.url)}</span>`;
+  const active = card(`触发中 <span class="cnt">${act.alerts.length}</span>`, act.checked_at ? `<span class="hint">上次检查 ${when(act.checked_at)}</span>` : "",
+    act.evaluating ? table([
+      { label: "事件", fmt: a => `<span class="tag bad">${esc(ALERT_EV[a.event] || a.event)}</span>` },
+      { label: "对象", fmt: a => `<b>${esc(a.subject)}</b>` },
+      { label: "说明", fmt: a => esc(a.message) },
+      { label: "开始于", fmt: a => when(a.since) },
+    ], act.alerts, null, "<b>一切正常</b>没有触发中的告警。")
+      : '<div class="empty"><b>这个节点不做检查</b>告警只在面板所在的节点上检查和发送，请到那个节点的面板查看。</div>');
+  const list = card(`通道 <span class="cnt">${channels.length}</span>`, "", table([
+    { label: "名称", fmt: c => `<b>${esc(c.name)}</b>` }, { label: "方式", fmt: how },
+    { label: "事件", fmt: c => chips(c.events.map(e => ALERT_EV[e] || e)) },
+    { label: "状态", fmt: c => (c.enabled ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
+  ], channels, admin ? c => lk("alertTest", "发送测试", { id: c.id }) + rowActs("alertEdit", "alertDel", { id: c.id }) : null,
+    `<b>还没有告警通道</b>添加一个 Webhook 或 Telegram 机器人，出事时会主动通知。${admin ? "<br><br>" + btn("alertEdit", "添加通道", {}, "pri") : ""}`));
+  return { title: "告警", sub: "每 30 秒检查一次机群：触发和恢复时各通知一次，持续触发每 6 小时再提醒一次。通道里的令牌和 Webhook 地址不会显示出来。",
+    acts: admin ? btn("alertEdit", "添加通道", {}, "pri") : "", body: active + list };
+}
+Object.assign(A, {
+  alertEdit: d => openForm(d.id ? "编辑告警通道" : "添加告警通道", [
+    { k: "name", label: "名称" },
+    { k: "kind", label: "方式", type: "select", options: [["webhook", "Webhook（POST JSON）"], ["telegram", "Telegram 机器人"]] },
+    { k: "url", label: "Webhook URL（只限 https）", hint: d.id ? "显示的是打码后的地址，原样保存即保留原来的地址" : "收到的 JSON 含 node、alerts（event、subject、state、message）和 text" },
+    { k: "bot_token", label: "Telegram 机器人令牌", type: "password", auto: "new-password", hint: d.id ? "*** 表示保留原来的令牌" : "BotFather 给的 <id>:<secret>" },
+    { k: "chat_id", label: "Telegram chat id", hint: "数字 id（群组和频道是负数）或 @频道名" },
+    { k: "events", label: "通知哪些事件", type: "multi", options: ALERT_EVENTS },
+    { k: "enabled", label: "启用", type: "check", def: true },
+  ], d.id ? byId("alertCh", d.id) : { kind: "webhook", events: ALERT_EVENTS.map(e => e[0]) },
+  v => api(d.id ? "PUT" : "POST", "/alerts/channels" + (d.id ? "/" + d.id : ""), v)),
+  alertDel: d => del("/alerts/channels/" + d.id, "这个告警通道"),
+  alertTest: async d => { await api("POST", `/alerts/channels/${d.id}/test`); toast("测试消息已送达"); },
 });
 
 document.addEventListener("click", e => {

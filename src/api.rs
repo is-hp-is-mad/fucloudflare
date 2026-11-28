@@ -215,6 +215,10 @@ pub fn router(state: Arc<ApiState>) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(4 << 20)),
         )
         .route("/rules/lists/{list_id}/items/{item_id}", get(get_ip_list_item))
+        .route("/alerts/channels", get(list_alert_channels).post(create_alert_channel))
+        .route("/alerts/channels/{channel_id}", get(get_alert_channel).put(update_alert_channel).patch(update_alert_channel).delete(delete_alert_channel))
+        .route("/alerts/channels/{channel_id}/test", post(test_alert_channel))
+        .route("/alerts/active", get(active_alerts))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -427,7 +431,8 @@ async fn client_of(mut req: Request, next: Next) -> Response {
 
 /// May somebody with this role make this request? Everybody may look after
 /// their own account; viewers only read; users, the audit trail, releases,
-/// nodes, spectrum listeners and what nodes are told to do are the administrators'.
+/// nodes, spectrum listeners, what nodes are told to do and where alerts go
+/// are the administrators'.
 fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
     let under = |prefix: &str| path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'));
     let reads = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
@@ -438,7 +443,7 @@ fn permitted(role: Role, method: &axum::http::Method, path: &str) -> bool {
         || under("/replication")
         || under("/backup")
         || path.starts_with("/releases/")
-        || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || path.contains("/spectrum/apps")));
+        || (!reads && (under("/releases") || under("/fleet") || under("/nodes") || under("/alerts") || path.contains("/spectrum/apps")));
     match role {
         Role::Admin => true,
         Role::Editor => own || !admins,
@@ -3063,6 +3068,46 @@ async fn delete_steering(State(st): St, Path(id): Path<String>) -> ApiResult {
     ok(json!({ "id": id }))
 }
 
+// ----------------------------------------------------------- alerts ----
+// (what is checked and how it is sent: crate::alerts; secrets never leave masked)
+
+async fn list_alert_channels(State(st): St) -> ApiResult {
+    ok(Value::Array(st.store.list_alert_channels().iter().map(crate::alerts::AlertChannel::public).collect()))
+}
+
+async fn get_alert_channel(State(st): St, Path(id): Path<String>) -> ApiResult {
+    ok(st.store.get_alert_channel(&id).ok_or(StoreError::NotFound)?.public())
+}
+
+async fn create_alert_channel(State(st): St, bytes: Bytes) -> ApiResult {
+    ok(st.store.save_alert_channel_async(None, body(&bytes)?).await?.public())
+}
+
+/// PUT and PATCH alike: the fields given change; a secret sent back masked stays.
+async fn update_alert_channel(State(st): St, Path(id): Path<String>, bytes: Bytes) -> ApiResult {
+    ok(st.store.save_alert_channel_async(Some(&id), body(&bytes)?).await?.public())
+}
+
+async fn delete_alert_channel(State(st): St, Path(id): Path<String>) -> ApiResult {
+    st.store.delete_alert_channel_async(&id).await?;
+    ok(json!({ "id": id }))
+}
+
+/// Send one test message through the channel (whether it is on or not).
+async fn test_alert_channel(State(st): St, Path(id): Path<String>) -> ApiResult {
+    let channel = st.store.get_alert_channel(&id).ok_or(StoreError::NotFound)?;
+    let node = st.node();
+    crate::alerts::send_test(&st.edge, &channel, &node)
+        .await
+        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, 1100, format!("the test message was not delivered: {e}")))?;
+    ok(json!({ "id": id, "sent": true }))
+}
+
+/// What fires now, on the node that checks (the panel's); elsewhere `evaluating` is false.
+async fn active_alerts() -> ApiResult {
+    ok(crate::alerts::active())
+}
+
 // ------------------------------------------------ local proxy rules ----
 
 async fn list_proxy_rules(State(st): St) -> ApiResult {
@@ -3812,6 +3857,128 @@ mod tests {
         assert_eq!(sc, StatusCode::OK);
         let settings: Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(settings["result"]["vars"]["API_KEY"], "***");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn alert_channels_through_the_api_keep_their_secrets_and_their_permissions() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-alerts-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        // (each made in their own name: no password change pending)
+        st.accounts.create_user("edit@example.com", Role::Editor, Some("editor-pass-123"), "edit@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("view@example.com", Role::Viewer, Some("viewer-pass-123"), "view@example.com", &Client::default()).unwrap();
+        let session = |email: &str, password: &str| match st.accounts.login(email, password, &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let admin = session("admin@example.com", "strong-pass-123");
+        let editor = session("edit@example.com", "editor-pass-123");
+        let viewer = session("view@example.com", "viewer-pass-123");
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let as_who = |auth: &str| -> Vec<(&'static str, String)> { vec![("authorization", auth.to_string()), ("content-type", "application/json".to_string())] };
+        let bot = format!("{}:{}", 12345, "test-token-".repeat(3));
+        let base = "/client/v4/alerts/channels";
+
+        let hook = json!({ "name": "ops", "kind": "webhook", "url": "https://hooks.example.com/services/test-secret", "events": ["node_offline", "under_attack"] });
+        let (sc, b) = call(&mut app, "POST", base, hook.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(!String::from_utf8_lossy(&b).contains("test-secret"));
+        let hook_id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+        let tg = json!({ "name": "chat", "kind": "telegram", "bot_token": bot, "chat_id": "-1001234", "events": ["traffic_limit"] });
+        let (sc, b) = call(&mut app, "POST", base, tg.to_string().into_bytes()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(json_of(&b)["result"]["bot_token"], "***");
+        let tg_id = json_of(&b)["result"]["id"].as_str().unwrap().to_string();
+
+        // nothing that answers shows a secret
+        for path in [base.to_string(), format!("{base}/{hook_id}"), format!("{base}/{tg_id}")] {
+            let (sc, b) = call(&mut app, "GET", &path, vec![]).await;
+            let text = String::from_utf8_lossy(&b).to_string();
+            assert_eq!(sc, StatusCode::OK);
+            assert!(!text.contains("test-secret") && !text.contains("test-token") && !text.contains("\"sync\""), "{text}");
+        }
+        // what was shown, sent back whole with a change, keeps the secret
+        let (_, b) = call(&mut app, "GET", &format!("{base}/{hook_id}"), vec![]).await;
+        let mut shown = json_of(&b)["result"].clone();
+        shown["name"] = json!("ops renamed");
+        let (sc, b) = call(&mut app, "PUT", &format!("{base}/{hook_id}"), shown.to_string().into_bytes()).await;
+        assert_eq!((sc, json_of(&b)["result"]["name"].clone()), (StatusCode::OK, json!("ops renamed")));
+        assert_eq!(st.store.get_alert_channel(&hook_id).unwrap().url, "https://hooks.example.com/services/test-secret");
+        let (sc, _) = call(&mut app, "PATCH", &format!("{base}/{tg_id}"), br#"{"bot_token":"***","chat_id":"@example_alerts"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let kept = st.store.get_alert_channel(&tg_id).unwrap();
+        assert_eq!((kept.bot_token.as_str(), kept.chat_id.as_str()), (bot.as_str(), "@example_alerts"));
+
+        // refused, and nothing changes
+        for (method, path, body) in [
+            ("POST", base.to_string(), json!({ "name": "x", "kind": "webhook", "url": "http://hooks.example.com/x", "events": ["node_offline"] })),
+            ("POST", base.to_string(), json!({ "name": "x", "kind": "webhook", "url": "https://hooks.example.com/x", "events": [] })),
+            ("POST", base.to_string(), json!({ "name": "x", "kind": "sms", "events": ["node_offline"] })),
+            ("POST", base.to_string(), json!({ "name": "x", "kind": "telegram", "bot_token": "***", "chat_id": "42", "events": ["node_offline"] })),
+            ("PUT", format!("{base}/{hook_id}"), json!({ "url": "https://hooks.example.net/***" })),
+            ("PATCH", format!("{base}/{hook_id}"), json!({ "events": ["node_offline", "nope"] })),
+        ] {
+            let (sc, b) = call(&mut app, method, &path, body.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{method} {path} {body}: {}", String::from_utf8_lossy(&b));
+        }
+        let (sc, _) = call(&mut app, "POST", base, b"not json".to_vec()).await;
+        assert_eq!(sc, StatusCode::BAD_REQUEST);
+        assert_eq!(st.store.list_alert_channels().len(), 2);
+        assert_eq!(st.store.get_alert_channel(&hook_id).unwrap().events, vec!["node_offline", "under_attack"]);
+        for (method, path) in [("GET", format!("{base}/no-such-id")), ("PUT", format!("{base}/no-such-id")), ("DELETE", format!("{base}/no-such-id")), ("POST", format!("{base}/no-such-id/test"))] {
+            let (sc, _) = call(&mut app, method, &path, br#"{"name":"x"}"#.to_vec()).await;
+            assert_eq!(sc, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+
+        // this test starts no checks: the route answers all the same
+        let (sc, b) = call(&mut app, "GET", "/client/v4/alerts/active", vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        assert!(json_of(&b)["result"]["alerts"].is_array());
+
+        // roles: viewers and editors read, only administrators change or test
+        for who in [&viewer, &editor] {
+            let h = as_who(who);
+            let (sc, _, b) = call_raw(&mut app, "GET", base, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), vec![]).await;
+            assert_eq!(sc, StatusCode::OK);
+            assert!(!String::from_utf8_lossy(&b).contains("test-secret"));
+            for (method, path) in [("POST", base.to_string()), ("PATCH", format!("{base}/{hook_id}")), ("DELETE", format!("{base}/{hook_id}")), ("POST", format!("{base}/{hook_id}/test"))] {
+                let (sc, _, _) = call_raw(&mut app, method, &path, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), hook.to_string().into_bytes()).await;
+                assert_eq!(sc, StatusCode::FORBIDDEN, "{method} {path}");
+            }
+        }
+        assert_eq!(st.store.list_alert_channels().len(), 2);
+
+        // tokens: a fleet token is not enough; Notifications Read reads, Write changes
+        let token_with = |group: &str| {
+            json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.{}", crate::tokens::account_id()): "*" }, "permission_groups": [{ "name": group }] }],
+            })
+        };
+        let mut bearer = HashMap::new();
+        for group in ["Fleet Write", "Notifications Read", "Notifications Write"] {
+            let h = as_who(&admin);
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h.iter().map(|(k, v)| (*k, v.as_str())).collect(), token_with(group).to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            bearer.insert(group, format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap()));
+        }
+        let expect = [
+            ("Fleet Write", "GET", base.to_string(), StatusCode::FORBIDDEN),
+            ("Notifications Read", "GET", "/client/v4/alerts/active".to_string(), StatusCode::OK),
+            ("Notifications Read", "GET", base.to_string(), StatusCode::OK),
+            ("Notifications Read", "DELETE", format!("{base}/{tg_id}"), StatusCode::FORBIDDEN),
+            ("Notifications Write", "DELETE", format!("{base}/{tg_id}"), StatusCode::OK),
+        ];
+        for (group, method, path, status) in expect {
+            let h = as_who(&bearer[group]);
+            let (sc, _, b) = call_raw(&mut app, method, &path, h.iter().map(|(k, v)| (*k, v.as_str())).collect(), vec![]).await;
+            assert_eq!(sc, status, "{group}: {method} {path}");
+            assert!(!String::from_utf8_lossy(&b).contains("test-secret"));
+        }
+        assert!(st.store.get_alert_channel(&tg_id).is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

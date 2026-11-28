@@ -449,6 +449,32 @@ DNS 记录的 Cloudflare 兼容补充：
   （`managed_by: auto_firewall_networks`；家庭宽带不会被整网处理；机群节点自己的地址除外）。`auto_firewall_networks=false` 关闭。
 - 攻击潮：窗口内攻击地址数达到 `auto_firewall_surge`（默认 50，0 关闭）时自动进入受攻击模式，攻击停止一小时后恢复原来的级别。
 
+## 告警
+
+出事时主动通知（面板：告警）。通道有两种：Webhook（POST 一段 JSON）和 Telegram 机器人（机器人令牌加 chat id）。
+只在面板所在的节点（没有 `--panel-origin` 的那台）上每 30 秒检查一次，触发和恢复各通知一次，持续触发时每 6 小时再提醒一次；
+状态只放内存，重启后还在触发的会重新通知一次。
+
+| 事件 | 什么时候触发 |
+|---|---|
+| `node_offline` | 启用的节点连续 3 次检查不在线；进程启动后 2 分钟内不算，之后重新数 |
+| `sync_lagging` | 节点在线，但已经 5 分钟没有用上最新的配置版本 |
+| `certificate_failing` | 证书包签发失败（一张证书都没有），或者在用的证书 14 天内到期 |
+| `traffic_limit` | 节点流量到档（`dns_limited` / `throttled` / `limited`），换档会再通知 |
+| `under_attack` | 域名被自动防火墙切到受攻击模式（手动开的不算） |
+| `origin_errors` | 某域名 5 分钟内有 3 次回源错误事件；之后整整 5 分钟没有回源错误才算恢复 |
+
+```
+/alerts/channels[/{id}]       GET POST PUT PATCH DELETE   {"name", "kind": "webhook|telegram", "enabled", "events": [...], "url", "bot_token", "chat_id"}
+/alerts/channels/{id}/test    POST                        发一条测试消息（停用的通道也能测）
+/alerts/active                GET                         当前触发中的告警（不做检查的节点上 evaluating 为 false）
+```
+
+- Webhook 只接受 `https://`，不能指向内网、回环或保留地址，也不能带用户名密码；域名解析到内网地址时同样不发，不跟随跳转。
+- `events` 至少选一个；未知的事件名会被拒绝。最多 20 个通道。改通道要管理员；API 令牌要 Notifications Read / Write（Fleet 权限不包括它）。
+- 接口返回里令牌显示为 `***`、Webhook 地址只显示到域名（`https://host/***`）；原样送回打码后的值（或留空）会保留原来的，
+  所以面板里改别的字段不会弄丢密钥。通道随配置同步、也在备份里，密钥一起。
+
 ## 安全级别、IP 纯净度与页面内人机验证
 
 - `security_level`：`off` / `low`（简易：威胁分 ≥ 80 要验证）/ `medium`（中等：≥ 50）/ `high`（严格：≥ 25，含机房 IP）/ `under_attack`（受攻击模式：所有人）。

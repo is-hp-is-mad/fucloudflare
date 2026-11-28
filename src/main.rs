@@ -1,4 +1,5 @@
 mod acme;
+mod alerts;
 mod api;
 mod auth;
 mod backup;
@@ -953,6 +954,8 @@ async fn main() -> anyhow::Result<()> {
         // bans from the security events (zones that switched it on): on the panel's node
         // only, one writer for the rules (every peer has the events)
         edge::autofw::spawn(store.clone(), waf.clone(), edge.reputation.get().cloned());
+        // alerts: one sender for the fleet, where the panel runs
+        alerts::spawn(store.clone(), fleet.clone(), waf.clone(), edge.clone(), args.edge_ips.clone(), args.node_name.clone());
     }
     let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {

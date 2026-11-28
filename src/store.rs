@@ -186,6 +186,9 @@ pub struct Tombstones {
     pub acme_challenges: BTreeMap<String, SyncMeta>,
     pub node_telemetry: BTreeMap<String, SyncMeta>,
     pub ip_lists: BTreeMap<String, SyncMeta>,
+    /// (Left out while empty: nodes that know no alert channels compute the same version.)
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub alert_channels: BTreeMap<String, SyncMeta>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -224,6 +227,10 @@ pub struct Data {
     /// Distributed ACME leader lease across peer nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acme_lease: Option<AcmeLease>,
+    /// Where alerts go (see crate::alerts); left out while empty, so that the
+    /// configuration version stays the one nodes without alerts compute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alert_channels: Vec<crate::alerts::AlertChannel>,
     /// Replication epoch UUID (changes if state is re-initialized).
     #[serde(default)]
     pub epoch: String,
@@ -678,6 +685,9 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
     for t in d.node_telemetry.values_mut() {
         bump(&mut t.sync);
     }
+    for c in &mut d.alert_channels {
+        bump(&mut c.sync);
+    }
     if let Some(l) = &mut d.acme_lease {
         bump(&mut l.sync);
     }
@@ -729,6 +739,7 @@ fn normalize_loaded_data(d: &mut Data, clock: &HlcClock) {
         acme_challenges,
         node_telemetry,
         ip_lists,
+        alert_channels,
     );
     sync_telemetry_projections(d);
     clock.advance_floor(max_ver.0, max_ver.1);
@@ -763,6 +774,7 @@ fn gc_tombstones(d: &mut Data, now_ms: u64, durable_ttl_ms: u64, ephemeral_ttl_m
     prune(&mut d.tombstones.local_proxy_rules, durable_ttl_ms);
     prune(&mut d.tombstones.node_telemetry, durable_ttl_ms);
     prune(&mut d.tombstones.ip_lists, durable_ttl_ms);
+    prune(&mut d.tombstones.alert_channels, durable_ttl_ms);
     prune(&mut d.tombstones.purges, ephemeral_ttl_ms);
     prune(&mut d.tombstones.acme_challenges, ephemeral_ttl_ms);
 }
@@ -814,6 +826,8 @@ struct ConfigDeltaPayload {
     node_telemetry: BTreeMap<String, NodeTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     acme_lease: Option<AcmeLease>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    alert_channels: Vec<crate::alerts::AlertChannel>,
     tombstones: Tombstones,
 }
 
@@ -1293,6 +1307,26 @@ impl Store {
             }
         })
         .await
+    }
+
+    // ---- alert channels (see crate::alerts) ----
+
+    pub fn list_alert_channels(&self) -> Vec<crate::alerts::AlertChannel> {
+        self.data.lock().unwrap().alert_channels.clone()
+    }
+
+    pub fn get_alert_channel(&self, id: &str) -> Option<crate::alerts::AlertChannel> {
+        self.data.lock().unwrap().alert_channels.iter().find(|c| c.id == id).cloned()
+    }
+
+    pub async fn save_alert_channel_async(&self, id: Option<&str>, body: serde_json::Value) -> Result<crate::alerts::AlertChannel, StoreError> {
+        let id_owned = id.map(str::to_string);
+        self.mutate_async(move |d, clock, sync_node| apply_save_alert_channel(d, clock, sync_node, id_owned.as_deref(), body)).await
+    }
+
+    pub async fn delete_alert_channel_async(&self, id: &str) -> Result<(), StoreError> {
+        let id_owned = id.to_string();
+        self.mutate_async(move |d, clock, sync_node| apply_delete_alert_channel(d, clock, sync_node, &id_owned)).await
     }
 
     // ---- local proxy rules ----
@@ -1815,6 +1849,31 @@ fn apply_delete_steering(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &s
     }
     let tomb = stamp_next(d, clock, sync_node, true);
     d.tombstones.steering.insert(id.to_string(), tomb);
+    Ok(())
+}
+
+fn apply_save_alert_channel(d: &mut Data, clock: &HlcClock, sync_node: &str, id: Option<&str>, body: serde_json::Value) -> Result<crate::alerts::AlertChannel, StoreError> {
+    if id.is_none() && d.alert_channels.len() >= crate::alerts::MAX_CHANNELS {
+        return invalid(format!("at most {} alert channels", crate::alerts::MAX_CHANNELS));
+    }
+    let old = id.and_then(|id| d.alert_channels.iter().find(|c| c.id == id)).cloned();
+    let mut channel: crate::alerts::AlertChannel = merge_global(&d.alert_channels, id, body, |c| &c.id, |c| &c.created_on)?;
+    (channel.id, channel.created_on, channel.modified_on) = stamp(&d.alert_channels, id, |c| &c.id, |c| &c.created_on);
+    channel.validate(old.as_ref())?;
+    channel.sync = stamp_next(d, clock, sync_node, false);
+    d.tombstones.alert_channels.remove(&channel.id);
+    upsert(&mut d.alert_channels, channel.clone(), |c| &c.id);
+    Ok(channel)
+}
+
+fn apply_delete_alert_channel(d: &mut Data, clock: &HlcClock, sync_node: &str, id: &str) -> Result<(), StoreError> {
+    let before = d.alert_channels.len();
+    d.alert_channels.retain(|c| c.id != id);
+    if d.alert_channels.len() == before {
+        return Err(StoreError::NotFound);
+    }
+    let tomb = stamp_next(d, clock, sync_node, true);
+    d.tombstones.alert_channels.insert(id.to_string(), tomb);
     Ok(())
 }
 
@@ -2360,6 +2419,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         acme_lease: d.acme_lease.as_ref().filter(|l| full_resync || l.sync.local_rev > since).cloned(),
+        alert_channels: d.alert_channels.iter().filter(|x| full_resync || x.sync.local_rev > since).cloned().collect(),
         tombstones: Tombstones {
             zones: filter_tombs(&d.tombstones.zones, since),
             records: filter_tombs(&d.tombstones.records, since),
@@ -2382,6 +2442,7 @@ fn export_since_data(d: &Data, since_rev: u64, peer_epoch: Option<&str>) -> Resu
             acme_challenges: filter_tombs(&d.tombstones.acme_challenges, since),
             node_telemetry: filter_tombs(&d.tombstones.node_telemetry, since),
             ip_lists: filter_tombs(&d.tombstones.ip_lists, since),
+            alert_channels: filter_tombs(&d.tombstones.alert_channels, since),
         },
     };
     Ok(DomainDelta {
@@ -2584,6 +2645,7 @@ fn merge_delta_data(
     changed |= merge_collection(&mut rev, clock, &mut d.local_proxy_rules, &mut d.tombstones.local_proxy_rules, payload.local_proxy_rules, payload.tombstones.local_proxy_rules, |r| r.id.clone(), |r| &r.sync, |r| &mut r.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.purges, &mut d.tombstones.purges, payload.purges, payload.tombstones.purges, |p| p.id.clone(), |p| &p.sync, |p| &mut p.sync);
     changed |= merge_collection(&mut rev, clock, &mut d.acme_challenges, &mut d.tombstones.acme_challenges, payload.acme_challenges, payload.tombstones.acme_challenges, AcmeChallenge::sync_key, |c| &c.sync, |c| &mut c.sync);
+    changed |= merge_collection(&mut rev, clock, &mut d.alert_channels, &mut d.tombstones.alert_channels, payload.alert_channels, payload.tombstones.alert_channels, |c| c.id.clone(), |c| &c.sync, |c| &mut c.sync);
 
     // Keep purge ring bounded by newest `updated_ms`.
     if d.purges.len() > 50 {
