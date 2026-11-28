@@ -89,7 +89,7 @@ pub async fn apply(accept_encoding: Option<String>, head: bool, resp: Response<B
     }
     let (mut parts, body) = resp.into_parts();
     let Ok(data) = collect_limited(body, MAX_SIZE as usize).await else {
-        return super::page(502, super::ORIGIN_ERROR, &super::ORIGIN_BAD_RESPONSE.to_string(), "-", &ctx());
+        return super::page(502, super::ORIGIN_ERROR, "", "-", &ctx());
     };
     let packed = if data.len() > 64 * 1024 {
         let input = data.clone();

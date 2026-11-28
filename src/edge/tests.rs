@@ -424,7 +424,7 @@ async fn origin_rules_and_errors() {
     // origin down -> 521 error page; plain HTTP redirected when always_use_https is on
     rule(json!({ "expression": "http.request.uri.path eq \"/down\"", "origin_port": 1, "priority": 0 }));
     let down = get(&env, "example.com", "/down").await;
-    assert!(down.status == 521 && down.body.contains(ORIGIN_ERROR) && down.body.contains(ORIGIN_DOWN.zh), "{} {}", down.status, down.body);
+    assert!(down.status == 521 && down.body.contains("回源错误") && down.body.contains("Origin error") && down.body.contains(ORIGIN_DOWN.zh), "{} {}", down.status, down.body);
     // the visitor learns the kind of failure, not where the origin is
     assert!(!down.body.contains("127.0.0.1") && !down.body.contains(":1 ") && !down.body.contains("refused ("), "{}", down.body);
     let logged = env.edge.waf.events(&env.zone, 100);
@@ -1845,7 +1845,7 @@ async fn origin_that_is_the_edge_itself_is_explained_on_the_dashboard_only() {
     tokio::spawn(serve(listener, edge.clone(), None, false));
     let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let r = exchange(s, raw("GET", "example.com", "/x", "", "")).await;
-    assert!(r.status == 530 && r.body.contains(ORIGIN_ERROR) && r.body.contains(ORIGIN_MISCONFIGURED.zh), "{} {}", r.status, r.body);
+    assert!(r.status == 530 && r.body.contains("回源错误") && r.body.contains(ORIGIN_MISCONFIGURED.zh), "{} {}", r.status, r.body);
     assert!(!r.body.contains("127.0.0.1") && !r.body.contains("origin_node") && !r.body.contains("FUCF_EDGE_IPS"), "no detail for visitors: {}", r.body);
     let events = edge.waf.events(&env.zone, 10);
     let e = events.iter().find(|e| e.source == "origin").expect("logged for the dashboard");
@@ -1924,4 +1924,29 @@ async fn error_pages_show_where_the_request_broke() {
     let r = get(&env, "example.com", "/down").await;
     assert_eq!((r.status, hops(&r.body)), (521, vec!["ok".to_string(), "ok".into(), "bad".into()]), "{}", r.body);
     assert!(r.body.contains("回源失败") && r.body.contains("重新加载"), "{}", r.body);
+}
+
+#[test]
+fn error_pages_pick_the_visitors_language() {
+    let lang = |v: &str| {
+        let mut h = HeaderMap::new();
+        if !v.is_empty() {
+            h.insert(header::ACCEPT_LANGUAGE, v.parse().unwrap());
+        }
+        Lang::from_headers(&h)
+    };
+    assert_eq!(lang(""), Lang::Zh);
+    assert_eq!(lang("zh-CN,zh;q=0.9,en;q=0.8"), Lang::Zh);
+    assert_eq!(lang("en-US,en;q=0.9"), Lang::En);
+    assert_eq!(lang("en;q=0.5,zh-TW;q=0.8"), Lang::Zh);
+    assert_eq!(lang("ja,fr;q=0.8"), Lang::En);
+}
+
+#[tokio::test]
+async fn error_pages_carry_both_languages() {
+    let env = setup().await;
+    let r = get(&env, "nowhere.test", "/").await;
+    for text in ["未知的主机名", "Unknown host", "这个主机名没有接入本边缘节点。", "What happened?", "Not involved", "data-lang=\"zh\"", "id=\"lang\""] {
+        assert!(r.body.contains(text), "{text}: {}", r.body);
+    }
 }

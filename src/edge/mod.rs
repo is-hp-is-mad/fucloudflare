@@ -170,6 +170,83 @@ pub struct PageCtx {
     /// The host name the visitor asked for (never the origin's address).
     pub host: String,
     pub here: cgi::Here,
+    /// For origin errors: the kind of failure, told in the visitor's language.
+    pub reason: Option<Reason>,
+    /// The language shown first (both are on the page, a button switches).
+    pub lang: Lang,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lang {
+    Zh,
+    En,
+}
+
+impl Lang {
+    /// From `Accept-Language`: Chinese if the visitor prefers it (or says nothing), else English.
+    pub fn from_headers(headers: &HeaderMap) -> Lang {
+        let Some(value) = headers.get(header::ACCEPT_LANGUAGE).and_then(|v| v.to_str().ok()) else { return Lang::Zh };
+        let mut best = (Lang::Zh, -1.0f32);
+        for part in value.split(',') {
+            let mut it = part.split(';');
+            let tag = it.next().unwrap_or("").trim().to_ascii_lowercase();
+            let q = it.find_map(|p| p.trim().strip_prefix("q=").and_then(|q| q.parse::<f32>().ok())).unwrap_or(1.0);
+            let lang = if tag.starts_with("zh") { Lang::Zh } else if tag.starts_with("en") || tag == "*" { Lang::En } else { continue };
+            if q > best.1 {
+                best = (lang, q);
+            }
+        }
+        if best.1 < 0.0 && !value.trim().is_empty() {
+            return Lang::En; // some other language: English is the closer guess
+        }
+        best.0
+    }
+}
+
+/// Chinese for the titles and details the edge uses (English is the source).
+fn zh(en: &str) -> Option<&'static str> {
+    Some(match en {
+        "Bad request" => "请求无效",
+        "Forbidden" => "禁止访问",
+        "Not found" => "未找到",
+        "Unknown host" => "未知的主机名",
+        "Payload too large" => "请求体过大",
+        "Misdirected request" => "请求发错了地方",
+        "Worker threw exception" => "Worker 运行出错",
+        "Worker busy" => "Worker 繁忙",
+        "Worker unavailable" => "Worker 暂不可用",
+        "Loop detected" => "检测到循环",
+        "Traffic limit reached" => "流量已用尽",
+        "Access denied" => "访问被拒绝",
+        "Too many requests" => "请求过于频繁",
+        "Bad gateway" => "网关错误",
+        "Invalid cron expression" => "Cron 表达式无效",
+        "Scheduled worker failed" => "定时 Worker 运行失败",
+        "could not read the request body" | "reading request body failed" => "无法读取请求体。",
+        "invalid method" => "请求方法无效。",
+        "invalid path for warp upstream" | "invalid request URI" => "请求地址无效。",
+        "missing Host header" => "请求缺少 Host 头。",
+        "host is not in this accelerate node's allowlist" => "这个主机名不在本加速节点的允许列表中。",
+        "there is no such endpoint on this edge" => "边缘节点上没有这个地址。",
+        "this host name is not proxied by this edge" => "这个主机名没有接入本边缘节点。",
+        "request body too large or interrupted" => "请求体过大或传输中断。",
+        "HTTP/3 is not enabled for this site" => "这个站点没有启用 HTTP/3。",
+        "the worker script for this route failed" => "这条路由的 Worker 脚本运行出错。",
+        "too many concurrent worker executions" => "同时运行的 Worker 太多。",
+        "worker runtime shutting down" => "Worker 运行时正在关闭。",
+        "maximum internal forwarding hops exceeded" | "this request already passed through this edge" => "请求在边缘节点之间形成了循环。",
+        "this edge node has used up its traffic allowance" => "这个边缘节点本期的流量额度已用完。",
+        "You are being rate limited." => "你的请求过于频繁，已被限速。",
+        _ => return None,
+    })
+}
+
+/// Both languages of a text; CSS shows the one chosen (escaped here).
+fn bi(zh: &str, en: &str) -> String {
+    if zh == en {
+        return escape(en);
+    }
+    format!("<span data-l=\"zh\">{}</span><span data-l=\"en\">{}</span>", escape(zh), escape(en))
 }
 
 /// Origin-side failures as visitors are told about them.
@@ -238,7 +315,9 @@ footer code{font:12.5px ui-monospace,'SF Mono',Consolas,monospace;color:var(--su
 .hop.ok i,.hop.ok em{background:rgba(74,155,110,.14);color:#2f7a52}\
 .hop.bad i,.hop.bad em{background:rgba(217,119,87,.16);color:#b5462a}\
 @media (prefers-color-scheme:dark){.hop.ok i,.hop.ok em{color:#7cc49b}.hop.bad i,.hop.bad em{color:#f0a283}}\
-.hop em{white-space:nowrap}@media (max-width:520px){.hop .en{display:none}}\
+.hop em{white-space:nowrap}\
+html[data-lang=zh] [data-l=en],html[data-lang=en] [data-l=zh]{display:none}\
+main{position:relative}.lang{position:absolute;top:3rem;right:1.5rem;min-height:32px;padding:4px 12px;font-size:13px;background:var(--chip);color:var(--sub)}\
 .what h2{font-size:15px;font-weight:600;margin:1.25rem 0 .25rem}.what p{font-size:15px;margin:0}\
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}";
 
@@ -264,70 +343,131 @@ const ICON_ORIGIN: &str = "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"cur
 
 /// The path of the request and where it broke, like Cloudflare's 5xx pages.
 fn path_html(ctx: &PageCtx) -> String {
-    let state = |hop: Hop| -> (&str, &str) {
+    let state = |hop: Hop| -> (&str, String) {
         match (ctx.hop, hop) {
-            (failed, h) if failed == h => ("bad", "出错<span class=\"en\"> Error</span>"),
-            (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", "未涉及<span class=\"en\"> Not involved</span>"),
-            _ => ("ok", "正常<span class=\"en\"> Working</span>"),
+            (failed, h) if failed == h => ("bad", bi("出错", "Error")),
+            (Hop::Browser, _) | (Hop::Edge, Hop::Origin) => ("", bi("未涉及", "Not involved")),
+            _ => ("ok", bi("正常", "Working")),
         }
     };
-    let stop = |hop: Hop, icon: &str, name: &str, sub: &str| {
+    let stop = |hop: Hop, icon: &str, name: String, sub: &str| {
         let (class, text) = state(hop);
         format!("<div class=\"hop {class}\"><i aria-hidden=\"true\">{icon}</i><b>{name}</b><small>{}</small><em>{text}</em></div>", escape(sub))
     };
     let host = if ctx.host.is_empty() { "-" } else { ctx.host.as_str() };
     format!(
-        "<div class=\"path\" role=\"img\" aria-label=\"请求路径：浏览器、边缘节点 {colo}、源站\">{}{}{}</div>",
-        stop(Hop::Browser, ICON_BROWSER, "你的浏览器", "Browser"),
-        stop(Hop::Edge, ICON_EDGE, "边缘节点", &format!("fucf · {}", ctx.here.colo)),
-        stop(Hop::Origin, ICON_ORIGIN, "源站", host),
-        colo = escape(&ctx.here.colo),
+        "<div class=\"path\">{}{}{}</div>",
+        stop(Hop::Browser, ICON_BROWSER, bi("你的浏览器", "You"), "Browser"),
+        stop(Hop::Edge, ICON_EDGE, bi("边缘节点", "Edge"), &format!("fucf · {}", ctx.here.colo)),
+        stop(Hop::Origin, ICON_ORIGIN, bi("源站", "Origin"), host),
     )
 }
 
-/// What happened and what to do, by where it broke.
-fn advice(status: u16, ctx: &PageCtx) -> (String, &'static str) {
-    let colo = escape(&ctx.here.colo);
+/// What happened and what to do, by where it broke: `(zh, en)` each.
+fn advice(status: u16, ctx: &PageCtx) -> ((String, String), (&'static str, &'static str)) {
+    let colo = &ctx.here.colo;
     match ctx.hop {
         Hop::Origin => (
-            format!("请求已到达边缘节点 {colo}，但回源失败：问题在源站或回源配置，与你的浏览器和网络无关。"),
-            "访客：几分钟后重新加载即可。站点管理员：凭下方 Ray ID 在面板「分析 → 回源错误」查看原因与修复方法。",
+            (
+                format!("请求已到达边缘节点 {colo}，但回源失败：问题在源站或回源配置，与你的浏览器和网络无关。"),
+                format!("Your request reached the edge in {colo}, but the edge could not get an answer from the origin. The problem is with the origin or its configuration, not with your browser or network."),
+            ),
+            (
+                "访客：几分钟后重新加载即可。站点管理员：凭下方 Ray ID 在面板「分析 → 回源错误」查看原因与修复方法。",
+                "Visitors: try again in a few minutes. Site owners: look up the Ray ID below under Analytics → Origin errors in the dashboard for the cause and the fix.",
+            ),
         ),
         Hop::Browser => (
-            format!("这次请求的格式或大小不被接受，边缘节点 {colo} 没有处理它，也没有转发到源站。"),
-            "请检查网址，或清除这个站点的 Cookie 后再试。",
+            (
+                format!("这次请求的格式或大小不被接受，边缘节点 {colo} 没有处理它，也没有转发到源站。"),
+                format!("The form or size of this request was not accepted. The edge in {colo} did not handle it, nor pass it on to the origin."),
+            ),
+            ("请检查网址，或清除这个站点的 Cookie 后再试。", "Check the address, or clear this site's cookies and try again."),
         ),
         Hop::Edge => (
-            format!("这次请求由边缘节点 {colo} 直接作答，没有转发到源站，与源站无关。"),
+            (
+                format!("这次请求由边缘节点 {colo} 直接作答，没有转发到源站，与源站无关。"),
+                format!("The edge in {colo} answered this request by itself. It was not passed on to the origin, which has nothing to do with this error."),
+            ),
             match status {
-                404 => "请检查网址是否正确；如果这个地址本应可用，请联系站点管理员核对 fucf 中的域名与规则配置。",
-                403 => "如果你认为不该被拦截，请把下方 Ray ID 告诉站点管理员。",
-                429 => "请求太频繁了，请稍等片刻再试。",
-                _ if status >= 500 => "这通常是暂时的，请稍后重新加载；持续出现时请把 Ray ID 告诉站点管理员。",
-                _ => "请检查网址；持续出现时请把 Ray ID 告诉站点管理员。",
+                404 => (
+                    "请检查网址是否正确；如果这个地址本应可用，请联系站点管理员核对 fucf 中的域名与规则配置。",
+                    "Check the address. If it should work, ask the site owner to check the domain and rules configured in fucf.",
+                ),
+                403 => ("如果你认为不该被拦截，请把下方 Ray ID 告诉站点管理员。", "If you think this is a mistake, send the Ray ID below to the site owner."),
+                429 => ("请求太频繁了，请稍等片刻再试。", "Too many requests: wait a moment and try again."),
+                _ if status >= 500 => (
+                    "这通常是暂时的，请稍后重新加载；持续出现时请把 Ray ID 告诉站点管理员。",
+                    "This is usually temporary: reload in a little while. If it persists, send the Ray ID to the site owner.",
+                ),
+                _ => ("请检查网址；持续出现时请把 Ray ID 告诉站点管理员。", "Check the address. If it persists, send the Ray ID to the site owner."),
             },
         ),
     }
 }
 
+/// Switches the language; remembers the choice for this site.
+const LANG_SCRIPT: &str = "<script>(function(){var d=document.documentElement,k='fucf_lang';\
+try{var s=localStorage.getItem(k);if(s==='zh'||s==='en')d.setAttribute('data-lang',s)}catch(e){}\
+d.lang=d.getAttribute('data-lang')==='en'?'en':'zh-CN';\
+document.getElementById('lang').onclick=function(){var n=d.getAttribute('data-lang')==='en'?'zh':'en';\
+d.setAttribute('data-lang',n);d.lang=n==='en'?'en':'zh-CN';try{localStorage.setItem(k,n)}catch(e){}}})()</script>";
+
 fn page(status: u16, title: &str, detail: &str, ray: &str, ctx: &PageCtx) -> Response<Body> {
-    let (t, d) = (escape(title), escape(detail));
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    // a retry helps with what is temporary; a 4xx will not change by itself
-    let retry = if status >= 500 { "<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">重新加载</button></div>" } else { "" };
-    let when = crate::store::now();
-    let (what, todo) = advice(status, ctx);
-    let (colo, fl) = (escape(&ctx.here.colo), escape(&ctx.here.fl));
-    html_page(
-        code,
-        &format!("{status} · {t}"),
-        &format!(
-            "{PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{t}</h1><p>{d}</p>{path}\
-             <div class=\"what\"><h2>发生了什么</h2><p>{what}</p><h2>可以怎么做</h2><p>{todo}</p></div>{retry}\
-             <footer><span>Ray ID <code>{ray}</code></span><span>节点 <code>{colo}</code> · <code>fl={fl}</code></span><span>{when}</span><span>fucf</span></footer>",
-            path = path_html(ctx),
+    let (title_zh, title_en, detail_zh, detail_en) = match ctx.reason {
+        Some(r) => (
+            "回源错误".to_string(),
+            "Origin error".to_string(),
+            format!("{}。边缘节点工作正常，但没能从源站得到有效的响应。", r.zh),
+            format!("{}: the edge is working, but could not get a valid response from the origin.", capitalized(r.en)),
         ),
-    )
+        None => (zh(title).unwrap_or(title).to_string(), title.to_string(), zh(detail).unwrap_or(detail).to_string(), detail.to_string()),
+    };
+    // a retry helps with what is temporary; a 4xx will not change by itself
+    let retry = if status >= 500 {
+        format!("<div class=\"acts\"><button type=\"button\" onclick=\"location.reload()\">{}</button></div>", bi("重新加载", "Reload"))
+    } else {
+        String::new()
+    };
+    let when = crate::store::now();
+    let ((what_zh, what_en), (todo_zh, todo_en)) = advice(status, ctx);
+    let (colo, fl) = (escape(&ctx.here.colo), escape(&ctx.here.fl));
+    let (lang, head_title) = match ctx.lang {
+        Lang::Zh => ("zh", &title_zh),
+        Lang::En => ("en", &title_en),
+    };
+    let html = format!(
+        "<!doctype html><html lang=\"{html_lang}\" data-lang=\"{lang}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex\">\
+         <title>{status} · {}</title><style>{PAGE_CSS}</style></head><body><main>\
+         <button type=\"button\" id=\"lang\" class=\"lang\" aria-label=\"Language / 语言\"><span data-l=\"zh\">English</span><span data-l=\"en\">中文</span></button>\
+         {PAGE_MARK}<span class=\"code\">Error {status}</span><h1>{}</h1><p>{}</p>{path}\
+         <div class=\"what\"><h2>{}</h2><p>{}</p><h2>{}</h2><p>{}</p></div>{retry}\
+         <footer><span>Ray ID <code>{ray}</code></span><span>{} <code>{colo}</code> · <code>fl={fl}</code></span><span>{when}</span><span>fucf</span></footer>\
+         </main>{LANG_SCRIPT}</body></html>",
+        escape(head_title),
+        bi(&title_zh, &title_en),
+        bi(&detail_zh, &detail_en),
+        bi("发生了什么", "What happened?"),
+        bi(&what_zh, &what_en),
+        bi("可以怎么做", "What can I do?"),
+        bi(todo_zh, todo_en),
+        bi("节点", "Node"),
+        html_lang = if ctx.lang == Lang::En { "en" } else { "zh-CN" },
+        path = path_html(ctx),
+    );
+    let mut resp = Response::new(full(html));
+    *resp.status_mut() = code;
+    resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(header::VARY, HeaderValue::from_static("Accept-Language"));
+    resp
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn challenge_page(token: &str, ray: &str) -> Response<Body> {
@@ -1785,10 +1925,11 @@ impl Edge {
                 Verdict::Pass => None,
                 Verdict::Block { rule_id } => {
                     let detail = format!("This request was blocked by the security rules of this site (rule {rule_id}).");
-                    Some(page(403, "Access denied", &detail, ray, &PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here() }))
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(req.headers()) };
+                    Some(page(403, "Access denied", &detail, ray, &ctx))
                 }
                 Verdict::RateLimited { retry_after } => {
-                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here() };
+                    let ctx = PageCtx { hop: Hop::Edge, host: info.host.clone(), here: self.here(), reason: None, lang: Lang::from_headers(req.headers()) };
                     let mut resp = page(429, "Too many requests", "You are being rate limited.", ray, &ctx);
                     resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
                     Some(resp)
@@ -1913,6 +2054,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
         .map(|h| request_host(&h))
         .filter(|h| h.len() <= 253 && h.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:".contains(&b)))
         .unwrap_or_default();
+    let lang = Lang::from_headers(req.headers());
     let mut seen = None;
     // `refusal`: why the edge answered by itself instead of passing on the origin's answer
     let (resp, refusal) = match edge.clone().process(peer.ip().to_canonical(), ssl, req, &ray, &mut seen).await {
@@ -1934,7 +2076,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
                 }
             }
             let host = seen.as_ref().map(|s| s.host.clone()).unwrap_or(asked_host);
-            let ctx = PageCtx { hop: e.hop(), host, here: edge.here() };
+            let ctx = PageCtx { hop: e.hop(), host, here: edge.here(), reason: e.origin.map(|f| f.reason), lang };
             (page(e.status, e.title, &public, &ray, &ctx), Some(e.public_line()))
         }
     };
@@ -1951,7 +2093,7 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
         edge.front.get().and_then(|front| front.alt_svc(&host)).or_else(|| edge.alt_svc.get().cloned())
     });
     let page_host = seen.as_ref().map(|s| s.host.clone()).unwrap_or_default();
-    let mut resp = compress::apply(accept, head, resp, || PageCtx { hop: Hop::Origin, host: page_host, here: edge.here() }).await;
+    let mut resp = compress::apply(accept, head, resp, || PageCtx { hop: Hop::Origin, host: page_host, here: edge.here(), reason: Some(ORIGIN_BAD_RESPONSE), lang }).await;
     let internal = cgi::is_fucf_node(peer.ip().to_canonical(), &edge.store.snapshot().nodes);
     let is_cdn = seen.is_some();
     if let Some(seen) = seen {
