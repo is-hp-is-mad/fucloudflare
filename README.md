@@ -787,6 +787,23 @@ cargo build; python scripts\e2e.py   # 针对真实二进制的端到端检查�
 python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 ```
 
+### 兼容性验证（草稿）
+
+`.github/workflows/compat.yml` 用照 Cloudflare 写的真实工具检验 API 的兼容性。它只能在 Actions 页面手动启动（`workflow_dispatch`），
+不随推送或 PR 运行，也不用任何仓库密钥。先编译一次 fucf，之后每个工具一个互不依赖的作业：各自在本机启动一个临时 fucf，
+通过 API 建管理员和只带所需权限的 API 令牌，让工具指向 `http://127.0.0.1:8787/client/v4`，最后用 curl + jq 经 API 核对结果。
+
+| 作业 | 工具 | 做什么、核对什么 |
+|---|---|---|
+| `terraform` | Terraform + cloudflare provider v5 | 建域名、两条记录、两个阶段的规则集（Rulesets API）；核对对象、边缘确实拦截；再 `plan` 必须没有差异；`destroy` 后域名不在 |
+| `wrangler` | wrangler | `wrangler deploy` 一个 Worker；核对存下的是脚本本身，加路由后边缘返回它的输出 |
+| `dns01` | lego（cloudflare DNS 插件）+ 本地 pebble | 走完整的 DNS-01：TXT 经 API 写入、由 fucf 的 DNS 应答、pebble 验证、lego 删除；核对证书已签发、记录已删 |
+| `ddns` | ddclient（cloudflare 协议） | 经边缘的 HTTPS 面板主机（自签证书）更新一条 A 记录；核对 API 和 DNS 里都是新地址 |
+
+工具版本都钉死（Terraform 和 ddclient 校验 SHA-256，Go 模块经校验和数据库，npm 包经 registry 的完整性哈希），
+示例数据只用 `example.com` / `example.net` / `*.test` 和文档地址段。这份工作流是在没有运行过的情况下写的，
+第一次实际运行后还要按日志调整（各作业的日志作为 artifact 上传）；已知 wrangler 和 ddclient 用到的个别接口 fucf 目前可能还不支持。
+
 ## 已知限制
 
 - 多节点：对等节点之间双向同步，冲突按混合逻辑时钟后写者胜（同一对象几乎同时在两处修改时，只留下一处的修改）；缓存和限速计数是各节点各自的内存状态。

@@ -1,0 +1,448 @@
+# Compatibility checks: real tools written for Cloudflare, pointed at a local
+# fucf. Draft: written without a run, so expect to tune it after the first
+# one. Every job after `build` is independent: it starts its own fucf on its
+# own runner (e2e/compat/start-fucf.sh), gives the tool a token made through
+# the API, runs the tool, and then checks the result through the fucf API with
+# curl and jq. A check that does not hold fails the job with what it expected.
+# Only example data; no repository secrets; the tokens die with the runner.
+name: compat
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    # bash -eo pipefail: any failing command or pipe fails the step
+    shell: bash
+
+jobs:
+  build:
+    name: build fucf
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: compat
+      # A plain glibc release build: the jobs below run it on the same image.
+      - name: cargo build --release
+        run: cargo build --release --locked
+      - name: package
+        run: |
+          mkdir -p dist
+          cp target/release/fucf dist/fucf-linux-x86_64
+          ./dist/fucf-linux-x86_64 --version || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fucf-compat
+          path: dist/
+          retention-days: 7
+
+  terraform:
+    name: terraform (cloudflare provider v5)
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      TF_VERSION: 1.16.7
+      # SHA-256 of terraform_1.16.7_linux_amd64.zip, from HashiCorp's
+      # terraform_1.16.7_SHA256SUMS
+      TF_SHA256: 5454efcf7fc87f0c2113111b9a5c7182f0ca1c6f0f23a1e110a50770a8fe473b
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      # the provider's HTTP exchanges, uploaded below; the token in them is dead once the job ends
+      TF_LOG_PROVIDER: DEBUG
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fucf-compat
+          path: dist
+      - name: start fucf
+        run: e2e/compat/start-fucf.sh "Zone Write" "DNS Write" "Firewall Services Write" "Transform Rules Write"
+      - name: install terraform
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          echo "${TF_SHA256}  terraform_${TF_VERSION}_linux_amd64.zip" | sha256sum -c -
+          unzip -q "terraform_${TF_VERSION}_linux_amd64.zip" -d "$RUNNER_TEMP/terraform-bin"
+          echo "$RUNNER_TEMP/terraform-bin" >> "$GITHUB_PATH"
+      # Expect: init fetches cloudflare/cloudflare 5.25.0 from the registry
+      # (terraform checks its signature); apply creates the zone, both records
+      # and both rulesets through fucf and exits 0. A failure here names the
+      # endpoint or the field fucf answered differently (see the log artifact).
+      - name: terraform apply
+        working-directory: e2e/compat/terraform
+        env:
+          TF_LOG_PATH: ${{ runner.temp }}/terraform-apply.log
+        run: |
+          export CLOUDFLARE_API_TOKEN="$FUCF_TOKEN" TF_VAR_base_url="$FUCF_API" TF_VAR_account_id="$FUCF_ACCOUNT"
+          terraform version
+          terraform init
+          terraform apply -auto-approve
+      - name: check what terraform made
+        working-directory: e2e/compat/terraform
+        run: |
+          source ../lib.sh
+          # Expect: exactly one zone example.com, the one in Terraform's state.
+          ZONES=$(admin GET "/zones?name=example.com")
+          must "one zone example.com" '.result | length == 1' "$ZONES"
+          ZONE=$(jq -r '.result[0].id' <<<"$ZONES")
+          [ "$(terraform output -raw zone_id)" = "$ZONE" ] || { echo "::error::state has zone $(terraform output -raw zone_id), fucf has $ZONE"; exit 1; }
+          # Expect: www A 192.0.2.10 proxied; api AAAA 2001:db8::10, not proxied, ttl 300, with its comment.
+          RECS=$(admin GET "/zones/$ZONE/dns_records")
+          must "www.example.com A 192.0.2.10 proxied" \
+            '[.result[] | select(.name == "www.example.com" and .type == "A" and .content == "192.0.2.10" and .proxied == true)] | length == 1' "$RECS"
+          must "api.example.com AAAA 2001:db8::10, ttl 300, not proxied" \
+            '[.result[] | select(.name == "api.example.com" and .type == "AAAA" and .content == "2001:db8::10" and .proxied == false and .ttl == 300 and .comment == "compat check")] | length == 1' "$RECS"
+          must "no other records" '.result | length == 2' "$RECS"
+          # Expect: the firewall phase holds the one block rule, and it is the
+          # same object as the plain firewall rule list shows (T3 stores nothing twice).
+          FW=$(admin GET "/zones/$ZONE/rulesets/phases/http_request_firewall_custom/entrypoint")
+          must "one block rule in http_request_firewall_custom" \
+            '.result.rules | length == 1 and .[0].action == "block" and .[0].expression == "http.request.uri.path eq \"/compat-blocked\"" and .[0].enabled == true' "$FW"
+          must "the ruleset id in the state" ".result.id == \"$(terraform output -raw firewall_ruleset_id)\"" "$FW"
+          RULE=$(jq -r '.result.rules[0].id' <<<"$FW")
+          must "the same rule under /firewall/rules" \
+            "[.result[] | select(.id == \"$RULE\" and .action == \"block\")] | length == 1" "$(admin GET "/zones/$ZONE/firewall/rules")"
+          # Expect: the late transform phase sets x-compat-check: 1 on /api/ requests.
+          TR=$(admin GET "/zones/$ZONE/rulesets/phases/http_request_late_transform/entrypoint")
+          must "one header rewrite in http_request_late_transform" \
+            '.result.rules | length == 1 and .[0].action == "rewrite" and .[0].action_parameters.headers["x-compat-check"] == {"operation": "set", "value": "1"}' "$TR"
+          # Expect: the edge blocks the path with a 403 (the rule is live, not only stored).
+          sleep 1
+          CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: www.example.com" "$FUCF_EDGE/compat-blocked")
+          [ "$CODE" = "403" ] || { echo "::error::the edge answered $CODE for /compat-blocked, expected 403"; exit 1; }
+          echo "ok: the edge blocks /compat-blocked"
+      # Expect: a second plan right after apply finds nothing to change (exit
+      # code 0). Exit code 2 means fucf reads something back differently from
+      # what was written; the plan output names the attribute.
+      - name: terraform plan shows no drift
+        working-directory: e2e/compat/terraform
+        env:
+          TF_LOG_PATH: ${{ runner.temp }}/terraform-plan.log
+        run: |
+          export CLOUDFLARE_API_TOKEN="$FUCF_TOKEN" TF_VAR_base_url="$FUCF_API" TF_VAR_account_id="$FUCF_ACCOUNT"
+          set +e
+          terraform plan -detailed-exitcode
+          CODE=$?
+          set -e
+          [ "$CODE" = "0" ] || { echo "::error::terraform plan exited $CODE after apply (2 = drift)"; exit 1; }
+      # Expect: destroy removes everything and exits 0; afterwards fucf has no zone example.com.
+      - name: terraform destroy
+        working-directory: e2e/compat/terraform
+        env:
+          TF_LOG_PATH: ${{ runner.temp }}/terraform-destroy.log
+        run: |
+          export CLOUDFLARE_API_TOKEN="$FUCF_TOKEN" TF_VAR_base_url="$FUCF_API" TF_VAR_account_id="$FUCF_ACCOUNT"
+          terraform destroy -auto-approve
+          source ../lib.sh
+          must "no zone example.com left" '.result | length == 0' "$(admin GET "/zones?name=example.com")"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-terraform-logs
+          path: |
+            ${{ runner.temp }}/fucf.log
+            ${{ runner.temp }}/terraform-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  wrangler:
+    name: wrangler deploy
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      WRANGLER_VERSION: 4.155.0
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fucf-compat
+          path: dist
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: start fucf
+        run: e2e/compat/start-fucf.sh "Workers Scripts Write"
+      # npm checks the package against the registry's integrity hash.
+      - name: install wrangler
+        run: |
+          mkdir -p "$RUNNER_TEMP/wrangler-bin" && cd "$RUNNER_TEMP/wrangler-bin"
+          npm init -y >/dev/null
+          npm i --no-audit --no-fund "wrangler@${WRANGLER_VERSION}" >/dev/null
+          echo "$RUNNER_TEMP/wrangler-bin/node_modules/.bin" >> "$GITHUB_PATH"
+      # Expect: a dry run makes no API call and writes what deploy would
+      # upload (kept as an artifact, to compare with what fucf received).
+      # --no-bundle: fucf turns `export default` into its own form and may not
+      # read esbuild's `export { x as default }`, so the file goes up as written.
+      - name: wrangler deploy --dry-run
+        working-directory: e2e/compat/wrangler
+        run: |
+          wrangler --version
+          wrangler deploy --no-bundle --dry-run --outdir "$RUNNER_TEMP/wrangler-out"
+      # Expect: wrangler finds no existing Worker, uploads the script and
+      # exits 0. It first reads /accounts/{id}/workers/services/compat-worker
+      # and treats only Cloudflare's codes 10007 / 10090 as "not there yet";
+      # the upload is multipart/form-data (metadata + module). The debug log
+      # lists every request it made.
+      # Known to fail against fucf as of this draft (tried by hand on a local
+      # build): /workers/services/{name} has no route (404, code 7000, which
+      # wrangler does not take for "not found"), and PUT /workers/scripts/{name}
+      # takes the raw body as the script, so a multipart upload is refused
+      # with a syntax error. Both need src/api.rs.
+      - name: wrangler deploy
+        working-directory: e2e/compat/wrangler
+        env:
+          WRANGLER_LOG: debug
+          WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler-logs
+        run: |
+          # wrangler's own requests read CLOUDFLARE_API_BASE_URL, the Cloudflare SDK inside it CLOUDFLARE_BASE_URL
+          export CLOUDFLARE_API_TOKEN="$FUCF_TOKEN" CLOUDFLARE_ACCOUNT_ID="$FUCF_ACCOUNT"
+          export CLOUDFLARE_API_BASE_URL="$FUCF_API" CLOUDFLARE_BASE_URL="$FUCF_API"
+          wrangler deploy --no-bundle 2>&1 | tee "$RUNNER_TEMP/wrangler-deploy.log"
+      - name: check the deployed Worker
+        run: |
+          source e2e/compat/lib.sh
+          # Expect: fucf lists the script by its name.
+          must "compat-worker listed" '[.result[] | select(.id == "compat-worker")] | length == 1' "$(admin GET /workers/scripts)"
+          # Expect: the stored source is the module itself, not the multipart body around it.
+          admin GET /workers/scripts/compat-worker > "$RUNNER_TEMP/stored-worker.js"
+          grep -q 'compat worker ok' "$RUNNER_TEMP/stored-worker.js" || { echo "::error::stored script lacks the worker's text"; head -c 2000 "$RUNNER_TEMP/stored-worker.js"; exit 1; }
+          if grep -qi 'content-disposition' "$RUNNER_TEMP/stored-worker.js"; then
+            echo "::error::fucf stored the multipart upload as the script"; head -c 2000 "$RUNNER_TEMP/stored-worker.js"; exit 1
+          fi
+          # Expect: once routed, the edge runs it and answers its text.
+          ZONE=$(admin POST /zones '{"name":"example.net"}' | jq -er .result.id)
+          admin POST "/zones/$ZONE/dns_records" '{"type":"A","name":"worker.example.net","content":"192.0.2.20","proxied":true}' >/dev/null
+          admin POST "/zones/$ZONE/workers/routes" '{"pattern":"worker.example.net/*","script":"compat-worker"}' >/dev/null
+          sleep 1
+          BODY=$(curl -sS -m 10 -H "Host: worker.example.net" "$FUCF_EDGE/")
+          [ "$BODY" = "compat worker ok" ] || { echo "::error::the edge answered: $BODY"; exit 1; }
+          echo "ok: the edge runs the deployed Worker"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-wrangler-logs
+          path: |
+            ${{ runner.temp }}/fucf.log
+            ${{ runner.temp }}/wrangler-deploy.log
+            ${{ runner.temp }}/wrangler-logs/
+            ${{ runner.temp }}/wrangler-out/
+            ${{ runner.temp }}/stored-worker.js
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dns01:
+    name: DNS-01 (lego + pebble)
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      LEGO_VERSION: v4.35.2
+      PEBBLE_VERSION: v2.10.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fucf-compat
+          path: dist
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.10"
+          cache: false
+      # go install checks both modules against the Go checksum database. The
+      # pebble module's own directory holds its test config and test CA.
+      - name: install lego and pebble
+        run: |
+          go install "github.com/go-acme/lego/v4/cmd/lego@${LEGO_VERSION}"
+          go install "github.com/letsencrypt/pebble/v2/cmd/pebble@${PEBBLE_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "PEBBLE_DIR=$(go mod download -json "github.com/letsencrypt/pebble/v2@${PEBBLE_VERSION}" | jq -er .Dir)" >> "$GITHUB_ENV"
+      - name: start fucf
+        run: e2e/compat/start-fucf.sh "Zone Read" "DNS Write"
+      - name: add the zone
+        run: |
+          source e2e/compat/lib.sh
+          echo "ZONE=$(admin POST /zones '{"name":"example.com"}' | jq -er .result.id)" >> "$GITHUB_ENV"
+      # pebble is a local ACME server; -dnsserver makes it look the
+      # challenge up in fucf's own DNS, so a certificate is issued only if
+      # the TXT record lego wrote through the API was really served.
+      - name: start pebble
+        working-directory: ${{ env.PEBBLE_DIR }}
+        run: |
+          PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 nohup pebble -config test/config/pebble-config.json \
+            -dnsserver 127.0.0.1:15353 > "$RUNNER_TEMP/pebble.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -fsS --cacert test/certs/pebble.minica.pem -o /dev/null https://localhost:14000/dir && break
+            sleep 0.2
+          done
+          curl -fsS --cacert test/certs/pebble.minica.pem https://localhost:14000/dir
+      # Expect: lego finds example.com (SOA from fucf's DNS, then
+      # GET /zones?name=example.com), creates the TXT record, waits until
+      # fucf's DNS serves it, pebble validates, lego deletes the record and
+      # writes the certificate. A watcher records every TXT record it sees
+      # under the challenge name meanwhile.
+      - name: lego run (cloudflare DNS provider)
+        env:
+          LEGO_CA_CERTIFICATES: ${{ env.PEBBLE_DIR }}/test/certs/pebble.minica.pem
+        run: |
+          source e2e/compat/lib.sh
+          ( for _ in $(seq 1 900); do
+              admin GET "/zones/$ZONE/dns_records?type=TXT" 2>/dev/null \
+                | jq -c '.result[] | select(.name == "_acme-challenge.compat.example.com") | {id, name, content}' 2>/dev/null \
+                >> "$RUNNER_TEMP/txt-seen.jsonl" || true
+              sleep 0.2
+            done ) &
+          WATCH=$!
+          export CLOUDFLARE_DNS_API_TOKEN="$FUCF_TOKEN" CLOUDFLARE_BASE_URL="$FUCF_API"
+          lego --server https://localhost:14000/dir --accept-tos --email ops@example.com \
+            --path "$RUNNER_TEMP/lego" --dns cloudflare --dns.resolvers 127.0.0.1:15353 --dns.propagation-disable-ans \
+            --domains compat.example.com run 2>&1 | tee "$RUNNER_TEMP/lego.log"
+          kill "$WATCH" 2>/dev/null || true
+      - name: check the challenge and the certificate
+        run: |
+          source e2e/compat/lib.sh
+          # Expect: the watcher saw the challenge record while lego ran.
+          [ -s "$RUNNER_TEMP/txt-seen.jsonl" ] || { echo "::error::no TXT record _acme-challenge.compat.example.com was ever seen"; exit 1; }
+          sort -u "$RUNNER_TEMP/txt-seen.jsonl"
+          # Expect: lego removed it again, through the API and from DNS.
+          must "no challenge record left" \
+            '[.result[] | select(.type == "TXT" and .name == "_acme-challenge.compat.example.com")] | length == 0' "$(admin GET "/zones/$ZONE/dns_records")"
+          python3 scripts/dnsq.py 127.0.0.1 15353 _acme-challenge.compat.example.com TXT | tee "$RUNNER_TEMP/dns-after.txt"
+          if grep -q ' AN .* TXT ' "$RUNNER_TEMP/dns-after.txt"; then echo "::error::fucf's DNS still answers the challenge"; exit 1; fi
+          # Expect: a certificate for compat.example.com issued by pebble.
+          CRT="$RUNNER_TEMP/lego/certificates/compat.example.com.crt"
+          [ -s "$CRT" ] || { echo "::error::lego wrote no certificate"; exit 1; }
+          openssl x509 -in "$CRT" -noout -subject -issuer -ext subjectAltName | tee "$RUNNER_TEMP/cert.txt"
+          grep -q 'DNS:compat.example.com' "$RUNNER_TEMP/cert.txt" || { echo "::error::certificate does not name compat.example.com"; exit 1; }
+          grep -qi 'pebble' "$RUNNER_TEMP/cert.txt" || { echo "::error::certificate not issued by pebble"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-dns01-logs
+          path: |
+            ${{ runner.temp }}/fucf.log
+            ${{ runner.temp }}/pebble.log
+            ${{ runner.temp }}/lego.log
+            ${{ runner.temp }}/txt-seen.jsonl
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ddns:
+    name: DDNS (ddclient)
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      DDCLIENT_VERSION: v3.11.2
+      # ddclient publishes no checksums: SHA-256 of ddclient.in at tag v3.11.2,
+      # taken when this workflow was written. Change both together.
+      DDCLIENT_SHA256: 97c6b08dc4265d7038237f4cee903610d15bc9d2db295cea4ffc12e60d7489d1
+      # ddclient's cloudflare protocol always speaks https to `server`, so
+      # here the API is reached the way it is in production: through the
+      # edge's HTTPS listener under the panel host, with a self-signed
+      # certificate for that name.
+      FUCF_HTTPS_LISTEN: 127.0.0.1:18443
+      FUCF_PANEL_HOST: panel.example.test
+      # (the runner context is not available at job level, hence a fixed path)
+      FUCF_TLS_CERT_DIR: /tmp/compat-certs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fucf-compat
+          path: dist
+      - name: certificate and name for the panel host
+        run: |
+          mkdir -p "$FUCF_TLS_CERT_DIR"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+            -subj "/CN=panel.example.test" -addext "subjectAltName=DNS:panel.example.test" \
+            -keyout "$FUCF_TLS_CERT_DIR/panel.example.test.key" -out "$FUCF_TLS_CERT_DIR/panel.example.test.crt"
+          echo "127.0.0.1 panel.example.test" | sudo tee -a /etc/hosts
+      - name: start fucf
+        run: e2e/compat/start-fucf.sh "Zone Read" "DNS Write"
+      # Expect: the edge serves the API under the panel host over HTTPS with
+      # the certificate above, and the token works there too.
+      - name: the API through the edge
+        run: |
+          source e2e/compat/lib.sh
+          must "token verifies through https://panel.example.test:18443" '.success and .result.status == "active"' \
+            "$(curl -sS --fail-with-body --cacert "$FUCF_TLS_CERT_DIR/panel.example.test.crt" -H "Authorization: Bearer $FUCF_TOKEN" \
+               https://panel.example.test:18443/client/v4/user/tokens/verify)"
+      # ddclient only changes records that exist: home.example.com starts at 192.0.2.1.
+      - name: add the zone and the record
+        run: |
+          source e2e/compat/lib.sh
+          ZONE=$(admin POST /zones '{"name":"example.com"}' | jq -er .result.id)
+          admin POST "/zones/$ZONE/dns_records" '{"type":"A","name":"home.example.com","content":"192.0.2.1","ttl":120,"proxied":false}' >/dev/null
+          echo "ZONE=$ZONE" >> "$GITHUB_ENV"
+      - name: install ddclient
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ddclient" "https://raw.githubusercontent.com/ddclient/ddclient/${DDCLIENT_VERSION}/ddclient.in"
+          echo "${DDCLIENT_SHA256}  $RUNNER_TEMP/ddclient" | sha256sum -c -
+          perl -c "$RUNNER_TEMP/ddclient"
+      # Expect: ddclient looks the zone up (GET /zones/?name=example.com,
+      # with that slash), then the record (GET .../dns_records?type=A&name=home.example.com),
+      # and PATCHes {"content": "203.0.113.10"} into it, printing SUCCESS.
+      # The token is in the config file only; -debug prints the requests.
+      # Known to fail against fucf as of this draft (tried by hand on a local
+      # build): /zones/ with the trailing slash has no route (404), so ddclient
+      # stops at the zone lookup. Needs src/api.rs.
+      - name: run ddclient once
+        run: |
+          umask 077
+          cat > "$RUNNER_TEMP/ddclient.conf" <<EOF
+          ssl=yes
+          ssl_ca_file=$FUCF_TLS_CERT_DIR/panel.example.test.crt
+          protocol=cloudflare
+          server=panel.example.test:18443/client/v4
+          zone=example.com
+          login=token
+          password=$FUCF_TOKEN
+          home.example.com
+          EOF
+          perl "$RUNNER_TEMP/ddclient" -daemon 0 -foreground -force -verbose -debug -noquiet \
+            -file "$RUNNER_TEMP/ddclient.conf" -cache "$RUNNER_TEMP/ddclient.cache" \
+            -usev4 ipv4 -ipv4 203.0.113.10 2>&1 | tee "$RUNNER_TEMP/ddclient.log"
+          grep -q 'SUCCESS:.*home.example.com' "$RUNNER_TEMP/ddclient.log" || { echo "::error::ddclient did not report success"; exit 1; }
+      - name: check the record
+        run: |
+          source e2e/compat/lib.sh
+          # Expect: the one A record now says 203.0.113.10 and keeps its ttl and proxied.
+          must "home.example.com A 203.0.113.10, ttl 120, not proxied" \
+            '[.result[] | select(.name == "home.example.com" and .type == "A")] | length == 1 and .[0].content == "203.0.113.10" and .[0].ttl == 120 and .[0].proxied == false' \
+            "$(admin GET "/zones/$ZONE/dns_records")"
+          # Expect: fucf's DNS answers the new address.
+          sleep 1
+          python3 scripts/dnsq.py 127.0.0.1 15353 home.example.com A | tee "$RUNNER_TEMP/dns-after.txt"
+          grep -q ' AN home.example.com .* A 203.0.113.10' "$RUNNER_TEMP/dns-after.txt" || { echo "::error::DNS does not answer 203.0.113.10"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-ddns-logs
+          path: |
+            ${{ runner.temp }}/fucf.log
+            ${{ runner.temp }}/ddclient.log
+          if-no-files-found: ignore
+          retention-days: 7

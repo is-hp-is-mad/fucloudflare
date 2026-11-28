@@ -214,7 +214,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
   不要在每个处理函数里各写一遍。域名列表按归属过滤。账户级的对象（节点、调度、Workers、KV、D1 等）第一版仍只有管理员可写。
 - 测试：两个普通用户互相看不到、改不了对方的域名（逐类接口各测一个）；管理员都能看到；令牌不能越过归属。
 
-### [ ] T13 兼容性验证的 CI 工作流（草稿）
+### [x] T13 兼容性验证的 CI 工作流（草稿）
 
 - 新文件 `.github/workflows/compat.yml`，只在 `workflow_dispatch` 时运行：启动一个本地 fucf（做法照 `ci.yml` 的 UI 作业），
   然后用真实工具指向它：Terraform 的 cloudflare provider（建域名、记录、T3 的规则）、wrangler（部署一个 Worker）、
@@ -302,6 +302,12 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 管理员用 `PATCH /zones/{id} {"owner": ...}` 改归属（未知用户 400，什么都不改），面板"管理"页有"归属"卡片。普通用户建的域名不能和别人的（含无归属的）同名、在其下或在其上（409），检查在 store 的写入里做。
 - 账户级对象（Workers、KV、D1、IP 列表、调度、节点、人机验证组件等）对非管理员只读。额外收紧：非管理员不能建 Worker 路由，也不能建交给 Worker 的邮件规则（中间件读请求体判断），因为 Worker 是管理员的代码和绑定。令牌和 Global API Key 不会超出用户本人。
 - 没把握：已有的 editor/viewer 升级后看不到任何域名，要管理员逐个分配；用户删除后他的域名变成只有管理员可见；滚动升级期间旧节点不检查归属，也可能经同步丢掉 `owner`（丢了就只有管理员可见）；用户之间不做域名所有权验证，谁先建谁拥有。
+
+### T13
+- 新增 `.github/workflows/compat.yml`（只有 `workflow_dispatch`，`contents: read`，不用仓库密钥）：`build` 编译一次，`terraform`、`wrangler`、`dns01`（lego + 本地 pebble，pebble 查 fucf 自己的 DNS）、`ddns`（ddclient，经边缘 HTTPS 面板主机、自签证书）四个作业互不依赖，各自用 `e2e/compat/start-fucf.sh` 起临时 fucf、建管理员和只带所需权限组的令牌，结果用 `e2e/compat/lib.sh` 的 `must`（curl + jq）核对。
+- 版本全部钉死：Terraform 1.16.7（SHA-256）、cloudflare provider 5.25.0、wrangler 4.155.0、lego v4.35.2、pebble v2.10.1、ddclient v3.11.2（官方不发校验和，SHA-256 是写的时候自己算的）；actions 照 ci.yml 用大版本标签。
+- 本地 debug 构建上手工试过：Terraform 会发的建域名、记录、两个阶段的规则集请求都正常，边缘 403 也对。已知必失败、需要改 `src/api.rs`：wrangler 先查 `/accounts/{id}/workers/services/{name}`（现在 404/7000，wrangler 只认 10007/10090），上传是 multipart（现在当成脚本原文，报语法错）；ddclient 请求 `/zones/?name=`（带斜杠，404）。
+- 实际跑一次后还要调：Terraform v5 读回字段的差异（`plan` 必须无差异）、lego 的传播检查参数、provider 版本号；各作业日志都作为 artifact 上传。
 
 ## 5. 部署（通过 Komari）
 

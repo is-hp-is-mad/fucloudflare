@@ -1,0 +1,9 @@
+# The Worker the wrangler job of .github/workflows/compat.yml deploys to a
+# throwaway local fucf (CLOUDFLARE_API_BASE_URL points wrangler there).
+# No workers.dev and no routes: the job only checks the upload, and adds a
+# route itself through the fucf API afterwards.
+name = "compat-worker"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = false
+preview_urls = false
