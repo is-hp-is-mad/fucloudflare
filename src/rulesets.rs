@@ -421,15 +421,21 @@ impl Mapped for RateLimit {
         (&self.expression, &self.description, self.enabled)
     }
     fn actions(&self, _: Kind) -> Map<String, Value> {
-        map(json!({
-            "action": self.action,
-            "ratelimit": {
-                "characteristics": ["cf.colo.id", "ip.src"],
-                "period": self.period,
-                "requests_per_period": self.threshold,
-                "mitigation_timeout": self.mitigation_timeout,
-            },
-        }))
+        let mut characteristics = vec!["cf.colo.id".to_string()];
+        match self.characteristics.is_empty() {
+            true => characteristics.push("ip.src".into()),
+            false => characteristics.extend(self.characteristics.iter().map(|c| cloudflare_characteristic(c))),
+        }
+        let mut rl = map(json!({
+            "characteristics": characteristics,
+            "period": self.period,
+            "requests_per_period": self.threshold,
+            "mitigation_timeout": self.mitigation_timeout,
+        }));
+        if !self.status_codes.is_empty() {
+            rl.insert("counting_expression".into(), json!(counting_expression(&self.expression, &self.status_codes)));
+        }
+        map(json!({ "action": self.action, "ratelimit": rl }))
     }
     fn parse(kind: Kind, c: &Common, base: &str) -> Result<Map<String, Value>, StoreError> {
         action_in(c, &["block", "log"], kind, base)?;
@@ -437,19 +443,45 @@ impl Mapped for RateLimit {
         let path = at(base, "ratelimit");
         let Some(rl) = &c.ratelimit else { return invalid(format!("{path} is required in http_ratelimit")) };
         only(rl, &["characteristics", "period", "requests_per_period", "mitigation_timeout", "counting_expression", "requests_to_origin"], &path)?;
-        // requests are counted per client address on each node (crate::edge::waf::Waf::count)
+        // requests are counted on each node (crate::edge::waf::Waf::count), so
+        // cf.colo.id is always there; the rest is what tells clients apart
+        let mut characteristics = Vec::new();
         if let Some(ch) = rl.get("characteristics").filter(|v| !v.is_null()) {
-            let mut got: Vec<&str> = ch.as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-            got.sort_unstable();
-            if got != ["cf.colo.id", "ip.src"] || ch.as_array().is_some_and(|a| a.len() != 2) {
-                return invalid(format!(
-                    "{}: requests are counted per client address on each node here, so only [\"cf.colo.id\", \"ip.src\"]",
-                    at(&path, "characteristics")
-                ));
+            let where_ = at(&path, "characteristics");
+            let Some(list) = ch.as_array() else { return invalid(format!("{where_} must be a list of strings")) };
+            let mut colo = false;
+            for c in list {
+                let Some(c) = c.as_str() else { return invalid(format!("{where_} must be a list of strings")) };
+                if c == "cf.colo.id" {
+                    colo = true;
+                    continue;
+                }
+                let Some(ours) = our_characteristic(c) else {
+                    return invalid(format!(
+                        "{where_}: '{c}' is not supported by this server; cf.colo.id with ip.src, ip.src.asnum, ip.geoip.country, http.host, \
+                         http.request.uri.path, http.request.headers[\"name\"] or http.request.cookies[\"name\"]"
+                    ));
+                };
+                if !characteristics.contains(&ours) {
+                    characteristics.push(ours);
+                }
+            }
+            if !colo {
+                return invalid(format!("{where_} must hold cf.colo.id: requests are counted on each node"));
             }
         }
-        if text(rl, "counting_expression", &path)?.is_some_and(|e| !e.trim().is_empty()) {
-            return invalid(format!("{} is not supported by this server: the rule's expression is what is counted", at(&path, "counting_expression")));
+        if characteristics == ["ip"] {
+            characteristics.clear();
+        }
+        let mut status_codes = Vec::new();
+        if let Some(counting) = text(rl, "counting_expression", &path)?.filter(|e| !e.trim().is_empty()) {
+            status_codes = counted_statuses(&counting, &c.expression).ok_or_else(|| {
+                StoreError::Invalid(format!(
+                    "{}: only the rule's own expression and a response code can be counted here, as `<expression> and http.response.code in {{401 403}}` \
+                     (or the code alone for a rule that matches every request)",
+                    at(&path, "counting_expression")
+                ))
+            })?;
         }
         if flag(rl, "requests_to_origin", &path)? == Some(true) {
             return invalid(format!("{} is not supported by this server: every matching request is counted", at(&path, "requests_to_origin")));
@@ -460,8 +492,92 @@ impl Mapped for RateLimit {
             "threshold": required(number(rl, "requests_per_period", &path, max)?, &path, "requests_per_period")?,
             "period": required(number(rl, "period", &path, max)?, &path, "period")?,
             "mitigation_timeout": number(rl, "mitigation_timeout", &path, max)?.unwrap_or(0),
+            "characteristics": characteristics,
+            "status_codes": status_codes,
         })))
     }
+}
+
+/// A characteristic of a rate limit in Cloudflare's words, from this server's.
+fn cloudflare_characteristic(ours: &str) -> String {
+    match ours.split_once(':') {
+        Some(("header", name)) => format!("http.request.headers[\"{name}\"]"),
+        Some(("cookie", name)) => format!("http.request.cookies[\"{name}\"]"),
+        _ => match ours {
+            "asn" => "ip.src.asnum",
+            "country" => "ip.geoip.country",
+            "host" => "http.host",
+            "path" => "http.request.uri.path",
+            _ => "ip.src",
+        }
+        .into(),
+    }
+}
+
+/// This server's word for a Cloudflare characteristic (not `cf.colo.id`),
+/// or None for one it cannot count by. Names are checked again by
+/// [`RateLimit`]'s own validation.
+fn our_characteristic(cf: &str) -> Option<String> {
+    let named = |prefix: &str| cf.strip_prefix(prefix)?.strip_suffix("\"]").filter(|n| !n.is_empty() && !n.contains('"')).map(str::to_string);
+    if let Some(name) = named("http.request.headers[\"") {
+        return Some(format!("header:{}", name.to_ascii_lowercase()));
+    }
+    if let Some(name) = named("http.request.cookies[\"") {
+        return Some(format!("cookie:{name}"));
+    }
+    Some(
+        match cf {
+            "ip.src" => "ip",
+            "ip.src.asnum" => "asn",
+            "ip.geoip.country" => "country",
+            "http.host" => "host",
+            "http.request.uri.path" => "path",
+            _ => return None,
+        }
+        .into(),
+    )
+}
+
+/// May `expression` stand bare before an `and` without changing its meaning?
+/// (`and` binds tighter than `or` and `xor`.)
+fn binds_alone(expression: &str) -> bool {
+    let lower = expression.to_ascii_lowercase();
+    ![" or ", "||", " xor ", "^^"].iter().any(|op| lower.contains(op))
+}
+
+/// The `counting_expression` a rate limit that counts answers by status is
+/// shown with: its own expression and the codes.
+fn counting_expression(expression: &str, codes: &[u16]) -> String {
+    let codes = format!("http.response.code in {{{}}}", codes.iter().map(u16::to_string).collect::<Vec<_>>().join(" "));
+    match expression.trim() {
+        "" => codes,
+        e if binds_alone(e) => format!("{e} and {codes}"),
+        e => format!("({e}) and {codes}"),
+    }
+}
+
+/// The status codes a `counting_expression` counts, when it is the rule's
+/// own expression (as [`counting_expression`] writes it, or bare when that
+/// keeps its meaning) and a test of `http.response.code` and nothing else:
+/// that is all this server can count. None otherwise.
+fn counted_statuses(counting: &str, expression: &str) -> Option<Vec<u16>> {
+    let counting = counting.trim();
+    let expression = expression.trim();
+    let codes = if expression.is_empty() {
+        counting
+    } else {
+        let rest = counting.strip_prefix(&format!("({expression})")).or_else(|| counting.strip_prefix(expression).filter(|_| binds_alone(expression)))?;
+        let rest = rest.trim_start();
+        rest.strip_prefix("and ").or_else(|| rest.strip_prefix("&&"))?.trim()
+    };
+    let test = codes.strip_prefix("http.response.code")?.trim_start();
+    let parsed: Option<Vec<u16>> = if let Some(set) = test.strip_prefix("in").map(str::trim_start).and_then(|t| t.strip_prefix('{')?.strip_suffix('}')) {
+        set.split_whitespace().map(|n| n.parse().ok()).collect()
+    } else {
+        let one = test.strip_prefix("eq").or_else(|| test.strip_prefix("=="))?.trim();
+        Some(vec![one.parse().ok()?])
+    };
+    parsed.filter(|codes| !codes.is_empty())
 }
 
 impl Mapped for RedirectRule {
@@ -1315,10 +1431,18 @@ mod tests {
         assert!(m.contains("rules[0].action"), "{m}");
         let m = err(put(rl, json!({ "action": "block", "expression": "true" })).await);
         assert!(m.contains("rules[0].ratelimit is required"), "{m}");
-        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": ["cf.colo.id", "http.request.headers[\"x-key\"]"], "period": 60, "requests_per_period": 5 } })).await);
-        assert!(m.contains("rules[0].ratelimit.characteristics"), "{m}");
-        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": "http.response.code eq 401" } })).await);
-        assert!(m.contains("counting_expression"), "{m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": ["cf.colo.id", "cf.unique_visitor_id"], "period": 60, "requests_per_period": 5 } })).await);
+        assert!(m.contains("rules[0].ratelimit.characteristics: 'cf.unique_visitor_id'"), "{m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": ["ip.src"], "period": 60, "requests_per_period": 5 } })).await);
+        assert!(m.contains("must hold cf.colo.id"), "{m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": "ip.src", "period": 60, "requests_per_period": 5 } })).await);
+        assert!(m.contains("must be a list of strings"), "{m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": "http.request.uri.path eq \"/x\"" } })).await);
+        assert!(m.contains("rules[0].ratelimit.counting_expression"), "{m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "http.host eq \"a.example.com\"", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": "http.response.code eq 401" } })).await);
+        assert!(m.contains("counting_expression"), "a code alone would count other requests than the rule's: {m}");
+        let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": ["cf.colo.id", "http.request.headers[\"x key\"]"], "period": 60, "requests_per_period": 5 } })).await);
+        assert!(m.contains("header:x key"), "the store's own check refuses the name: {m}");
         let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "period": 60, "requests_per_period": -1 } })).await);
         assert!(m.contains("rules[0].ratelimit.requests_per_period must be a whole number"), "{m}");
         let m = err(put(rl, json!({ "action": "block", "expression": "true", "ratelimit": { "period": 0, "requests_per_period": 5 } })).await);
@@ -1489,6 +1613,62 @@ mod tests {
         let rs = update_rule(&store, &z, &ruleset_id(&z, phase), &id, json!({ "action": "skip", "description": "health" })).await.unwrap();
         assert_eq!(rs["rules"][0]["action_parameters"], skip_params());
         assert_eq!(rs["rules"][0]["description"], json!("health"));
+    }
+
+    #[tokio::test]
+    async fn rate_limits_count_by_what_cloudflare_names_and_by_the_answers_status() {
+        let (store, z) = setup();
+        let rl = "http_ratelimit";
+        let given = json!({
+            "action": "block", "expression": "http.request.uri.path eq \"/login\"", "description": "sign-ins", "enabled": true,
+            "ratelimit": {
+                "characteristics": ["cf.colo.id", "ip.src", "http.request.headers[\"x-api-key\"]", "http.request.cookies[\"Sid\"]"],
+                "period": 60, "requests_per_period": 5, "mitigation_timeout": 600,
+                "counting_expression": "http.request.uri.path eq \"/login\" and http.response.code in {401 403}",
+            },
+        });
+        let rs = put_entrypoint(&store, &z, rl, json!({ "rules": [given.clone()] })).await.unwrap();
+        assert_eq!(rules(&rs), vec![given.clone()], "given back as it was written");
+        let made = &store.items::<RateLimit>(&z).unwrap()[0];
+        assert_eq!((made.characteristics.clone(), made.status_codes.clone()), (vec!["ip".to_string(), "header:x-api-key".into(), "cookie:Sid".into()], vec![401, 403]));
+
+        // every other characteristic, and an expression an `and` would change, which gets brackets
+        let wide = json!({
+            "action": "log", "expression": "http.host eq \"a.example.com\" or http.host eq \"b.example.com\"", "description": "", "enabled": true,
+            "ratelimit": {
+                "characteristics": ["cf.colo.id", "ip.src.asnum", "ip.geoip.country", "http.host", "http.request.uri.path"],
+                "period": 10, "requests_per_period": 100, "mitigation_timeout": 0,
+                "counting_expression": "(http.host eq \"a.example.com\" or http.host eq \"b.example.com\") and http.response.code in {429}",
+            },
+        });
+        let rs = put_entrypoint(&store, &z, rl, json!({ "rules": [wide.clone()] })).await.unwrap();
+        assert_eq!(rules(&rs), vec![wide]);
+        assert_eq!(store.items::<RateLimit>(&z).unwrap()[0].characteristics, ["asn", "country", "host", "path"]);
+        // without the brackets it would mean something else
+        let mut bare = rules(&rs)[0].clone();
+        bare["ratelimit"]["counting_expression"] = json!("http.host eq \"a.example.com\" or http.host eq \"b.example.com\" and http.response.code in {429}");
+        assert!(put_entrypoint(&store, &z, rl, json!({ "rules": [bare] })).await.is_err());
+
+        // a rule for every request may count by the code alone; eq and == are one code, and only the address is the default
+        for (counting, codes) in [("http.response.code eq 401", vec![401]), ("http.response.code == 404", vec![404]), ("http.response.code in {500 502}", vec![500, 502])] {
+            let rule = json!({ "action": "block", "expression": "true", "ratelimit": { "characteristics": ["ip.src", "cf.colo.id"], "period": 60, "requests_per_period": 5, "counting_expression": counting } });
+            let rs = put_entrypoint(&store, &z, rl, json!({ "rules": [rule] })).await.unwrap();
+            let made = &store.items::<RateLimit>(&z).unwrap()[0];
+            assert!(made.characteristics.is_empty(), "the address alone is stored as the default");
+            assert_eq!(made.status_codes, codes, "{counting}");
+            assert_eq!(rules(&rs)[0]["ratelimit"]["characteristics"], json!(["cf.colo.id", "ip.src"]));
+        }
+        for counting in ["http.response.code in {}", "http.response.code in {400..499}", "http.response.code gt 400", "http.response.code eq 99999", "true and http.response.code eq 401"] {
+            let rule = json!({ "action": "block", "expression": "true", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": counting } });
+            assert!(put_entrypoint(&store, &z, rl, json!({ "rules": [rule] })).await.is_err(), "{counting}");
+        }
+        // an expression that only starts like the rule's is not the rule's
+        let rule = json!({ "action": "block", "expression": "ip.src.asnum eq 1", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": "ip.src.asnum eq 13335 and http.response.code eq 401" } });
+        assert!(put_entrypoint(&store, &z, rl, json!({ "rules": [rule] })).await.is_err());
+        // an empty counting expression counts every matching request
+        let rule = json!({ "action": "block", "expression": "true", "ratelimit": { "period": 60, "requests_per_period": 5, "counting_expression": "" } });
+        put_entrypoint(&store, &z, rl, json!({ "rules": [rule] })).await.unwrap();
+        assert!(store.items::<RateLimit>(&z).unwrap()[0].status_codes.is_empty());
     }
 
     #[tokio::test]

@@ -177,6 +177,19 @@ pub struct Settings {
     /// The zone's own HTML for the pages the edge writes by itself, by kind
     /// (`5xx`, `block`, `ratelimit`, `1xxx`; see crate::edge::errpages).
     pub error_pages: crate::edge::errpages::ErrorPages,
+    /// Path every node asks of each origin address of the zone's proxied names
+    /// (see crate::edge::origins); empty: no health checks.
+    pub origin_check_path: String,
+    /// Seconds between two checks of an address.
+    pub origin_check_interval: u32,
+    /// A visitor keeps going to the same origin address of a name with several.
+    pub session_affinity: bool,
+    /// Secondary name servers (addresses, or networks as `address/prefix`) that may
+    /// transfer the zone (AXFR); the single addresses are sent a NOTIFY when it changes.
+    pub dns_transfer_to: Vec<String>,
+    /// Tiered cache: the node the others fetch cacheable requests through (empty: every
+    /// node asks the origin itself).
+    pub cache_tier_node: String,
 }
 
 impl Default for Settings {
@@ -208,6 +221,11 @@ impl Default for Settings {
             auto_level_restore: String::new(),
             auto_level_until: 0,
             error_pages: Default::default(),
+            origin_check_path: String::new(),
+            origin_check_interval: 30,
+            session_affinity: false,
+            dns_transfer_to: Vec::new(),
+            cache_tier_node: String::new(),
         }
     }
 }
@@ -229,6 +247,19 @@ impl Settings {
         }
         if !self.auto_level_restore.is_empty() {
             one_of("auto_level_restore", &self.auto_level_restore, &["off", "essentially_off", "low", "medium", "high", "under_attack"])?;
+        }
+        let path = &self.origin_check_path;
+        if !path.is_empty() && (!path.starts_with('/') || path.len() > 256 || path.bytes().any(|b| b <= b' ' || b == 0x7f)) {
+            return invalid("origin_check_path is a path like /healthz (at most 256 bytes), or empty for no checks");
+        }
+        if self.dns_transfer_to.len() > 16 || self.dns_transfer_to.iter().any(|e| !crate::dns::transfer::valid(e)) {
+            return invalid("dns_transfer_to holds at most 16 addresses or networks (address/prefix)");
+        }
+        if self.cache_tier_node.len() > 64 {
+            return invalid("cache_tier_node is the name of a node, or empty");
+        }
+        if !(10..=3600).contains(&self.origin_check_interval) {
+            return invalid("origin_check_interval is 10 to 3600 seconds");
         }
         if self.browser_cache_ttl > 31_536_000 || self.hsts_max_age > 63_072_000 {
             return invalid("browser_cache_ttl is at most 31536000 and hsts_max_age at most 63072000 seconds");
@@ -288,6 +319,14 @@ pub struct RateLimit {
     /// Seconds a client stays blocked once over the threshold.
     #[serde(default)]
     pub mitigation_timeout: u32,
+    /// What tells one client from another: `ip` (alone when nothing is given), `asn`,
+    /// `country`, `host`, `path`, `header:NAME`, `cookie:NAME`; several make one key.
+    #[serde(default)]
+    pub characteristics: Vec<String>,
+    /// Count only the requests answered with one of these statuses (counted once
+    /// the answer is there: failed sign-ins, say); empty counts every matching request.
+    #[serde(default, deserialize_with = "lenient_codes")]
+    pub status_codes: Vec<u16>,
     #[serde(default = "RateLimit::default_action")]
     pub action: String,
     #[serde(default)]
@@ -300,6 +339,34 @@ impl RateLimit {
     fn default_action() -> String {
         "block".into()
     }
+
+    /// What the requests of one client are counted under.
+    pub fn key(&self, info: &crate::expr::ReqInfo, ip: std::net::IpAddr) -> String {
+        if self.characteristics.is_empty() {
+            return ip.to_string();
+        }
+        let cookie = |name: &str| info.header("cookie").split(';').filter_map(|kv| kv.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.to_string()).unwrap_or_default();
+        let part = |c: &String| match c.split_once(':') {
+            Some(("header", name)) => info.header(name).to_string(),
+            Some(("cookie", name)) => cookie(name),
+            _ => match c.as_str() {
+                "asn" => info.asn.to_string(),
+                "country" => info.country.clone(),
+                "host" => info.host.clone(),
+                "path" => info.path.clone(),
+                _ => ip.to_string(),
+            },
+        };
+        self.characteristics.iter().map(part).collect::<Vec<_>>().join("\u{1f}")
+    }
+}
+
+/// Status codes given as numbers or as their digits (as a form sends them).
+fn lenient_codes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u16>, D::Error> {
+    let raw: Vec<Value> = Deserialize::deserialize(d)?;
+    raw.iter()
+        .map(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()).and_then(|n| u16::try_from(n).ok()).ok_or_else(|| serde::de::Error::custom(format!("{v} is not a status code"))))
+        .collect()
 }
 
 impl Item for RateLimit {
@@ -309,6 +376,23 @@ impl Item for RateLimit {
         one_of("action", &self.action, &["block", "log"])?;
         if self.threshold == 0 || !(1..=86400).contains(&self.period) || self.mitigation_timeout > 86400 {
             return invalid("threshold must be >= 1, period 1-86400 and mitigation_timeout 0-86400");
+        }
+        for c in &mut self.characteristics {
+            let given = c.trim();
+            // cookie names keep their case, the rest is lower case
+            *c = match given.split_once(':') {
+                Some((kind, name)) if kind.eq_ignore_ascii_case("cookie") => format!("cookie:{}", name.trim()),
+                _ => given.to_ascii_lowercase(),
+            };
+            let named = c.split_once(':').is_some_and(|(kind, name)| {
+                matches!(kind, "header" | "cookie") && !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            });
+            if !named && !matches!(c.as_str(), "ip" | "asn" | "country" | "host" | "path") {
+                return invalid(format!("characteristic '{c}' is not ip, asn, country, host, path, header:NAME or cookie:NAME"));
+            }
+        }
+        if self.characteristics.len() > 4 || self.status_codes.len() > 20 || self.status_codes.iter().any(|s| !(100..=599).contains(s)) {
+            return invalid("at most 4 characteristics, and at most 20 status_codes between 100 and 599");
         }
         Ok(())
     }
@@ -974,6 +1058,9 @@ pub struct CacheRule {
     /// `Cache-Control`.
     #[serde(default)]
     pub edge_ttl: Option<u32>,
+    /// One copy whatever the query string: the key is the path alone.
+    #[serde(default)]
+    pub ignore_query: bool,
 }
 
 impl Item for CacheRule {
@@ -1184,6 +1271,9 @@ pub struct PurgeOp {
     pub files: Vec<String>,
     #[serde(default)]
     pub prefixes: Vec<String>,
+    /// What the origin tagged with one of these (`Cache-Tag`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
     pub sync: SyncMeta,
 }
@@ -1286,10 +1376,10 @@ impl SteerRule {
             }
         }
         self.as_orgs = self.as_orgs.iter().map(|o| o.trim().to_ascii_lowercase()).filter(|o| !o.is_empty()).collect();
-        one_of("action", &self.action, &["route", "block"])?;
+        one_of("action", &self.action, &["route", "fastest", "block"])?;
         if self.action == "block" {
             self.nodes.clear();
-        } else if self.nodes.is_empty() {
+        } else if self.nodes.is_empty() && self.action == "route" {
             return invalid("a routing rule needs at least one node");
         }
         for n in &self.nodes {

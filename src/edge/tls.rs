@@ -250,13 +250,96 @@ fn crypto() -> Arc<CryptoProvider> {
     Arc::new(provider::default_provider())
 }
 
+/// For how long a session ticket is good, and how often its key changes.
+const TICKET_SECS: u64 = 12 * 3600;
+
+/// Session tickets every node of the fleet can open: the key comes from the
+/// fleet's token and the half day, so a visitor the DNS sends to another node
+/// (or who comes back after this one started again) resumes its TLS session
+/// instead of shaking hands in full. A ticket of the half day before is still
+/// taken; older keys are not derived any more.
+struct FleetTickets {
+    secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for FleetTickets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FleetTickets")
+    }
+}
+
+impl FleetTickets {
+    fn key(&self, period: u64) -> Option<ring::aead::LessSafeKey> {
+        let mac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.secret);
+        let derived = ring::hmac::sign(&mac, &[b"fucf tls session tickets".as_slice(), &period.to_be_bytes()].concat());
+        ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, derived.as_ref()).ok().map(ring::aead::LessSafeKey::new)
+    }
+
+    /// `period (8) | nonce (12) | sealed`.
+    fn seal(&self, period: u64, plain: &[u8]) -> Option<Vec<u8>> {
+        use ring::rand::SecureRandom;
+        let mut nonce = [0u8; 12];
+        ring::rand::SystemRandom::new().fill(&mut nonce).ok()?;
+        let mut sealed = plain.to_vec();
+        self.key(period)?
+            .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(period.to_be_bytes()), &mut sealed)
+            .ok()?;
+        Some([period.to_be_bytes().as_slice(), &nonce, &sealed].concat())
+    }
+
+    fn open(&self, now: u64, ticket: &[u8]) -> Option<Vec<u8>> {
+        let (head, sealed) = ticket.split_at_checked(20)?;
+        let period = u64::from_be_bytes(head[..8].try_into().ok()?);
+        if period != now && period + 1 != now {
+            return None;
+        }
+        let nonce = ring::aead::Nonce::try_assume_unique_for_key(&head[8..]).ok()?;
+        let mut sealed = sealed.to_vec();
+        let plain = self.key(period)?.open_in_place(nonce, ring::aead::Aad::from(period.to_be_bytes()), &mut sealed).ok()?;
+        Some(plain.to_vec())
+    }
+
+    fn period() -> u64 {
+        crate::edge::stats::now_secs() / TICKET_SECS
+    }
+}
+
+impl rustls::server::ProducesTickets for FleetTickets {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        TICKET_SECS as u32
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.seal(Self::period(), plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.open(Self::period(), cipher)
+    }
+}
+
+static TICKETS: OnceLock<Arc<FleetTickets>> = OnceLock::new();
+
+/// Have the TLS configurations made from now on hand out session tickets
+/// that every node holding `secret` (the fleet's token) can open.
+pub fn share_tickets(secret: &[u8]) {
+    let _ = TICKETS.set(Arc::new(FleetTickets { secret: secret.to_vec() }));
+}
+
 fn base_server_config(store: Arc<Store>) -> anyhow::Result<(ServerConfig, Arc<CertResolver>)> {
     let default = self_signed("fucf.invalid").ok_or_else(|| anyhow::anyhow!("cannot generate default certificate"))?;
     let resolver = Arc::new(CertResolver { store, generated: RwLock::default(), default });
-    let cfg = ServerConfig::builder_with_provider(crypto())
+    let mut cfg = ServerConfig::builder_with_provider(crypto())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_cert_resolver(resolver.clone());
+    if let Some(tickets) = TICKETS.get() {
+        cfg.ticketer = tickets.clone();
+    }
     Ok((cfg, resolver))
 }
 
@@ -320,15 +403,32 @@ impl ServerCertVerifier for NoVerify {
 }
 
 /// Client config for origin connections; `verify` selects strict mode.
+/// The certificate this edge shows the origins that ask for one (see [`present_to_origins`]).
+static ORIGIN_IDENTITY: OnceLock<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> = OnceLock::new();
+
+/// Authenticated origin pulls: have the client configurations made from now
+/// on present this certificate, so an origin can take requests from this
+/// fleet alone (it asks for a client certificate and checks it against ours).
+pub fn present_to_origins(cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    parse_cert(cert_pem, key_pem)?;
+    let chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>().map_err(|e| format!("invalid certificate PEM: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|e| format!("invalid private key PEM: {e}"))?;
+    let _ = ORIGIN_IDENTITY.set((chain, key));
+    Ok(())
+}
+
 pub fn client_config(verify: bool) -> anyhow::Result<Arc<ClientConfig>> {
     let builder = ClientConfig::builder_with_provider(crypto()).with_safe_default_protocol_versions()?;
-    let cfg = if verify {
-        let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        builder.with_root_certificates(roots).with_no_client_auth()
+    let identity = ORIGIN_IDENTITY.get().map(|(chain, key)| (chain.clone(), key.clone_key()));
+    let builder = if verify {
+        builder.with_root_certificates(RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() })
     } else {
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(crypto()))).with_no_client_auth()
+        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify(crypto())))
     };
-    Ok(Arc::new(cfg))
+    Ok(Arc::new(match identity {
+        Some((chain, key)) => builder.with_client_auth_cert(chain, key)?,
+        None => builder.with_no_client_auth(),
+    }))
 }
 
 #[cfg(test)]
@@ -363,5 +463,27 @@ mod tests {
         let der = ck.cert[0].as_ref();
         assert!(der.windows(8).any(|w| w == [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f]));
         assert!(der.windows(32).any(|w| w == [7u8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+    use rustls::server::ProducesTickets;
+
+    #[test]
+    fn every_node_of_the_fleet_opens_a_session_ticket_and_nobody_else() {
+        let (here, there, other) = (FleetTickets { secret: b"fleet token".to_vec() }, FleetTickets { secret: b"fleet token".to_vec() }, FleetTickets { secret: b"another fleet".to_vec() });
+        let ticket = here.seal(100, b"session state").unwrap();
+        assert_eq!(there.open(100, &ticket).as_deref(), Some(b"session state".as_slice()), "another node, same token");
+        assert_eq!(there.open(101, &ticket).as_deref(), Some(b"session state".as_slice()), "the half day after");
+        assert_eq!((there.open(102, &ticket), there.open(99, &ticket), other.open(100, &ticket)), (None, None, None));
+        let mut bent = ticket.clone();
+        *bent.last_mut().unwrap() ^= 1;
+        assert_eq!((there.open(100, &bent), there.open(100, &ticket[..19]), there.open(100, b"")), (None, None, None));
+        assert_ne!(here.seal(100, b"session state").unwrap(), ticket, "sealed anew each time");
+        // as rustls uses it
+        let sealed = here.encrypt(b"abc").unwrap();
+        assert_eq!((there.decrypt(&sealed).as_deref(), here.enabled(), here.lifetime()), (Some(b"abc".as_slice()), true, 43200));
     }
 }

@@ -163,6 +163,18 @@ struct Counter {
     blocked_until: Option<Instant>,
 }
 
+/// A client over a rate limit, as the nodes tell each other: the rule, what
+/// the client is counted under, and until when (unix seconds).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Block {
+    pub rule: String,
+    pub key: String,
+    pub until: u64,
+}
+
+/// Blocks shorter than this are over before another node hears of them.
+const SHARED_BLOCK_SECS: u64 = 10;
+
 #[derive(Default)]
 struct Journal {
     events: VecDeque<Event>,
@@ -177,7 +189,9 @@ pub struct Waf {
     reporting: AtomicBool,
     /// `accelerate` mode: keep only the outbox, skipping 5,000-event journal in RAM.
     outbox_only: AtomicBool,
-    counters: Mutex<HashMap<(String, IpAddr), Counter>>,
+    counters: Mutex<HashMap<(String, String), Counter>>,
+    /// Clients put over a limit here, not yet told to the other nodes.
+    blocks_out: Mutex<Vec<Block>>,
     /// When an origin error was last logged, per (zone, host, status).
     origin_logged: Mutex<HashMap<(String, String, u16), u64>>,
     key: hmac::Key,
@@ -212,6 +226,7 @@ impl Waf {
             reporting: AtomicBool::new(false),
             outbox_only: AtomicBool::new(false),
             counters: Mutex::default(),
+            blocks_out: Mutex::default(),
             origin_logged: Mutex::default(),
             key,
         }
@@ -422,10 +437,56 @@ impl Waf {
             })
     }
 
-    // ---- rate limiting (fixed window per rule and client IP) ----
+    // ---- rate limiting (fixed window per rule and client) ----
+
+    /// Is the client over the limit of a rule already (this request not counted)?
+    fn limited(&self, rule_id: &str, key: &str) -> Option<u64> {
+        let now = Instant::now();
+        let until = self.counters.lock().unwrap().get(&(rule_id.to_string(), key.to_string()))?.blocked_until?;
+        (until > now).then(|| (until - now).as_secs().max(1))
+    }
+
+    /// The answer to a request had this status: counted for the rate limits
+    /// that count answers by their status (`status_codes`). The client that
+    /// goes over such a limit is stopped from its next request on.
+    pub fn answered(&self, zone: &ZoneSnap, info: &ReqInfo, status: u16, ray: &str) {
+        let Some(ip) = info.ip else { return };
+        for (rule, expr) in zone.rate_limits.iter().filter(|(r, _)| r.status_codes.contains(&status)) {
+            if !expr.matches(info) {
+                continue;
+            }
+            let key = rule.key(info, ip);
+            let was = self.limited(&rule.meta.id, &key).is_some();
+            if self.count(&rule.meta.id, &key, rule.threshold, rule.period, rule.mitigation_timeout).is_some() && !was {
+                self.log(zone, info, ray, "ratelimit", (rule.meta.id.as_str(), rule.description.as_str()), &rule.action);
+            }
+        }
+    }
+
+    /// The clients this node put over a rate limit since the last call, for the other nodes.
+    pub fn take_blocks(&self) -> Vec<Block> {
+        std::mem::take(&mut *self.blocks_out.lock().unwrap())
+    }
+
+    /// Clients another node put over a rate limit are over it here as well.
+    pub fn absorb_blocks(&self, blocks: &[Block]) {
+        let (now, unix) = (Instant::now(), super::stats::now_secs());
+        let mut counters = self.counters.lock().unwrap();
+        for block in blocks {
+            let left = block.until.saturating_sub(unix).min(86400);
+            if left == 0 || counters.len() > 100_000 {
+                continue;
+            }
+            let until = now + Duration::from_secs(left);
+            let c = counters.entry((block.rule.clone(), block.key.clone())).or_insert(Counter { window_start: now, count: 0, blocked_until: None });
+            if c.blocked_until.is_none_or(|have| have < until) {
+                c.blocked_until = Some(until);
+            }
+        }
+    }
 
     /// Count one request; `Some(retry_after_secs)` when over the limit.
-    fn count(&self, rule_id: &str, ip: IpAddr, threshold: u32, period: u32, timeout: u32) -> Option<u64> {
+    fn count(&self, rule_id: &str, key: &str, threshold: u32, period: u32, timeout: u32) -> Option<u64> {
         let now = Instant::now();
         let period = Duration::from_secs(period as u64);
         let mut counters = self.counters.lock().unwrap();
@@ -440,7 +501,7 @@ impl Waf {
             }
         }
         let c = counters
-            .entry((rule_id.to_string(), ip))
+            .entry((rule_id.to_string(), key.to_string()))
             .or_insert(Counter { window_start: now, count: 0, blocked_until: None });
         if let Some(until) = c.blocked_until {
             if until > now {
@@ -459,7 +520,14 @@ impl Waf {
         let window_end = c.window_start + period;
         let until = if timeout > 0 { now + Duration::from_secs(timeout as u64) } else { window_end };
         c.blocked_until = Some(until);
-        Some((until - now).as_secs().max(1))
+        let secs = (until - now).as_secs();
+        if secs >= SHARED_BLOCK_SECS && self.reporting.load(Ordering::Relaxed) {
+            let mut out = self.blocks_out.lock().unwrap();
+            if out.len() < MAX_OUTBOX {
+                out.push(Block { rule: rule_id.to_string(), key: key.to_string(), until: super::stats::now_secs() + secs });
+            }
+        }
+        Some(secs.max(1))
     }
 
     /// Run all security phases for one request.
@@ -514,9 +582,13 @@ impl Waf {
                 if !expr.matches(info) {
                     continue;
                 }
-                if let Some(retry_after) =
-                    self.count(&rule.meta.id, ip, rule.threshold, rule.period, rule.mitigation_timeout)
-                {
+                let key = rule.key(info, ip);
+                // a rule that counts answers by their status counts once the answer is there (see `answered`)
+                let over = match rule.status_codes.is_empty() {
+                    true => self.count(&rule.meta.id, &key, rule.threshold, rule.period, rule.mitigation_timeout),
+                    false => self.limited(&rule.meta.id, &key),
+                };
+                if let Some(retry_after) = over {
                     let ident = (rule.meta.id.as_str(), rule.description.as_str());
                     self.log(zone, info, ray, "ratelimit", ident, &rule.action);
                     if rule.action == "block" {
@@ -606,17 +678,45 @@ mod tests {
     }
 
     #[test]
+    fn a_client_over_a_limit_on_one_node_is_over_it_on_the_others() {
+        let (here, there) = (Waf::new(), Waf::new());
+        here.set_reporting();
+        (0..4).for_each(|_| {
+            here.count("r", "k", 3, 60, 120);
+        });
+        let blocks = here.take_blocks();
+        assert_eq!((blocks.len(), blocks[0].rule.as_str(), blocks[0].key.as_str()), (1, "r", "k"));
+        assert!(here.take_blocks().is_empty() && there.limited("r", "k").is_none());
+        there.absorb_blocks(&blocks);
+        assert!(there.limited("r", "k").is_some() && there.limited("r", "other").is_none());
+        // one that is over already says nothing
+        there.absorb_blocks(&[Block { rule: "r".into(), key: "late".into(), until: 1 }]);
+        assert!(there.limited("r", "late").is_none());
+    }
+
+    #[test]
+    fn clients_are_told_apart_by_what_the_rule_names() {
+        let rule: crate::items::RateLimit =
+            serde_json::from_value(serde_json::json!({ "threshold": 1, "period": 1, "characteristics": ["ip", "header:x-api-key", "cookie:Sid"], "status_codes": ["401", 403] })).unwrap();
+        let info = ReqInfo { headers: vec![("x-api-key".into(), "abc".into()), ("cookie".into(), "a=1; Sid=xyz".into())], ..Default::default() };
+        assert_eq!(rule.key(&info, "198.51.100.7".parse().unwrap()), "198.51.100.7\u{1f}abc\u{1f}xyz");
+        assert_eq!(rule.status_codes, [401, 403]);
+        let plain: crate::items::RateLimit = serde_json::from_value(serde_json::json!({ "threshold": 1, "period": 1 })).unwrap();
+        assert_eq!(plain.key(&info, "198.51.100.7".parse().unwrap()), "198.51.100.7");
+    }
+
+    #[test]
     fn rate_limit_window() {
         let waf = Waf::new();
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         for _ in 0..3 {
-            assert_eq!(waf.count("r", ip, 3, 60, 0), None);
+            assert_eq!(waf.count("r", &ip.to_string(), 3, 60, 0), None);
         }
-        assert!(waf.count("r", ip, 3, 60, 0).is_some());
-        assert!(waf.count("r", ip, 3, 60, 0).is_some());
+        assert!(waf.count("r", &ip.to_string(), 3, 60, 0).is_some());
+        assert!(waf.count("r", &ip.to_string(), 3, 60, 0).is_some());
         // other clients and other rules are unaffected
-        assert_eq!(waf.count("r", "198.51.100.8".parse().unwrap(), 3, 60, 0), None);
-        assert_eq!(waf.count("r2", ip, 3, 60, 0), None);
+        assert_eq!(waf.count("r", "198.51.100.8", 3, 60, 0), None);
+        assert_eq!(waf.count("r2", &ip.to_string(), 3, 60, 0), None);
     }
 
     #[test]

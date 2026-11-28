@@ -123,6 +123,7 @@ impl Edge {
             ("sni", if tls.is_some_and(|t| t.sni) { "plaintext" } else { "off" }.to_string()),
             ("warp", warp.to_string()),
             ("kex", tls.map(|t| t.kex.clone()).unwrap_or_default()),
+            ("ja4", tls.map(|t| t.ja4.clone()).unwrap_or_default()),
             ("ray", ray.to_string()),
             ("asn", location.asn.map(|n| n.to_string()).unwrap_or_default()),
             ("zone", zone.to_string()),

@@ -5,13 +5,16 @@ pub mod cache;
 pub mod certdir;
 pub mod cgi;
 pub mod autofw;
+pub mod banset;
 pub mod challenge;
 pub mod errpages;
+pub mod origins;
 pub mod reputation;
 pub mod files;
 pub mod compress;
 pub mod front;
 pub mod h3;
+pub mod ja4;
 pub mod proxy;
 pub mod quic_mux;
 pub mod reqlog;
@@ -622,6 +625,8 @@ pub struct TlsInfo {
     pub sni: bool,
     /// Key exchange group, as far as known.
     pub kex: String,
+    /// The JA4 fingerprint of the ClientHello (see [`ja4`]), as far as known.
+    pub ja4: String,
 }
 
 /// Is this a gRPC request? (gRPC-Web is not: that one is plain HTTP.)
@@ -977,6 +982,16 @@ pub struct Outgoing {
     pub on_upgrade: Option<OnUpgrade>,
     /// A gRPC call: goes to the origin over HTTP/2, trailers and all.
     pub grpc: bool,
+    /// Fetching anew what was just answered stale: not answered stale again.
+    pub refresh: bool,
+}
+
+/// A copy to fetch anew in the background (stale-while-revalidate).
+struct Refresh {
+    key: String,
+    zone_id: String,
+    info: ReqInfo,
+    headers: HeaderMap,
 }
 
 pub struct Edge {
@@ -1024,6 +1039,14 @@ pub struct Edge {
     pub d1: std::sync::OnceLock<Arc<crate::workers::db::D1Store>>,
     /// Configured node name (for `LocalProxyRule.nodes` matching).
     pub node_name: std::sync::OnceLock<String>,
+    /// How long the visitors' handshakes with this node take, per network (see crate::rtt).
+    pub rtt: Arc<crate::rtt::Rtt>,
+    /// Which origin addresses pass this node's health checks.
+    pub origins: Arc<origins::Health>,
+    /// Copies answered stale, waiting to be fetched anew (see [`Edge::refresh_stale`]), and the keys of those under way.
+    refresh_tx: tokio::sync::mpsc::Sender<Refresh>,
+    refresh_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Refresh>>>,
+    refreshing: std::sync::Mutex<std::collections::HashSet<String>>,
     /// True when this node runs in `--role accelerate` mode.
     pub accelerate: std::sync::atomic::AtomicBool,
     /// Explicitly trust `X-Forwarded-Host` from the local HTTP/3 front.
@@ -1272,6 +1295,7 @@ fn is_addr(rtype: &str) -> bool {
 
 impl Edge {
     pub fn new(store: Arc<Store>, cache: Arc<Cache>, waf: Arc<Waf>, edge_ips: Vec<IpAddr>) -> anyhow::Result<Self> {
+        let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(256);
         Ok(Edge {
             store,
             cache,
@@ -1297,6 +1321,11 @@ impl Edge {
             kv: Default::default(),
             d1: Default::default(),
             node_name: Default::default(),
+            rtt: Default::default(),
+            origins: Default::default(),
+            refresh_tx,
+            refresh_rx: std::sync::Mutex::new(Some(refresh_rx)),
+            refreshing: Default::default(),
             accelerate: std::sync::atomic::AtomicBool::new(false),
             trust_forwarded_host: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1365,14 +1394,22 @@ impl Edge {
             }
         }
 
-        // Rotate through the addresses; ones that failed recently go last.
-        let order = |addrs: Vec<&str>| -> Vec<String> {
-            let start = self.rr.fetch_add(1, Ordering::Relaxed);
+        // Rotate through the addresses by their weights (with session affinity, the same visitor
+        // starts with the same one); ones that fail their health check or failed recently go last.
+        let order = |addrs: Vec<(&str, u32)>| -> Vec<String> {
+            let turn = match info.ip.filter(|_| zone.zone.settings.session_affinity) {
+                Some(ip) => origins::turn_of(ip),
+                None => self.rr.fetch_add(1, Ordering::Relaxed),
+            };
+            let start = origins::pick(&addrs.iter().map(|(_, weight)| *weight).collect::<Vec<_>>(), turn);
             let (down, now) = (self.down.lock().unwrap(), Instant::now());
-            let mut list: Vec<String> = (0..addrs.len()).map(|i| addrs[(start + i) % addrs.len()].to_string()).collect();
-            list.sort_by_key(|h| down.get(h).is_some_and(|until| *until > now));
+            let mut list: Vec<String> = (0..addrs.len()).map(|i| addrs[(start + i) % addrs.len()].0.to_string()).collect();
+            list.sort_by_key(|h| (self.origins.is_down(&zone.zone.id, &info.host, h), down.get(h).is_some_and(|until| *until > now)));
             list
         };
+        fn weighed<'a>(r: &&'a crate::store::Record) -> (&'a str, u32) {
+            (r.content.as_str(), r.origin.as_ref().and_then(|o| o.weight).unwrap_or(1))
+        }
         let records: Vec<&crate::store::Record> = zone.records_for(&info.host).iter().filter(|r| r.proxied).collect();
         // The origin options of the record the origin is taken from. A rule
         // that names another origin leaves them behind: they describe how to
@@ -1381,6 +1418,23 @@ impl Edge {
         if origin_node.is_none() && origin_host.is_none() {
             options = records.iter().find_map(|r| r.origin.as_ref());
             origin_node = options.and_then(|o| o.node.clone());
+        }
+        // Tiered cache: what may be cached is fetched through the zone's upper-tier node, whose
+        // copy then serves every node and spares the origin. That node is asked as a visitor
+        // would ask it (it applies the origin's own options and rules); when it just failed,
+        // the origin is asked directly.
+        let upper = zone.zone.settings.cache_tier_node.trim();
+        if !upper.is_empty() && origin_node.is_none() && origin_host.is_none() && matches!(info.method.as_str(), "GET" | "HEAD") {
+            let me = crate::fleet::self_name(&self.store, &self.edge_ips, self.node_name.get().map(String::as_str));
+            let node = snap.nodes.iter().find(|n| n.name.eq_ignore_ascii_case(upper)).filter(|n| !n.name.eq_ignore_ascii_case(&me));
+            let failed = |n: &crate::items::EdgeNode| {
+                let (down, now) = (self.down.lock().unwrap(), Instant::now());
+                [n.ipv4.map(|a| a.to_string()), n.ipv6.map(|a| a.to_string())].into_iter().flatten().any(|a| down.get(&a).is_some_and(|until| *until > now))
+            };
+            if let Some(node) = node.filter(|n| !failed(n)) {
+                origin_node = Some(node.name.clone());
+                (options, host_header, sni, port, scheme) = (None, None, None, None, Some("https".to_string()));
+            }
         }
 
         let (host, candidates) = if let Some(target_node) = origin_node {
@@ -1414,14 +1468,14 @@ impl Edge {
             let mut candidates = match origin_host {
                 Some(h) => vec![h],
                 None => {
-                    let addrs: Vec<&str> =
-                        records.iter().filter(|r| is_addr(&r.rtype)).map(|r| r.content.as_str()).collect();
+                    let addrs: Vec<(&str, u32)> = records.iter().filter(|r| is_addr(&r.rtype)).map(weighed).collect();
                     if !addrs.is_empty() {
                         let mut list = order(addrs);
                         let of = |addr: &str| records.iter().find(|r| is_addr(&r.rtype) && r.content == addr).and_then(|r| r.origin.as_ref());
                         options = of(&list[0]);
                         // an address that is reached differently is no stand-in for this one
-                        list.retain(|addr| of(addr) == options);
+                        let way = crate::store::RecordOrigin::way(options);
+                        list.retain(|addr| crate::store::RecordOrigin::way(of(addr)) == way);
                         list
                     } else {
                         // CNAME: follow it through zones we host, else leave it to system DNS.
@@ -1435,8 +1489,7 @@ impl Edge {
                         for _ in 0..8 {
                             let Some(z) = snap.find_zone(&name) else { break };
                             let recs = z.records_for(&name);
-                            let addrs: Vec<&str> =
-                                recs.iter().filter(|r| is_addr(&r.rtype)).map(|r| r.content.as_str()).collect();
+                            let addrs: Vec<(&str, u32)> = recs.iter().filter(|r| is_addr(&r.rtype)).map(|r| (r.content.as_str(), 1)).collect();
                             if !addrs.is_empty() {
                                 resolved = Some(order(addrs));
                                 break;
@@ -1496,7 +1549,7 @@ impl Edge {
 
     /// Serve from cache or pull from the origin (no WAF, no workers).
     pub async fn fetch(&self, snap: &Snapshot, zone: &ZoneSnap, out: Outgoing) -> Result<Response<Body>, EdgeError> {
-        let Outgoing { info, mut headers, body, on_upgrade, grpc } = out;
+        let Outgoing { info, mut headers, body, on_upgrade, grpc, refresh } = out;
         let method = Method::from_bytes(info.method.as_bytes())
             .map_err(|_| EdgeError::new(400, "Bad request", "invalid method"))?;
         let uri = info.uri();
@@ -1505,7 +1558,8 @@ impl Edge {
         let (force, ttl_override) = (rule.is_some_and(|r| r.cache), rule.and_then(|r| r.edge_ttl).map(u64::from));
         let eligible = !zone.zone.paused && !settings.development_mode && cache::request_cacheable(&method, &headers);
         let use_cache = eligible && rule.is_none_or(|r| r.cache);
-        let key = cache::cache_key(info.ssl, &info.host, &uri, &headers);
+        // a rule may keep one copy whatever the query string
+        let key = cache::cache_key(info.ssl, &info.host, if rule.is_some_and(|r| r.ignore_query) { &info.path } else { &uri }, &headers);
         let conditional = Conditional::of(&headers);
 
         let mut status_label = if eligible && !use_cache { "BYPASS" } else { "DYNAMIC" };
@@ -1519,6 +1573,14 @@ impl Edge {
                 // A part is cut from what we have; otherwise the request goes
                 // to the origin as it is, and its partial answer is not kept.
                 _ if conditional.range.is_some() => storable = false,
+                // stale-while-revalidate: the visitor gets the copy at once, a new one is fetched behind its back
+                Some(entry)
+                    if !refresh
+                        && entry.stored.elapsed() < entry.ttl + cache::stale_while_revalidate(&entry.headers)
+                        && self.refresh_later(&key, &zone.zone.id, &info, &headers) =>
+                {
+                    return Ok(cached_response(&entry, &method, &conditional, "UPDATING"));
+                }
                 Some(entry) => {
                     status_label = "EXPIRED";
                     fallback = Some(entry.clone()).filter(|e| e.stored.elapsed() < e.ttl + cache::STALE_IF_ERROR);
@@ -1763,7 +1825,7 @@ impl Edge {
 
         let resp = match snap.find_zone(&host).filter(|z| Self::serves(z, &host)) {
             Some(zone) => {
-                let out = Outgoing { info, headers: map, body: ReqBody::Buffered(body), on_upgrade: None, grpc: false };
+                let out = Outgoing { info, headers: map, body: ReqBody::Buffered(body), on_upgrade: None, grpc: false, refresh: false };
                 self.fetch(snap, zone, out).await.map_err(|e| format!("{} {}: {}", e.status, e.title, e.detail))?
             }
             None => {
@@ -2072,6 +2134,7 @@ impl Edge {
             path,
             query,
             headers: header_pairs(req.headers()),
+            ja4: req.extensions().get::<TlsInfo>().map(|t| t.ja4.clone()).unwrap_or_default(),
             ..Default::default()
         };
 
@@ -2225,6 +2288,8 @@ impl Edge {
             worker = route.and_then(|r| r.script.as_ref()).and_then(|name| snap.workers.get(name));
         }
 
+        // rate limits that count answers by their status need the request once the answer is there
+        let counted = zone.rate_limits.iter().any(|(r, _)| !r.status_codes.is_empty()).then(|| info.clone());
         let mut resp = match worker {
             Some(script) => {
                 if info.path == "/__scheduled" {
@@ -2256,9 +2321,12 @@ impl Edge {
                     crate::workers::run(self.clone(), snap.clone(), script.clone(), info, body).await?
                 }
             }
-            None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc }).await?,
+            None => self.fetch(&snap, zone, Outgoing { info, headers, body, on_upgrade, grpc, refresh: false }).await?,
         };
         waiting::stamp(&mut resp, admitted);
+        if let Some(info) = &counted {
+            self.waf.answered(zone, info, resp.status().as_u16(), ray);
+        }
         // What the zone's settings add to an answer (rules may still change it).
         if ssl && settings.hsts_max_age > 0 {
             let subdomains = if settings.hsts_include_subdomains { "; includeSubDomains" } else { "" };
@@ -2398,6 +2466,51 @@ impl Edge {
     }
 }
 
+impl Edge {
+    /// Have the copy under `key` fetched anew in the background. False when
+    /// that cannot be queued: the request then asks the origin itself.
+    fn refresh_later(&self, key: &str, zone_id: &str, info: &ReqInfo, headers: &HeaderMap) -> bool {
+        let mut busy = self.refreshing.lock().unwrap();
+        if busy.contains(key) {
+            return true;
+        }
+        let job = Refresh { key: key.to_string(), zone_id: zone_id.to_string(), info: info.clone(), headers: headers.clone() };
+        let queued = self.refresh_tx.try_send(job).is_ok();
+        if queued {
+            busy.insert(key.to_string());
+        }
+        queued
+    }
+
+    /// Fetch anew the copies that were answered stale, for as long as the process runs.
+    pub async fn refresh_stale(self: Arc<Self>) {
+        let Some(mut queue) = self.refresh_rx.lock().unwrap().take() else { return };
+        while let Some(job) = queue.recv().await {
+            let edge = self.clone();
+            tokio::spawn(async move {
+                let snap = edge.store.snapshot();
+                if let Some(zone) = snap.zones.values().find(|z| z.zone.id == job.zone_id) {
+                    let out = Outgoing { info: job.info, headers: job.headers, body: ReqBody::Buffered(Bytes::new()), on_upgrade: None, grpc: false, refresh: true };
+                    let _ = edge.fetch(&snap, zone, out).await;
+                }
+                edge.refreshing.lock().unwrap().remove(&job.key);
+            });
+        }
+    }
+
+    /// One round trip with the visitor at `ip`, as its handshake with this node
+    /// showed it: what the DNS steers by (see crate::rtt). Not the nodes of the
+    /// fleet among themselves, nor this host.
+    pub fn measured(&self, ip: IpAddr, rtt: Duration) {
+        let ip = ip.to_canonical();
+        let Some(geo) = self.geo.get() else { return };
+        if ip.is_loopback() || cgi::is_fucf_node(ip, &self.store.snapshot().nodes) {
+            return;
+        }
+        self.rtt.sample(&geo.locate(ip), rtt);
+    }
+}
+
 /// Run the pipeline and stamp the edge's own response headers.
 pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<Body>) -> Response<Body> {
     let ray = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
@@ -2503,6 +2616,8 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     resp.headers_mut().insert(header::SERVER, HeaderValue::from_static("fucf"));
     mark_cache(&mut resp, &edge.here().colo);
     if let Ok(v) = HeaderValue::from_str(&ray) {
+        // the origin's tags are for purging here, not for visitors
+        resp.headers_mut().remove("cache-tag");
         resp.headers_mut().insert("fucf-ray", v);
     }
     // An origin's Alt-Svc is about the origin's own endpoints (it may sit
@@ -2780,6 +2895,7 @@ async fn serve_with_options(
             match acceptor {
                 None => serve_conn(stream, peer, None, false, linfo, edge).await,
                 Some((both, h1_only, acme, resolver)) => {
+                    let fingerprint = ja4::peek(&stream).await;
                     let hello = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
                     let Ok(Ok(start)) = tokio::time::timeout(Duration::from_secs(10), hello).await else { return };
                     if start.client_hello().alpn().is_some_and(|mut offered| offered.any(|p| p == tls::ACME_TLS_ALPN)) {
@@ -2797,8 +2913,14 @@ async fn serve_with_options(
                         .and_then(|name| edge.store.snapshot().find_zone(&name).map(|z| z.zone.settings.http2))
                         .unwrap_or(true);
                     let config = if http2 { both } else { h1_only };
+                    // from here the handshake waits for the visitor once: one round trip
+                    let asked = std::time::Instant::now();
                     if let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(10), start.into_stream(config)).await {
                         let session = tls.get_ref().1;
+                        // (TLS 1.2 waits for the visitor twice: not a measure of one round trip)
+                        if session.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
+                            edge.measured(peer.ip(), asked.elapsed());
+                        }
                         let alpn_h2 = session.alpn_protocol() == Some(b"h2");
                         let info = TlsInfo {
                             version: match session.protocol_version() {
@@ -2807,6 +2929,7 @@ async fn serve_with_options(
                             },
                             sni: session.server_name().is_some(),
                             kex: session.negotiated_key_exchange_group().map(|group| format!("{:?}", group.name())).unwrap_or_default(),
+                            ja4: fingerprint,
                         };
                         serve_conn(tls, peer, Some(info), alpn_h2, linfo, edge).await;
                     }

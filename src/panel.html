@@ -681,7 +681,7 @@ const RULES = {
   firewall: { path: "firewall/rules", title: "防火墙规则", empty: "<b>还没有防火墙规则</b>按路径、IP、国家或运营商拦截、质询或放行请求。", cols: ["description", "expression", "action", "priority", "enabled"],
     fields: [DESC, EXPR, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["js_challenge", "JS 质询（可疑时要求点一下）"], ["managed_challenge", "人机验证（点一下）"], ["log", "仅记录"], ["skip", "放行并跳过后续检查"]] }, ...COMMON] },
   rate: { path: "rate_limits", title: "限速规则", empty: "<b>还没有限速规则</b>限制单个 IP 在统计周期内的请求数。", cols: ["description", "expression", "threshold", "period", "action", "enabled"],
-    fields: [DESC, EXPR, { k: "threshold", label: "阈值（请求数 / 每 IP）", type: "number", def: 100 }, { k: "period", label: "统计周期（秒）", type: "number", def: 60 }, { k: "mitigation_timeout", label: "超限后封禁时长（秒）", type: "number" }, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["log", "仅记录"]] }, { k: "enabled", label: "启用", type: "check", def: true }] },
+    fields: [DESC, EXPR, { k: "threshold", label: "阈值（请求数 / 每 IP）", type: "number", def: 100 }, { k: "period", label: "统计周期（秒）", type: "number", def: 60 }, { k: "mitigation_timeout", label: "超限后封禁时长（秒）", type: "number" }, { k: "characteristics", label: "区分客户端的依据（默认 ip；可选 asn、country、host、path、header:名称、cookie:名称）", type: "list", opt: 1 }, { k: "status_codes", label: "只统计这些响应状态码（留空统计所有请求）", type: "list", opt: 1 }, { k: "action", label: "动作", type: "select", options: [["block", "拦截"], ["log", "仅记录"]] }, { k: "enabled", label: "启用", type: "check", def: true }] },
   origin: { path: "origin_rules", title: "回源规则", empty: "<b>还没有回源规则</b>按表达式改写回源地址、端口、协议、Host 头或 SNI。", cols: ["description", "expression", "origin_host", "origin_node", "origin_port", "host_header", "priority", "enabled"],
     fields: [DESC, EXPR, { k: "origin_host", label: "回源地址（域名或 IP）", opt: 1 }, { k: "origin_node", label: "内部回源节点（可选，如 jp）", opt: 1 }, { k: "origin_port", label: "回源端口", type: "number", opt: 1 }, { k: "origin_scheme", label: "回源协议", type: "select", options: ["", "http", "https"], opt: 1 }, { k: "host_header", label: "Host 头", opt: 1 }, { k: "sni", label: "TLS SNI", opt: 1 }, ...COMMON] },
   redirect: { path: "redirect_rules", title: "重定向规则", empty: "<b>还没有重定向规则</b>把匹配的请求跳转到另一个 URL。", cols: ["description", "expression", "target_url", "status_code", "enabled"],
@@ -690,7 +690,7 @@ const RULES = {
   transform: { path: "transform_rules", title: "改写规则", empty: "<b>还没有改写规则</b>重写路径，增删请求头和响应头。", cols: ["description", "expression", "rewrite_path", "priority", "enabled"],
     fields: [DESC, EXPR, { k: "rewrite_path", label: "重写路径", opt: 1 }, { k: "set_request_headers", label: "设置请求头 (JSON)", type: "json" }, { k: "remove_request_headers", label: "删除请求头", type: "list" }, { k: "set_response_headers", label: "设置响应头 (JSON)", type: "json" }, { k: "remove_response_headers", label: "删除响应头", type: "list" }, ...COMMON] },
   cache: { path: "cache_rules", title: "缓存规则", empty: "<b>还没有缓存规则</b>默认只缓存静态文件；用规则缓存更多内容或强制不缓存。", cols: ["description", "expression", "cache", "edge_ttl", "priority", "enabled"],
-    fields: [DESC, EXPR, { k: "cache", label: "缓存匹配的响应（关闭 = 强制不缓存）", type: "check", def: true }, { k: "edge_ttl", label: "边缘 TTL（秒，留空遵循源站）", type: "number", opt: 1 }, ...COMMON] },
+    fields: [DESC, EXPR, { k: "cache", label: "缓存匹配的响应（关闭 = 强制不缓存）", type: "check", def: true }, { k: "edge_ttl", label: "边缘 TTL（秒，留空遵循源站）", type: "number", opt: 1 }, { k: "ignore_query", label: "忽略查询串（不同查询串共用一份缓存）", type: "check" }, ...COMMON] },
   cert: { path: "custom_certificates", title: "边缘证书", empty: "<b>还没有上传证书</b>没有证书的主机名使用即时生成的自签名证书。", cols: ["hosts", "modified_on"],
     fields: [{ k: "hosts", label: "域名（留空 = 根域 + 通配）", type: "list" }, { k: "certificate", label: "证书链 PEM", type: "textarea" }, { k: "private_key", label: "私钥 PEM（不会回显）", type: "textarea" }] },
   spectrum: { path: "spectrum/apps", title: "TCP / UDP 转发", empty: "<b>还没有转发应用</b>把边缘上的任意 TCP / UDP 端口转发到源站。", cols: ["protocol", "dns_name", "origin_direct", "proxy_protocol"],
@@ -981,7 +981,9 @@ const ZONE = {
     return { sub: "边缘与源站之间的加密方式，以及访客看到的证书。", body:
       card("加密", "", setRow("回源加密", "flexible：HTTP 回源。full：HTTPS 回源，不验证源站证书。strict：HTTPS 回源并验证证书。",
         sel("ssl", s.ssl, [["flexible", "flexible：HTTP 回源"], ["full", "full：HTTPS，不验证"], ["strict", "strict：HTTPS，验证证书"]], "回源加密")) +
-        setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS"))) + await ruleSection(z.id, "cert") };
+        setRow("始终使用 HTTPS", "把所有 HTTP 请求 301 到 HTTPS。", sw("always_use_https", s.always_use_https, "始终使用 HTTPS")) +
+        setRow("源站健康检查", "一个主机名有多条代理 A/AAAA 记录时，每个节点定期用这个路径请求每个源站地址；连续两次失败（无应答或 4xx/5xx）的地址排到最后，恢复后自动回来。留空为不检查。", `<input data-set="origin_check_path" value="${esc(s.origin_check_path || "")}" placeholder="/healthz" spellcheck="false" aria-label="源站健康检查路径">`) +
+        setRow("会话保持", "同一访客（按 IP）始终回到同一个源站地址，该地址不可用时才换。", sw("session_affinity", s.session_affinity, "会话保持"))) + await ruleSection(z.id, "cert") };
   },
   async security(z) {
     return { sub: "托管规则集、自定义防火墙规则和限速。防火墙规则可按国家或运营商屏蔽访问（CDN 屏蔽）。", body:
@@ -1110,12 +1112,12 @@ async function viewSteer() {
       }</div></div>` : "";
   const tester = card("定位测试", "", `<div class="cb"><div class="hint" style="margin-bottom:8px">输入访客或其 DNS 服务器的 IP（DNS 调度看的是递归 DNS 的地址，带 ECS 时是访客网段），看本节点把它定位到哪里、会命中哪条规则（不计节点健康与流量分流）。</div>
     <div class="steer-test" style="display:flex;gap:8px;flex-wrap:wrap"><input id="steer-ip" placeholder="例如 223.5.5.5" autocomplete="off" spellcheck="false" style="flex:1;min-width:180px">${btn("steerTest", "定位", {}, "pri")}</div><div id="steer-res" style="margin-top:10px"></div></div>`);
-  return { title: "调度与 DNS 屏蔽", sub: "按优先级从小到大匹配访客的国家、省份、大洲、运营商（条件之间为“且”）。调度：解析到列表里第一个健康且未被限流分流的节点，其后的节点是故障或超量分流时的备选。屏蔽：拒绝为这类访客解析。", acts: btn("steerEdit", "添加规则", {}, "pri"), body:
+  return { title: "调度与 DNS 屏蔽", sub: "按优先级从小到大匹配访客的国家、省份、大洲、运营商（条件之间为“且”）。调度：解析到列表里第一个健康且未被限流分流的节点，其后的节点是故障或超量分流时的备选。实测最快：解析到访客所在网络握手往返时间最短的节点（各节点实测，数据不足时在候选里轮流分配）。屏蔽：拒绝为这类访客解析。", acts: btn("steerEdit", "添加规则", {}, "pri"), body:
     tester + (palette ? card("拖拽式节点调度栏", "", palette) : "") +
     card(`规则 <span class="cnt">${C.steer.length}</span>`, "", table([
       { k: "priority", label: "优先级", cls: "num" }, { label: "名称", fmt: r => `<b>${esc(r.name)}</b>` },
       { label: "匹配", fmt: r => (cond(r).length ? chips(cond(r)) : '<span class="hint">所有访客</span>') },
-      { label: "动作", fmt: r => (r.action === "block" ? '<span class="tag bad">屏蔽解析</span>' :
+      { label: "动作", fmt: r => (r.action === "block" ? '<span class="tag bad">屏蔽解析</span>' : (r.action === "fastest" ? '<span class="tag pri">实测最快</span> ' + (r.nodes.length ? "" : '<span class="hint">全部节点</span>') : "") +
         `<span class="flow flow-drop" data-drop-kind="steer-rule" data-rule-id="${esc(r.id)}">${r.nodes.map((n, i) => `<span class="tag pri fchip" ${admin ? `draggable="true" data-drag-kind="steer-node" data-rule-id="${esc(r.id)}" data-idx="${i}" data-drop-kind="steer-node"` : ""}>${esc(n)}${admin && r.nodes.length > 1 ? `<button type="button" class="x" data-act="steerNodeRm" data-rule-id="${esc(r.id)}" data-idx="${i}" title="从本规则移除">×</button>` : ""}</span>`).join('<span class="arr">→</span>')}</span>`) },
       { label: "状态", fmt: r => (r.enabled ? '<span class="st ok">启用</span>' : '<span class="st">停用</span>') },
     ], C.steer, r => rowActs("steerEdit", "steerDel", { id: r.id }), `<b>还没有调度规则</b>访客目前只按节点负责的大洲分配。<br><br>${btn("steerEdit", "添加规则", {}, "pri")}`)) };
@@ -1751,7 +1753,7 @@ const A = {
   recEdit: d => {
     const r = byId("records", d.id), o = r.origin || {};
     openForm(d.id ? "编辑记录" : "添加记录", [
-      { k: "type", label: "类型", type: "select", options: ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR"] },
+      { k: "type", label: "类型", type: "select", options: ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR", "HTTPS", "SVCB", "TLSA", "SSHFP", "DS", "NAPTR", "URI"] },
       { k: "name", label: "名称", hint: "@ 表示根域；可写前缀（www）或完整域名；支持 *.前缀" },
       { k: "content", label: "内容", hint: "A/AAAA 填 IP；已代理时这里是源站地址" },
       { k: "proxied", label: "经 CDN 代理（仅 A / AAAA / CNAME）", type: "check" },
@@ -1993,8 +1995,8 @@ const A = {
   relForget: async d => { if (await confirmBox("忘掉这次发布？", "各节点保持当前版本不变。", "忘掉", false)) { await api("DELETE", `/releases/${d.sha}?forget=true`); toast("已忘掉"); render(); } },
   steerEdit: d => openForm(d.id ? "编辑规则" : "添加规则", [
     { k: "name", label: "名称" },
-    { k: "action", label: "动作", type: "select", options: [["route", "调度到指定节点"], ["block", "屏蔽：拒绝解析"]] },
-    { k: "nodes", label: "节点（按优先顺序，逗号分隔）", type: "list", hint: "可用：" + (C.nodeNames || []).join(", ") },
+    { k: "action", label: "动作", type: "select", options: [["route", "调度到指定节点"], ["fastest", "调度到实测最快的节点"], ["block", "屏蔽：拒绝解析"]] },
+    { k: "nodes", label: "节点（按优先顺序，逗号分隔；“实测最快”时是候选节点，留空为全部）", type: "list", hint: "可用：" + (C.nodeNames || []).join(", ") },
     { k: "countries", label: "国家代码", type: "list" },
     { k: "regions", label: "省/州代码 (ISO 3166-2)", type: "list" },
     { k: "continents", label: "大洲", type: "multi", options: Object.entries(CONT) },
@@ -2013,11 +2015,12 @@ const A = {
       const rule = r.rule ? (r.rule.action === "block" ? `命中屏蔽规则 <b>${esc(r.rule.name)}</b>` : `命中规则 <b>${esc(r.rule.name)}</b>（优先级 ${r.rule.priority}）→ ${r.rule.nodes.map(n => `<span class="tag pri">${esc(n)}</span>`).join(" ")}`)
         : `没有命中任何规则 → 按大洲分配：${(r.continent_nodes || []).map(n => `<span class="tag">${esc(n)}</span>`).join(" ") || '<span class="hint">全部节点</span>'}`;
       const dbs = r.databases || {};
+      const meas = r.measured ? `<div style="margin-top:6px">实测往返（${esc(r.measured.network)}）：${r.measured.nodes.map(n => `<span class="tag">${esc(n.name)} ${Math.round(n.ms)} ms</span>`).join(" ")}</div>` : '<div class="hint" style="margin-top:6px">这个网络还没有足够的实测数据（“实测最快”规则会在候选节点里轮流分配）。</div>';
       const rep = r.reputation, asr = rep && rep.assessment;
       const REP = { abuser: "滥用名单", attacker: "近期攻击", tor: "Tor 出口", vpn: "VPN", datacenter: "机房 / 云", banned_here: "本机群封禁过", verified_crawler: "已验证爬虫" };
       const repLine = rep ? `<div style="margin-top:6px">威胁分 <b class="${asr.score >= 50 ? "st bad" : asr.score >= 25 ? "st warn" : "st ok"}">${asr.score}</b> / 100 ${asr.reasons.map(x => `<span class="tag">${esc(REP[x] || x)}</span>`).join(" ")}
         <span class="hint">（纯净度库：${rep.lists.map(l => `${esc(l.name)} ${l.networks}`).join("，")}）</span></div>` : '<div class="hint" style="margin-top:6px">本节点没有开启 IP 纯净度库。</div>';
-      out.innerHTML = `<div>${chips(place)}</div><div style="margin-top:6px">${rule}</div>${repLine}${dbs.cn_provinces ? "" : '<div class="hint" style="margin-top:6px">本节点没有加载 ip2region 省份库：中国大陆多数地址查不到省份，按省份的规则多半不会命中。</div>'}`;
+      out.innerHTML = `<div>${chips(place)}</div><div style="margin-top:6px">${rule}</div>${meas}${repLine}${dbs.cn_provinces ? "" : '<div class="hint" style="margin-top:6px">本节点没有加载 ip2region 省份库：中国大陆多数地址查不到省份，按省份的规则多半不会命中。</div>'}`;
     } catch (ex) { out.innerHTML = `<span class="st bad">${esc(ex.message)}</span>`; }
   },
   workerEdit: async d => {

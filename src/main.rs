@@ -24,6 +24,7 @@ mod mail;
 mod node;
 mod release;
 mod reports;
+mod rtt;
 mod rulesets;
 mod spectrum;
 mod store;
@@ -193,10 +194,33 @@ struct Args {
     #[arg(long, env = "FUCF_H3_FRONT_PORT", default_value_t = 443)]
     h3_front_port: u16,
 
-    /// TTL in seconds of DNS answers under the CNAME base. A node that goes
-    /// down or over its traffic allowance keeps getting visitors for this long.
+    /// TTL in seconds of the DNS answers that point at the edge (at most 300
+    /// for proxied records). A node that goes down or over its traffic
+    /// allowance keeps getting visitors for this long.
     #[arg(long, env = "FUCF_EDGE_TTL", default_value_t = 300)]
     edge_ttl: u32,
+
+    /// Answers per second the DNS server sends over UDP to one network (/24,
+    /// /56) for one name; beyond it half go out truncated (ask again over
+    /// TCP) and the rest is dropped. 0: no limit.
+    #[arg(long, env = "FUCF_DNS_RRL", default_value_t = 100)]
+    dns_rrl: u32,
+
+    /// Write the addresses the automatic firewall bans (by rules that block)
+    /// to this file as an nftables script (sets `banned4` and `banned6` of the
+    /// table `inet fucf`), for the host to load and drop them in the kernel.
+    #[arg(long, env = "FUCF_BAN_EXPORT")]
+    ban_export: Option<PathBuf>,
+
+    /// Authenticated origin pulls: a certificate (PEM) this node presents to
+    /// origins that ask for a client certificate, so they can take requests
+    /// from this fleet alone. Needs --origin-client-key.
+    #[arg(long, env = "FUCF_ORIGIN_CLIENT_CERT", requires = "origin_client_key")]
+    origin_client_cert: Option<PathBuf>,
+
+    /// The private key (PEM) of --origin-client-cert.
+    #[arg(long, env = "FUCF_ORIGIN_CLIENT_KEY", requires = "origin_client_cert")]
+    origin_client_key: Option<PathBuf>,
 
     /// SMTP listener for inbound e-mail routing (e.g. `0.0.0.0:25`). Off unless set.
     #[arg(long, env = "FUCF_SMTP_LISTEN")]
@@ -520,6 +544,12 @@ async fn main() -> anyhow::Result<()> {
     // Challenge clearances are derived from the token: the nodes of a fleet
     // share it, so they accept each other's, and restarts do not void them.
     let waf = Arc::new(edge::waf::Waf::with_secret(token.as_bytes()));
+    // so are TLS session tickets: a visitor the DNS moves to another node resumes there
+    edge::tls::share_tickets(token.as_bytes());
+    if let (Some(cert), Some(key)) = (&args.origin_client_cert, &args.origin_client_key) {
+        let read = |p: &PathBuf| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
+        edge::tls::present_to_origins(&read(cert)?, &read(key)?).map_err(|e| anyhow::anyhow!("--origin-client-cert: {e}"))?;
+    }
     let telemetry = if accel {
         waf.set_outbox_only();
         Arc::new(Telemetry {
@@ -635,6 +665,7 @@ async fn main() -> anyhow::Result<()> {
     let edge = Arc::new(edge);
     // every node, whatever its role, pushes the requests it answered to the zones' log jobs
     edge::reqlog::spawn_push(edge.clone());
+    tokio::spawn(edge.clone().refresh_stale());
     let mut edge_listeners = Vec::new();
     for (what, addr, tls) in [("HTTP", &args.http_listen, false), ("HTTPS", &args.https_listen, true)] {
         if addr == "off" {
@@ -782,8 +813,10 @@ async fn main() -> anyhow::Result<()> {
         h3_front: front,
         edge_ttl: args.edge_ttl.max(1),
         accelerate: accel,
+        rtt: edge.rtt.clone(),
     });
 
+    dns::rrl::configure(args.dns_rrl);
     let mut dns_listeners = Vec::new();
     for addr in &args.dns_listen {
         if accel && !addr.ip().is_loopback() {
@@ -841,7 +874,7 @@ async fn main() -> anyhow::Result<()> {
     // what the nodes report is taken here and kept for the peers: every peer has the whole fleet's
     let reports = {
         let (store, ips, name) = (store.clone(), args.edge_ips.clone(), args.node_name.clone());
-        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
+        Arc::new(reports::Reports::new(edge.stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), move || fleet::self_name(&store, &ips, name.as_deref())))
     };
     if !accel {
         reports.load(&telemetry.reports_path);
@@ -961,6 +994,15 @@ async fn main() -> anyhow::Result<()> {
         // alerts: one sender for the fleet, where the panel runs
         alerts::spawn(store.clone(), fleet.clone(), waf.clone(), edge.clone(), args.edge_ips.clone(), args.node_name.clone());
     }
+    if !accel {
+        // secondaries hear of a changed zone at once
+        tokio::spawn(dns::transfer::notify(store.clone()));
+    }
+    if let Some(path) = args.ban_export.clone() {
+        tokio::spawn(edge::banset::run(store.clone(), path));
+    }
+    // every node checks the origins itself: what it can reach is what it sends requests to
+    tokio::spawn(edge::origins::run(edge.clone()));
     let edge_at_stop = edge.clone();
     let app = api::router(Arc::new(api::ApiState {
         store,
@@ -1157,6 +1199,7 @@ async fn apply_purges(store: Arc<store::Store>, cache: Arc<edge::cache::Cache>) 
             } else {
                 cache.purge_urls(&op.zone_id, &op.files, false);
                 cache.purge_urls(&op.zone_id, &op.prefixes, true);
+                cache.purge_tags(&op.zone_id, &op.tags);
             }
         }
     }

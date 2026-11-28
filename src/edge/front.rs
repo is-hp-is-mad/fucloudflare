@@ -194,7 +194,7 @@ async fn handle(edge: Arc<Edge>, front: SocketAddr, port: u16, req: Request<Inco
     }
     if tls {
         // QUIC is always TLS 1.3, and has no handshake without a server name to speak of
-        req.extensions_mut().insert(TlsInfo { version: "TLSv1.3", sni: true, kex: String::new() });
+        req.extensions_mut().insert(TlsInfo { version: "TLSv1.3", sni: true, kex: String::new(), ja4: String::new() });
         req.extensions_mut().insert(ViaFront);
     }
     req.extensions_mut().insert(super::proxy::ListenerInfo { port, is_proxy: false, is_front: true });

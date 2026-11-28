@@ -42,6 +42,10 @@ const NS_TTL: u32 = 86400;
 const MAX_CNAME_CHAIN: usize = 8;
 /// TTL of addresses answered in place of a CNAME at the apex.
 const FLATTENED_TTL: u32 = 60;
+/// Out of a hundred answers of a `fastest` steering rule, how many go to a
+/// node picked at random: every candidate keeps being measured, and a node
+/// that got faster is found out.
+const EXPLORE_PCT: u8 = 5;
 
 /// Names outside our zones that the CNAMEs at zone apexes lead to.
 fn external_targets(snap: &Snapshot) -> HashSet<String> {
@@ -139,7 +143,8 @@ pub struct Resolver {
     /// Another QUIC server that takes HTTP/3 for us, under its own
     /// certificate: advertised for the names that certificate covers.
     pub h3_front: Option<Arc<crate::edge::front::Front>>,
-    /// TTL of the answers that point at the edge under the CNAME base. A
+    /// TTL of the answers that point at the edge (proxied records: at most
+    /// the usual 300 seconds; names under the CNAME base: as it is). A
     /// node that fails or runs out of allowance keeps getting visitors for
     /// this long; every lookup after it costs a round trip to us.
     pub edge_ttl: u32,
@@ -148,6 +153,38 @@ pub struct Resolver {
     pub limits: Arc<crate::limits::Limits>,
     /// Accelerate nodes suppress public authoritative DNS (only loopback answers).
     pub accelerate: bool,
+    /// What the nodes measured of their visitors' round trips: `fastest` steering rules go by it.
+    pub rtt: Arc<crate::rtt::Rtt>,
+}
+
+/// The queries this node answered for a zone since it started.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct QueryCount {
+    pub total: u64,
+    pub by_type: std::collections::BTreeMap<String, u64>,
+    /// By answer: NOERROR, NXDOMAIN, REFUSED, ...
+    pub by_rcode: std::collections::BTreeMap<String, u64>,
+}
+
+static QUERIES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, QueryCount>>> = std::sync::LazyLock::new(Default::default);
+
+/// What [`QueryCount`] holds for a zone (by its id).
+pub fn query_count(zone_id: &str) -> QueryCount {
+    QUERIES.lock().unwrap().get(zone_id).cloned().unwrap_or_default()
+}
+
+fn counted(zone_id: &str, qtype: u16, rcode: u16) {
+    let answer = match rcode {
+        0 => "NOERROR".to_string(),
+        rcode::NXDOMAIN => "NXDOMAIN".to_string(),
+        rcode::REFUSED => "REFUSED".to_string(),
+        other => format!("RCODE{other}"),
+    };
+    let mut queries = QUERIES.lock().unwrap();
+    let count = queries.entry(zone_id.to_string()).or_default();
+    count.total += 1;
+    *count.by_type.entry(wire::type_name(qtype)).or_default() += 1;
+    *count.by_rcode.entry(answer).or_default() += 1;
 }
 
 /// Edge addresses to hand to one particular client.
@@ -171,7 +208,7 @@ fn ttl_of(r: &Record) -> u32 {
     if r.ttl <= 1 { AUTO_TTL } else { r.ttl }
 }
 
-fn to_rr(r: &Record, owner: &str) -> Option<RR> {
+pub(super) fn to_rr(r: &Record, owner: &str) -> Option<RR> {
     let data = wire::parse_rdata(&r.rtype, &r.content, r.priority).ok()?;
     Some(RR { name: owner.to_string(), ttl: ttl_of(r), data })
 }
@@ -180,7 +217,7 @@ fn parent(name: &str) -> &str {
     name.split_once('.').map(|(_, p)| p).unwrap_or("")
 }
 
-fn soa(z: &ZoneSnap) -> RR {
+pub(super) fn soa(z: &ZoneSnap) -> RR {
     let zone = &z.zone;
     RR {
         name: zone.name.clone(),
@@ -241,6 +278,9 @@ impl Resolver {
             let client = q.ecs.map(|e| e.addr).unwrap_or(peer.to_canonical());
             let mut by_location = false;
             self.answer(&q.qname, q.qtype, client, &mut by_location, &mut resp);
+            if let Some(z) = self.store.snapshot().find_zone(&q.qname) {
+                counted(&z.zone.id, q.qtype, resp.rcode);
+            }
             if resp.do_bit && resp.aa {
                 let snap = self.store.snapshot();
                 if let Some(z) = snap.find_zone(&q.qname) {
@@ -392,24 +432,25 @@ impl Resolver {
             return Edges { v4: Vec::new(), v6: Vec::new(), by_location: true, blocked: true };
         }
         if pool.len() > 1 {
-            for rule in snap.steering.iter().filter(|r| r.action == "route" && r.matches(&loc)) {
-                // Pick the first healthy (and for CN, TCP-unblocked) node independently per IP family.
+            for rule in snap.steering.iter().filter(|r| r.action != "block" && r.matches(&loc)) {
+                let fastest = rule.action == "fastest";
+                // Pick the first healthy (and for CN, TCP-unblocked) node independently per IP family;
+                // for a `fastest` rule, the one that answers the visitor's network soonest.
                 let pick_rule = |v6: bool| -> Option<&EdgeNode> {
-                    let avail: Vec<&EdgeNode> = rule
-                        .nodes
-                        .iter()
-                        .filter_map(|name| pool.iter().copied().find(|n| &n.name == name))
-                        .filter(|n| if v6 { n.ipv6.is_some() } else { n.ipv4.is_some() })
-                        .collect();
+                    let listed: Vec<&EdgeNode> = if fastest && rule.nodes.is_empty() {
+                        pool.clone()
+                    } else {
+                        rule.nodes.iter().filter_map(|name| pool.iter().copied().find(|n| &n.name == name)).collect()
+                    };
+                    let avail: Vec<&EdgeNode> = listed.into_iter().filter(|n| if v6 { n.ipv6.is_some() } else { n.ipv4.is_some() }).collect();
                     if avail.is_empty() {
                         return None;
                     }
-                    if is_cn {
-                        if let Some(n) = avail.iter().copied().find(|n| !tcp_blocked(n, v6)) {
-                            return Some(n);
-                        }
+                    let open: Vec<&EdgeNode> = if is_cn { avail.iter().copied().filter(|n| !tcp_blocked(n, v6)).collect() } else { Vec::new() };
+                    if fastest {
+                        return Some(self.fastest(&loc, if open.is_empty() { &avail } else { &open }, &me));
                     }
-                    avail.first().copied()
+                    open.first().or(avail.first()).copied()
                 };
                 let (n4, n6) = (pick_rule(false), pick_rule(true));
                 if n4.is_some() || n6.is_some() {
@@ -437,6 +478,18 @@ impl Resolver {
             }
         }
         of_list(&pool)
+    }
+
+    /// Of `nodes` (not empty), the one whose visitors from the network at
+    /// `loc` shake hands soonest, as the nodes measured it (see crate::rtt).
+    /// Each in turn while nothing tells them apart, and now and then anyway.
+    fn fastest<'a>(&self, loc: &crate::geo::Location, nodes: &[&'a EdgeNode], me: &str) -> &'a EdgeNode {
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        let any = || nodes[usize::from(roll_pct()) % nodes.len()];
+        match self.rtt.ranking(loc, &names, me) {
+            Some((_, order)) if roll_pct() >= EXPLORE_PCT => nodes.iter().copied().find(|n| n.name == order[0].0).unwrap_or_else(any),
+            _ => any(),
+        }
     }
 
     /// Where decoy names point (see `Settings::decoy_subdomains`): the node
@@ -542,6 +595,14 @@ impl Resolver {
         }
 
         if let Some(cut) = delegation(z, qname) {
+            if qtype == rtype::DS && cut == qname {
+                // the DS of a name this zone delegates is this zone's to answer
+                resp.answers = z.names[cut].iter().filter(|r| r.rtype == "DS").filter_map(|r| to_rr(r, cut)).collect();
+                if resp.answers.is_empty() {
+                    resp.authority.push(soa(z));
+                }
+                return;
+            }
             resp.aa = false;
             resp.authority = z.names[cut].iter().filter(|r| r.rtype == "NS").filter_map(|r| to_rr(r, cut)).collect();
             resp.additional = glue(z, &resp.authority);
@@ -654,7 +715,7 @@ impl Resolver {
         let spectrum = has_edge && z.spectrum_names.contains(node);
         if is_addr && (spectrum || has_edge && !zone.paused && records.iter().any(|r| r.proxied)) {
             // Hide the origin: hand out our edge addresses instead.
-            let rr = |data| RR { name: owner.to_string(), ttl: AUTO_TTL, data };
+            let rr = |data| RR { name: owner.to_string(), ttl: self.edge_ttl.min(AUTO_TTL), data };
             if qtype == rtype::A {
                 out.extend(edges.v4.iter().map(|ip| rr(RData::A(*ip))));
             } else {
@@ -800,6 +861,7 @@ mod tests {
             h3_port: None, h3_front: None, edge_ttl: 60,
             flat: Arc::default(), limits: Arc::default(),
             accelerate: false,
+            rtt: Arc::default(),
         }
     }
 
@@ -969,7 +1031,7 @@ mod tests {
         assert_eq!((m.rcode, m.an), (0, 0));
 
         // without edge nodes configured, proxied records resolve to the origin
-        let plain = Resolver { store: r.store.clone(), edge_v4: vec![], edge_v6: vec![], geo: Arc::new(Geo::default()), health: Arc::default(), cname_base: None, name_servers: vec![], h3_port: None, h3_front: None, edge_ttl: 60, flat: Arc::default(), limits: Arc::default(), accelerate: false };
+        let plain = Resolver { store: r.store.clone(), edge_v4: vec![], edge_v6: vec![], geo: Arc::new(Geo::default()), health: Arc::default(), cname_base: None, name_servers: vec![], h3_port: None, h3_front: None, edge_ttl: 60, flat: Arc::default(), limits: Arc::default(), accelerate: false, rtt: Arc::default() };
         assert!(contains(&ask(&plain, "app.example.com", rtype::A), &[198, 51, 100, 9]));
     }
 
@@ -1050,6 +1112,7 @@ mod tests {
             h3_port: Some(4433), h3_front: None, edge_ttl: 60,
             flat: Arc::default(), limits: Arc::default(),
             accelerate: false,
+            rtt: Arc::default(),
         };
         let from = |peer: IpAddr, name: &str, qtype: u16| {
             let raw = r.handle(&query(1, name, qtype, false), false, peer).unwrap();
@@ -1090,7 +1153,7 @@ mod tests {
         // answers under the CNAME base live as long as configured
         let ttl_of = |raw: &[u8]| u32::from_be_bytes(raw[raw.len() - 10..raw.len() - 6].try_into().unwrap());
         assert_eq!(ttl_of(&from(tokyo, "anything.cdn.example.net", rtype::A).1), 60);
-        let patient = Resolver { store: r.store.clone(), geo: r.geo.clone(), cname_base: r.cname_base.clone(), edge_ttl: 300, edge_v4: vec![], edge_v6: vec![], health: Arc::default(), name_servers: vec![], h3_port: None, h3_front: None, flat: Arc::default(), limits: Arc::default(), accelerate: false };
+        let patient = Resolver { store: r.store.clone(), geo: r.geo.clone(), cname_base: r.cname_base.clone(), edge_ttl: 300, edge_v4: vec![], edge_v6: vec![], health: Arc::default(), name_servers: vec![], h3_port: None, h3_front: None, flat: Arc::default(), limits: Arc::default(), accelerate: false, rtt: Arc::default() };
         let raw = patient.handle(&query(1, "anything.cdn.example.net", rtype::A, false), false, tokyo).unwrap();
         assert_eq!((u16::from_be_bytes([raw[6], raw[7]]), ttl_of(&raw)), (1, 300));
 
@@ -1164,6 +1227,50 @@ mod tests {
         let (an, raw) = from(tokyo, "app.example.com", rtype::A);
         assert!(an == 2 && !has(&raw, 3), "no enabled node serves AS: fall back to all enabled nodes");
         assert_eq!(node_of(ctcc), 2, "a disabled node is skipped in steering rules as well");
+    }
+
+    #[test]
+    fn a_fastest_rule_sends_a_network_to_the_node_that_answers_it_soonest() {
+        use serde_json::json;
+        let store = temp_store();
+        let z = store.create_zone("example.com").unwrap().id;
+        let mut app = rec("app", "A", "198.51.100.9");
+        app.proxied = true;
+        store.create_record(&z, app).unwrap();
+        for (name, ip) in [("a", "203.0.113.1"), ("b", "203.0.113.2"), ("c", "203.0.113.3")] {
+            store.save_node(None, json!({ "name": name, "ipv4": ip, "continents": ["AS"] })).unwrap();
+        }
+        assert!(store.save_steering(None, json!({ "name": "no nodes", "countries": ["CN"], "action": "route" })).is_err());
+        store.save_steering(None, json!({ "name": "cn", "countries": ["CN"], "action": "fastest", "nodes": ["a", "b"] })).unwrap();
+        let visitor: IpAddr = "192.0.2.40".parse().unwrap();
+        let loc = crate::geo::Location { continent: Some("AS".into()), country: Some("CN".into()), region: Some("JS".into()), asn: Some(4134), as_org: None };
+        let mut geo = Geo::default();
+        geo.fixed = [(visitor, loc.clone())].into();
+        let rtt = Arc::new(crate::rtt::Rtt::default());
+        let r = Resolver { store: Arc::new(store), edge_v4: vec![], edge_v6: vec![], geo: Arc::new(geo), health: Arc::default(), cname_base: None, name_servers: vec![], h3_port: None, h3_front: None, edge_ttl: 60, flat: Arc::default(), limits: Arc::default(), accelerate: false, rtt: rtt.clone() };
+        let answered = |r: &Resolver| -> HashSet<[u8; 4]> {
+            (0..400)
+                .map(|i| {
+                    let raw = r.handle(&query(i, "app.example.com", rtype::A, false), false, visitor).unwrap();
+                    raw[raw.len() - 4..].try_into().unwrap()
+                })
+                .collect()
+        };
+        // nothing measured: the candidates of the rule in turn, never the node it does not name
+        assert_eq!(answered(&r), HashSet::from([[203, 0, 113, 1], [203, 0, 113, 2]]));
+        // b answers that network sooner than a (as b told): nearly always b, a now and then to keep measuring it
+        let told = |ms: u64| {
+            let there = crate::rtt::Rtt::default();
+            (0..10).for_each(|_| there.sample(&loc, Duration::from_millis(ms)));
+            there.take_changed()
+        };
+        rtt.merge("a", &told(180));
+        rtt.merge("b", &told(45));
+        let to_b = (0..400).filter(|i| r.handle(&query(*i, "app.example.com", rtype::A, false), false, visitor).unwrap().ends_with(&[203, 0, 113, 2])).count();
+        assert!((340..400).contains(&to_b), "{to_b} of 400 answers went to the faster node");
+        // the answers that point at the edge live as long as configured (at most the usual 300 seconds)
+        let raw = r.handle(&query(1, "app.example.com", rtype::A, false), false, visitor).unwrap();
+        assert_eq!(u32::from_be_bytes(raw[raw.len() - 10..raw.len() - 6].try_into().unwrap()), 60);
     }
 
     #[test]

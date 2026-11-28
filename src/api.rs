@@ -142,6 +142,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/nodes/{node_id}", get(get_node).put(update_node).patch(update_node).delete(delete_node))
         .route("/steering", get(list_steering).post(create_steering))
         .route("/steering/test", get(test_steering))
+        .route("/steering/measured", get(measured_steering))
         .route("/steering/{rule_id}", axum::routing::put(update_steering).patch(update_steering).delete(delete_steering))
         .route("/proxy/rules", get(list_proxy_rules).post(create_proxy_rule))
         .route(
@@ -225,6 +226,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/zones/{zone_id}/logs/requests", get(request_log))
         .merge(crud::<crate::edge::reqlog::LogJob>("/zones/{zone_id}/logpush/jobs"))
         .merge(crud::<crate::edge::waiting::WaitingRoom>("/zones/{zone_id}/waiting_rooms"))
+        .route("/zones/{zone_id}/origins/health", get(origin_health))
+        .route("/zones/{zone_id}/dns_analytics", get(dns_analytics))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -2291,6 +2294,12 @@ struct PurgeBody {
     files: Vec<String>,
     #[serde(default)]
     prefixes: Vec<String>,
+    /// What the origin tagged with one of these in its `Cache-Tag` header.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Everything of these host names (Cloudflare's `hosts`).
+    #[serde(default)]
+    hosts: Vec<String>,
 }
 
 async fn purge_cache(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
@@ -2306,15 +2315,19 @@ async fn purge_warp_cache(State(st): St, bytes: Bytes) -> ApiResult {
 
 /// Drop cached objects of one scope (a zone, or the edge's own) on this
 /// node and, through the configuration, on every other one.
-async fn purge(st: &ApiState, scope: &str, b: PurgeBody) -> ApiResult {
-    if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() {
-        return Err(bad("specify purge_everything, files or prefixes"));
+async fn purge(st: &ApiState, scope: &str, mut b: PurgeBody) -> ApiResult {
+    // a host is the prefix that ends where its paths begin
+    let hosts = std::mem::take(&mut b.hosts);
+    b.prefixes.extend(hosts.iter().map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase()).filter(|h| !h.is_empty()).map(|h| format!("{h}/")));
+    b.tags = b.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() && b.tags.is_empty() {
+        return Err(bad("specify purge_everything, files, prefixes, hosts or tags"));
     }
-    st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone()).await?;
+    st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone(), b.tags.clone()).await?;
     let purged = if b.purge_everything {
         st.cache.purge_zone(scope)
     } else {
-        st.cache.purge_urls(scope, &b.files, false) + st.cache.purge_urls(scope, &b.prefixes, true)
+        st.cache.purge_urls(scope, &b.files, false) + st.cache.purge_urls(scope, &b.prefixes, true) + st.cache.purge_tags(scope, &b.tags)
     };
     ok(json!({ "id": scope, "purged": purged }))
 }
@@ -2904,6 +2917,10 @@ struct TelemetryPush {
     usage: Option<crate::limits::Usage>,
     #[serde(default)]
     status: Value,
+    #[serde(default)]
+    rtt: HashMap<String, crate::rtt::Measure>,
+    #[serde(default)]
+    blocks: Vec<crate::edge::waf::Block>,
 }
 
 #[derive(Deserialize)]
@@ -2967,6 +2984,8 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
                     events: tele.events,
                     usage: tele.usage,
                     status: tele.status,
+                    rtt: tele.rtt,
+                    blocks: tele.blocks,
                 },
                 true,
             );
@@ -3101,6 +3120,8 @@ async fn replication_report(State(st): St, bytes: Bytes) -> ApiResult {
             events: report.events,
             usage: report.usage,
             status: report.status,
+            rtt: Default::default(),
+            blocks: Default::default(),
         },
         true,
     );
@@ -3121,6 +3142,18 @@ async fn list_nodes(State(st): St) -> ApiResult {
         v
     });
     ok(Value::Array(nodes.collect()))
+}
+
+/// The DNS queries this node answered for the zone since it started, by type and by answer.
+async fn dns_analytics(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    ok(serde_json::to_value(crate::dns::resolver::query_count(&zone_id)).unwrap_or_default())
+}
+
+/// What this node's health checks say about the zone's origins (see crate::edge::origins).
+async fn origin_health(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    st.store.get_zone(&zone_id)?;
+    ok(st.edge.origins.report(&zone_id))
 }
 
 async fn list_steering(State(st): St) -> ApiResult {
@@ -3155,11 +3188,22 @@ async fn test_steering(State(st): St, Query(q): Params) -> ApiResult {
         "databases": { "country": geo.has_country_db(), "cn_provinces": geo.has_cn_db() },
         "rule": rule.map(|r| json!({ "id": r.id, "name": r.name, "action": r.action, "nodes": r.nodes, "priority": r.priority })),
         "continent_nodes": continent,
+        // what a `fastest` rule goes by: the nodes that measured this visitor's network, fastest first
+        "measured": st.edge.rtt.ranking(&loc, &snap.nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), &st.node()).map(|(network, order)| json!({
+            "network": network,
+            "nodes": order.iter().map(|(name, ms)| json!({ "name": name, "ms": ms })).collect::<Vec<_>>(),
+        })),
         "reputation": st.edge.reputation.get().map(|r| json!({
             "assessment": r.assess(ip, loc.asn.unwrap_or(0) as i64, loc.as_org.as_deref().unwrap_or(""), q.get("ua").map(String::as_str).unwrap_or("")),
             "lists": r.loaded().into_iter().map(|(name, n)| json!({ "name": name, "networks": n })).collect::<Vec<_>>(),
         })),
     }))
+}
+
+/// The round trips the nodes measured with their visitors, per network
+/// (`CN-JS/4134`, `CN/4134`, `CN-JS`, `CN`) and node: what `fastest` steering rules go by.
+async fn measured_steering(State(st): St) -> ApiResult {
+    ok(st.edge.rtt.table(&st.node()))
 }
 
 async fn create_steering(State(st): St, bytes: Bytes) -> ApiResult {
@@ -3365,7 +3409,7 @@ mod tests {
             front: None,
         });
         Arc::new(ApiState {
-            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), || "au".to_string())),
+            reports: Arc::new(crate::reports::Reports::new(stats.clone(), waf.clone(), fleet.clone(), edge.rtt.clone(), || "au".to_string())),
             store,
             token: "test-token".into(),
             cache,

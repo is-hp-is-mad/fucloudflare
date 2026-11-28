@@ -111,11 +111,20 @@ pub struct RecordOrigin {
     /// http or https, whatever the zone's ssl mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scheme: Option<String>,
+    /// Share of the requests among the addresses of the name (1 to 100; 1 when not given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
 }
 
 impl RecordOrigin {
     pub fn is_empty(&self) -> bool {
         *self == RecordOrigin::default()
+    }
+
+    /// How the origin is reached, whatever its share of the requests: two
+    /// addresses reached the same way can stand in for each other.
+    pub fn way(origin: Option<&RecordOrigin>) -> Option<RecordOrigin> {
+        origin.map(|o| RecordOrigin { weight: None, ..o.clone() }).filter(|o| !o.is_empty())
     }
 
     /// Normalized and checked; nothing if no option is set.
@@ -130,7 +139,11 @@ impl RecordOrigin {
             port: self.port,
             node: self.node.map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()),
             scheme: self.scheme.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()),
+            weight: self.weight,
         };
+        if origin.weight.is_some_and(|w| !(1..=100).contains(&w)) {
+            return invalid("origin.weight must be between 1 and 100");
+        }
         if origin.port == Some(0) {
             return invalid("origin.port must be between 1 and 65535");
         }
@@ -1433,12 +1446,12 @@ impl Store {
     #[allow(dead_code)]
     pub fn add_purge(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>) -> Result<String, StoreError> {
         let z = zone_id.to_string();
-        self.mutate(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes))
+        self.mutate(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes, Vec::new()))
     }
 
-    pub async fn add_purge_async(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>) -> Result<String, StoreError> {
+    pub async fn add_purge_async(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>, tags: Vec<String>) -> Result<String, StoreError> {
         let z = zone_id.to_string();
-        self.mutate_async(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes))
+        self.mutate_async(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes, tags))
             .await
     }
 
@@ -2066,9 +2079,10 @@ fn apply_add_purge(
     everything: bool,
     files: Vec<String>,
     prefixes: Vec<String>,
+    tags: Vec<String>,
 ) -> Result<String, StoreError> {
     let sync = stamp_next(d, clock, sync_node, false);
-    let op = PurgeOp { id: new_id(), zone_id: zone_id.to_string(), everything, files, prefixes, sync };
+    let op = PurgeOp { id: new_id(), zone_id: zone_id.to_string(), everything, files, prefixes, tags, sync };
     d.purges.push(op.clone());
     let excess = d.purges.len().saturating_sub(50);
     d.purges.drain(..excess);

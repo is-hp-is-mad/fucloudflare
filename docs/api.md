@@ -480,7 +480,7 @@ whole, and a new `action` starts without the old action's parameters. `position`
 | Phase | List | Actions and parameters |
 | --- | --- | --- |
 | `http_request_firewall_custom` | firewall rules | `block`, `js_challenge`, `managed_challenge`, `log`, `skip` |
-| `http_ratelimit` | rate limits | `block`, `log`; `ratelimit`: `requests_per_period`, `period`, `mitigation_timeout`, `characteristics` `["cf.colo.id", "ip.src"]` |
+| `http_ratelimit` | rate limits | `block`, `log`; `ratelimit`: `requests_per_period`, `period`, `mitigation_timeout`, `characteristics`, `counting_expression` (see below) |
 | `http_request_dynamic_redirect` | redirect rules | `redirect`; `action_parameters.from_value`: `target_url.value`, `status_code` (required), `preserve_query_string` |
 | `http_request_transform` | transform rules (path) | `rewrite`; `action_parameters.uri.path.value` |
 | `http_request_late_transform` | transform rules (request headers) | `rewrite`; `action_parameters.headers.{name}`: `{"operation": "set", "value"}` or `{"operation": "remove"}` |
@@ -492,6 +492,14 @@ whole, and a new `action` starts without the old action's parameters. `position`
   (`rules[2].action_parameters.uri.query is not supported by this server`), never dropped. A PUT
   either lands whole or not at all.
 - An expression of `true` is every request (stored as an empty expression, shown as `true`).
+- A rate limit's `characteristics` must hold `cf.colo.id` (requests are counted on each node) and
+  may add `ip.src` (the default), `ip.src.asnum`, `ip.geoip.country`, `http.host`,
+  `http.request.uri.path`, `http.request.headers["name"]` and `http.request.cookies["name"]`, at most
+  four besides `cf.colo.id`; they are the rate limit's own `characteristics` (`ip`, `asn`, `country`,
+  `host`, `path`, `header:NAME`, `cookie:NAME`). `counting_expression` can only be the rule's own
+  expression and the response code, `<expression> and http.response.code in {401 403}` (bracketed
+  when the expression has an `or` or `xor`; the code alone for a rule of every request); it becomes
+  `status_codes`. `requests_to_origin` is refused.
 - A `skip` here skips the remaining custom rules, the security level, rate limits and the managed rules,
   so its `action_parameters` must say at least `"ruleset": "current"`, `"phases": ["http_ratelimit",
   "http_request_firewall_managed"]` and `"products": ["securityLevel"]` (or be left out). A narrower

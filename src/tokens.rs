@@ -207,7 +207,7 @@ pub fn need(path: &str) -> Need {
                 "workers" => Area::WorkersRoutes,
                 "email" => Area::EmailRouting,
                 "spectrum" => Area::Spectrum,
-                "analytics" => Area::Analytics,
+                "analytics" | "origins" | "dns_analytics" => Area::Analytics,
                 "logs" | "logpush" => Area::Logs,
                 "waiting_rooms" => Area::WaitingRooms,
                 _ => return Need::Closed,

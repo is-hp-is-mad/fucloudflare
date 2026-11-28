@@ -36,6 +36,8 @@ pub struct ReqInfo {
     pub as_org: String,
     /// How bad the visitor's address looks, 0 (clean) to 100 (see crate::edge::reputation).
     pub threat: i64,
+    /// The JA4 fingerprint of the visitor's TLS ClientHello (see crate::edge::ja4); empty when not known.
+    pub ja4: String,
 }
 
 impl ReqInfo {
@@ -70,6 +72,7 @@ enum Val {
     Continent,
     Asn,
     AsOrg,
+    Ja4,
     Threat,
     Lower(Box<Val>),
     Upper(Box<Val>),
@@ -393,6 +396,7 @@ impl Parser<'_> {
             "ip.geoip.continent" | "ip.src.continent" => Val::Continent,
             "ip.geoip.asnum" | "ip.src.asnum" => Val::Asn,
             "ip.geoip.as_org" => Val::AsOrg,
+            "fcf.ja4" | "cf.bot_management.ja4" => Val::Ja4,
             "fcf.threat_score" | "cf.threat_score" | "ip.threat_score" => Val::Threat,
             "ssl" => Val::Ssl,
             _ => return Err(format!("unknown field '{word}'")),
@@ -473,6 +477,7 @@ impl Val {
             Val::Asn => V::I(r.asn),
             Val::Threat => V::I(r.threat),
             Val::AsOrg => V::S(Cow::Borrowed(&r.as_org)),
+            Val::Ja4 => V::S(Cow::Borrowed(&r.ja4)),
             Val::Ssl => V::B(r.ssl),
             Val::Lower(v) => V::S(Cow::Owned(s(v).to_lowercase())),
             Val::Upper(v) => V::S(Cow::Owned(s(v).to_uppercase())),

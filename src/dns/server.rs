@@ -27,7 +27,15 @@ pub async fn serve_udp(sock: UdpSocket, resolver: Arc<Resolver>) {
             Ok((n, peer)) => {
                 // Lookups are in-memory and non-blocking: answer inline.
                 if let Some(reply) = resolver.handle(&buf[..n], true, peer.ip()) {
-                    let _ = sock.send_to(&reply, peer).await;
+                    // (a sender's address over UDP is not to be trusted: see rrl)
+                    let out = match super::rrl::check(peer.ip(), &reply) {
+                        super::rrl::Verdict::Send => Some(reply),
+                        super::rrl::Verdict::Truncate => super::rrl::truncated(&reply),
+                        super::rrl::Verdict::Drop => None,
+                    };
+                    if let Some(out) = out {
+                        let _ = sock.send_to(&out, peer).await;
+                    }
                 }
             }
             // Windows reports ICMP port-unreachable from earlier sends here.
@@ -78,6 +86,17 @@ async fn tcp_conn(mut stream: TcpStream, resolver: Arc<Resolver>) -> std::io::Re
             Ok(r) => r?,
             Err(_) => return Ok(()),
         };
+        // a zone transfer is several messages
+        if let Some(messages) = super::transfer::axfr(&resolver, &buf, peer) {
+            for m in messages {
+                let framed = [&(m.len() as u16).to_be_bytes()[..], &m].concat();
+                match tokio::time::timeout(TCP_IDLE, stream.write_all(&framed)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Ok(()),
+                }
+            }
+            continue;
+        }
         let Some(reply) = resolver.handle(&buf, false, peer) else { return Ok(()) };
         let mut out = Vec::with_capacity(reply.len() + 2);
         out.extend_from_slice(&(reply.len() as u16).to_be_bytes());

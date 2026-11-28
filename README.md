@@ -139,6 +139,9 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `browser_cache_ttl` | 秒（默认 0） | 边缘会缓存的内容，浏览器缓存时间不足该值时提到该值；0 表示不改源站的 `Cache-Control` |
 | `hsts_max_age` / `hsts_include_subdomains` | 秒（默认 0）/ bool | HTTPS 响应带 `Strict-Transport-Security`；0 表示不发 |
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
+| `origin_check_path` / `origin_check_interval` | 路径（默认空）/ 秒（默认 30） | 源站主动健康检查：每个节点定期请求每个源站地址的这个路径，连续两次失败（无应答或状态码不是 2xx/3xx）的地址排到最后；`GET /zones/{id}/origins/health` 查看本节点的检查结果 |
+| `cache_tier_node` | 节点名（默认空） | 分层缓存：其他节点的 GET/HEAD 请求经这个节点回源（HTTPS，按访客的方式请求它），它的缓存供全机群共用，源站只被它请求；该节点刚失败过时改为直接回源。建议选离源站近的节点 |
+| `session_affinity` | bool（默认关） | 会话保持：同一访客 IP 始终回到同一个源站地址（记录的 `origin.weight`，1–100，决定各地址分到的请求比例） |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
 | `decoy_subdomains` | bool（默认关） | 伪装子域：没有记录的名字也能解析，但边缘不应答（见"伪装子域"） |
 | `auto_firewall` 及 `auto_firewall_*` | 见"自动防火墙" | 按近期安全事件自动封禁地址、网络，或切到受攻击模式 |
@@ -190,6 +193,52 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 **协议选择**：区域设置 `http2` / `http3` 控制向访客提供哪些协议。HTTP/3 开启时，代理主机名的 HTTPS 记录（type 65）
 先通告 `h3`（及其端口），再通告 `h2`，支持的客户端首次连接就能直接走 QUIC。
+
+### DNS：更多记录类型、辅助名称服务器、查询统计
+
+- 记录类型增加 `HTTPS`、`SVCB`（内容如 `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1`）、`TLSA`、`SSHFP`、`DS`（委派出去的子域的 DS）、`NAPTR`、`URI`。
+- 区域设置 `dns_transfer_to`：允许做区域传送（AXFR，仅 TCP）的辅助名称服务器地址或网段；区域变更时向其中的单个地址发 NOTIFY。
+  传给辅助服务器的内容同样隐藏源站：代理的名字给出全部边缘节点的地址（辅助服务器上没有按访客调度）。开启了 DNSSEC 的区域不传送（签名是按查询在线做的）。
+  把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
+- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
+
+### 回源时出示客户端证书
+
+`--origin-client-cert` / `--origin-client-key`（`FUCF_ORIGIN_CLIENT_CERT` / `FUCF_ORIGIN_CLIENT_KEY`，PEM）：回源的 TLS 握手里出示这张证书。
+源站要求并校验客户端证书后，就只接受本机群的回源请求，别人即使知道源站地址也连不上。各节点用同一张证书。
+
+### TLS 指纹（JA4）
+
+每条 TLS 连接的 ClientHello 会算出 JA4 指纹（协议版本、加密套件、扩展、签名算法的组合）：浏览器、命令行工具和攻击工具的指纹各不相同，与它们自称的 User-Agent 无关。
+规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
+经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
+
+### DNS 响应限速与内核层封禁
+
+- `--dns-rrl`（`FUCF_DNS_RRL`，默认 100，0 为关闭）：UDP 上对同一网络（/24、/56）同一名字每秒最多应答这么多次；超出的部分一半以截断（TC）应答，
+  真正的解析器会改用 TCP 重试，其余丢弃。UDP 的来源地址可以伪造，不限速的权威服务器会被用来放大攻击别人。本机回环不限。
+- `--ban-export 文件`（`FUCF_BAN_EXPORT`）：把自动防火墙当前封禁的地址（只含动作为拦截的规则）写成 nftables 脚本，每 30 秒检查、有变化才重写。
+  fucf 自己没有改内核表的权限，也不替你决定封禁覆盖哪些端口：由宿主机用 `nft -f 文件` 加载（例如配一个 systemd path 单元），并自己加丢弃规则，如
+  `nft add chain inet fucf input '{ type filter hook input priority -10; }'` 和 `nft add rule inet fucf input tcp dport { 80, 443 } ip saddr @banned4 drop`。
+  注意同一台机器上的其他服务是否也该被这条规则覆盖。
+
+### 限速的计数方式
+
+- `characteristics`：区分客户端的依据，默认只按 `ip`；可选 `asn`、`country`、`host`、`path`、`header:名称`、`cookie:名称`，最多 4 个，组合成一个计数键（例如 `["header:x-api-key"]` 按 API 密钥限速）。
+- `status_codes`：只统计以这些状态码应答的请求（如 `[401, 403]` 用来挡撞库）。这类规则在应答之后计数，超限的客户端从下一个请求起被拦。
+- 一个客户端在某个节点上被限速（封禁 10 秒以上）后，其他节点随上报得知，也照样拦它；计数本身仍是各节点各算各的。
+
+### 实测调度与故障切换
+
+- 调度规则的动作除了 `route`（按顺序取第一个可用节点）和 `block`，还有 `fastest`：解析到访客所在网络**实测最快**的节点。
+  每个节点记录访客 TLS 1.3 / QUIC 握手的一次往返时间，按网络（国家、省或州、运营商 AS 号，如 `CN-JS/4134`、`CN/4134`、`CN-JS`、`CN`）
+  取滑动平均，随上报传给其他节点；DNS 用最精确且至少两个候选节点都有足够样本（5 次握手、一天以内）的那一级来比较。
+  `nodes` 是候选节点，留空为全部。数据不足时在候选里轮流分配，另有 5% 的应答随机分给其他候选，以便持续测量。
+  `GET /steering/measured` 返回全部实测数据；面板的"定位"会显示某个地址所在网络的实测排名。
+  （TLS 1.2 的握手是两次往返，不计入；经 HTTP/3 前置进来的连接量不到访客的往返时间。）
+- 指向边缘的应答的 TTL 由 `--edge-ttl`（`FUCF_EDGE_TTL`，默认 300 秒）决定，代理记录最多 300 秒：调小后节点故障或超量时访客更快换走，代价是解析次数更多。
+- TLS 会话票据的密钥由机群令牌和时间（每 12 小时一换）导出，所有节点相同：访客被 DNS 换到另一个节点、或节点重启后，
+  仍可恢复会话而不必完整握手。
 
 ## 边缘自身的端点 `/cdn-cgi/`
 
@@ -277,7 +326,9 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
   请求和响应都按消息流式透传（含双向流），响应 trailers（`grpc-status`）原样送达；一次调用没有时长上限，连接靠 HTTP/2 ping 保活。
   边缘自己拒绝或失败的请求（WAF、限流、源站不可达）以 gRPC 状态码返回而不是错误页。gRPC-Web 是普通 HTTP，不走这条路径。
 - 故障转移：一个主机名有多条代理 A/AAAA 记录时轮询；连接被拒的地址 10 秒内排到最后，请求体已缓冲（≤1 MiB）时自动换下一个地址重发。
-- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存。首条匹配生效。
+- 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存；`ignore_query: true` 让缓存键只含路径（不同查询串共用一份）。首条匹配生效。
+- 清除缓存除 `purge_everything`、`files`、`prefixes` 外还可以给 `hosts`：清掉这些主机名下的全部对象；或给 `tags`：清掉源站用 `Cache-Tag` 响应头（逗号分隔）标记过的对象，该响应头不会发给访客。
+- `stale-while-revalidate`：源站的 `Cache-Control` 带 `stale-while-revalidate=N` 时，过期不超过 N 秒（最多一天）的副本先直接返回（`UPDATING`），同时在后台向源站取新副本。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
   遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `fcf-cache-status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`（边缘自己应答的为 `NONE`）。
@@ -418,6 +469,9 @@ DNS 记录的 Cloudflare 兼容补充：
   `phases: [http_ratelimit, http_request_firewall_managed]`、`products: [securityLevel]`（或者不写）；只跳过一部分的 skip 会被拒绝，不会被放宽。
 - 一条同时改路径、请求头、响应头的改写规则会出现在三个阶段里；经某个阶段修改只动那一部分，但表达式、描述和开关是共用的，
   它还在别的阶段时经单个阶段改这几项会被拒绝（请用 `/transform_rules`）。
+- 限速的 `characteristics` 必须带 `cf.colo.id`（每个节点各自计数），另外可以加 `ip.src`（默认）、`ip.src.asnum`、`ip.geoip.country`、`http.host`、
+  `http.request.uri.path`、`http.request.headers["名字"]`、`http.request.cookies["名字"]`；`counting_expression` 只能是规则自己的表达式加响应码，
+  写成 `<表达式> and http.response.code in {401 403}`（表达式里有 `or` 时加括号），存为限速的 `status_codes`。
 - 限速没有优先级，按创建顺序执行：可以在最后追加，不能重排。自动防火墙的规则不显示、不会被替换；回源规则的 `origin_node`、`origin_scheme`
   在 Cloudflare 里没有对应写法，不显示，修改时保持原样。
 - 令牌：带阶段的路径（阶段名或规则集 id）要该阶段对应的权限；列表和 `POST /rulesets` 要 Firewall Services，POST 另外还要该阶段的权限。

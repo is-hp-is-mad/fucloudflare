@@ -15,13 +15,19 @@ pub mod rtype {
     pub const TXT: u16 = 16;
     pub const AAAA: u16 = 28;
     pub const SRV: u16 = 33;
+    pub const NAPTR: u16 = 35;
     pub const OPT: u16 = 41;
     pub const DS: u16 = 43;
+    pub const SSHFP: u16 = 44;
     pub const RRSIG: u16 = 46;
     pub const NSEC: u16 = 47;
     pub const DNSKEY: u16 = 48;
+    pub const TLSA: u16 = 52;
+    pub const SVCB: u16 = 64;
     pub const HTTPS: u16 = 65;
+    pub const AXFR: u16 = 252;
     pub const ANY: u16 = 255;
+    pub const URI: u16 = 256;
     pub const CAA: u16 = 257;
 }
 
@@ -35,7 +41,7 @@ pub mod rcode {
 }
 
 /// Record types users may create through the API.
-pub const SUPPORTED_TYPES: &[&str] = &["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA", "PTR"];
+pub const SUPPORTED_TYPES: &[&str] = &["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA", "PTR", "HTTPS", "SVCB", "TLSA", "SSHFP", "DS", "NAPTR", "URI"];
 
 pub fn type_from_str(s: &str) -> Option<u16> {
     Some(match s {
@@ -49,8 +55,27 @@ pub fn type_from_str(s: &str) -> Option<u16> {
         "AAAA" => rtype::AAAA,
         "SRV" => rtype::SRV,
         "CAA" => rtype::CAA,
+        "HTTPS" => rtype::HTTPS,
+        "SVCB" => rtype::SVCB,
+        "TLSA" => rtype::TLSA,
+        "SSHFP" => rtype::SSHFP,
+        "DS" => rtype::DS,
+        "NAPTR" => rtype::NAPTR,
+        "URI" => rtype::URI,
         _ => return None,
     })
+}
+
+/// The name of a record type, for people (`TYPE99` for one without a name here).
+pub fn type_name(t: u16) -> String {
+    let named = SUPPORTED_TYPES.iter().chain(&["SOA"]).find(|name| type_from_str(name) == Some(t));
+    match (named, t) {
+        (Some(name), _) => name.to_string(),
+        (_, rtype::ANY) => "ANY".into(),
+        (_, rtype::DNSKEY) => "DNSKEY".into(),
+        (_, rtype::AXFR) => "AXFR".into(),
+        _ => format!("TYPE{t}"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,8 +110,18 @@ pub enum RData {
     /// NSEC (RFC 4034 §4).
     Nsec { next_domain: String, types: Vec<u16> },
     /// DS (RFC 4034 §5).
-    #[allow(dead_code)]
     Ds { key_tag: u16, algorithm: u8, digest_type: u8, digest: Vec<u8> },
+    /// A service binding the zone holds itself (RFC 9460): SVCB, or HTTPS when
+    /// `https`; `params` are (key, value as on the wire), in ascending key order.
+    Svcb { https: bool, priority: u16, target: String, params: Vec<(u16, Vec<u8>)> },
+    /// TLSA (RFC 6698).
+    Tlsa { usage: u8, selector: u8, matching: u8, data: Vec<u8> },
+    /// SSHFP (RFC 4255).
+    Sshfp { algorithm: u8, fp_type: u8, fingerprint: Vec<u8> },
+    /// NAPTR (RFC 3403).
+    Naptr { order: u16, preference: u16, flags: String, services: String, regexp: String, replacement: String },
+    /// URI (RFC 7553).
+    Uri { priority: u16, weight: u16, target: String },
 }
 
 impl RData {
@@ -108,6 +143,12 @@ impl RData {
             RData::Rrsig { .. } => rtype::RRSIG,
             RData::Nsec { .. } => rtype::NSEC,
             RData::Ds { .. } => rtype::DS,
+            RData::Svcb { https: true, .. } => rtype::HTTPS,
+            RData::Svcb { .. } => rtype::SVCB,
+            RData::Tlsa { .. } => rtype::TLSA,
+            RData::Sshfp { .. } => rtype::SSHFP,
+            RData::Naptr { .. } => rtype::NAPTR,
+            RData::Uri { .. } => rtype::URI,
         }
     }
 }
@@ -200,6 +241,98 @@ fn num<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, String> {
     s.parse().map_err(|_| format!("invalid {what}: '{s}'"))
 }
 
+/// Hexadecimal digits (spaces between them allowed) as bytes.
+fn unhex(s: &str, what: &str) -> Result<Vec<u8>, String> {
+    let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if digits.is_empty() || digits.len() % 2 != 0 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(format!("{what} must be an even number of hexadecimal digits"));
+    }
+    let nibble = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+    Ok(digits.chunks(2).map(|pair| nibble(pair[0]) << 4 | nibble(pair[1])).collect())
+}
+
+/// The words of a record's content; a word in double quotes may hold spaces
+/// (and `\"` for a quote).
+fn words(s: &str) -> Result<Vec<String>, String> {
+    let (mut out, mut word, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if quoted => word.push(chars.next().ok_or("a backslash ends the content")?),
+            '"' => (quoted, any) = (!quoted, true),
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut word));
+                    any = false;
+                }
+            }
+            c => {
+                word.push(c);
+                any = true;
+            }
+        }
+    }
+    if quoted {
+        return Err("a double quote is not closed".into());
+    }
+    if any {
+        out.push(word);
+    }
+    Ok(out)
+}
+
+/// The parameters of a service binding (`alpn=h2,h3 port=443 ipv4hint=… ech=…`), as on the wire.
+fn svc_params(given: &[String]) -> Result<Vec<(u16, Vec<u8>)>, String> {
+    let mut params = Vec::new();
+    for word in given {
+        let (key, value) = word.split_once('=').unwrap_or((word, ""));
+        let list = || value.split(',').map(str::trim).filter(|v| !v.is_empty());
+        let param = match key {
+            "alpn" => {
+                let mut ids = Vec::new();
+                for id in list() {
+                    if id.len() > 255 {
+                        return Err("an alpn id is at most 255 bytes".into());
+                    }
+                    ids.push(id.len() as u8);
+                    ids.extend_from_slice(id.as_bytes());
+                }
+                (1, ids)
+            }
+            "no-default-alpn" if value.is_empty() => (2, Vec::new()),
+            "port" => (3, num::<u16>(value, "port")?.to_be_bytes().to_vec()),
+            "ipv4hint" => {
+                let mut out = Vec::new();
+                for ip in list() {
+                    out.extend_from_slice(&ip.parse::<Ipv4Addr>().map_err(|_| format!("'{ip}' is not an IPv4 address"))?.octets());
+                }
+                (4, out)
+            }
+            "ech" => {
+                use base64::Engine;
+                (5, base64::engine::general_purpose::STANDARD.decode(value).map_err(|_| "ech must be base64")?)
+            }
+            "ipv6hint" => {
+                let mut out = Vec::new();
+                for ip in list() {
+                    out.extend_from_slice(&ip.parse::<Ipv6Addr>().map_err(|_| format!("'{ip}' is not an IPv6 address"))?.octets());
+                }
+                (6, out)
+            }
+            other => return Err(format!("unknown service parameter '{other}' (alpn, no-default-alpn, port, ipv4hint, ipv6hint, ech)")),
+        };
+        if param.1.is_empty() && param.0 != 2 {
+            return Err(format!("the service parameter '{key}' needs a value"));
+        }
+        params.push(param);
+    }
+    params.sort_by_key(|(key, _)| *key);
+    if params.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("a service parameter is given twice".into());
+    }
+    Ok(params)
+}
+
 /// Convert API-level `(type, content, priority)` into wire RDATA.
 pub fn parse_rdata(rtype: &str, content: &str, priority: Option<u16>) -> Result<RData, String> {
     let c = content.trim();
@@ -238,6 +371,58 @@ pub fn parse_rdata(rtype: &str, content: &str, priority: Option<u16>) -> Result<
             }
             let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
             RData::Caa { flags, tag, value: value.as_bytes().to_vec() }
+        }
+        "HTTPS" | "SVCB" => {
+            let f = words(c)?;
+            if f.len() < 2 {
+                return Err("content must be 'priority target [parameters]', e.g. '1 . alpn=h2,h3'".into());
+            }
+            let params = svc_params(&f[2..])?;
+            let priority: u16 = num(&f[0], "priority")?;
+            if priority == 0 && !params.is_empty() {
+                return Err("priority 0 (an alias) takes no parameters".into());
+            }
+            RData::Svcb { https: rtype == "HTTPS", priority, target: if f[1] == "." { String::new() } else { normalize_name(&f[1])? }, params }
+        }
+        "TLSA" => {
+            let f: Vec<&str> = c.splitn(4, char::is_whitespace).collect();
+            let [usage, selector, matching, data] = f[..] else { return Err("TLSA content must be 'usage selector matching-type data'".into()) };
+            RData::Tlsa { usage: num(usage, "TLSA usage")?, selector: num(selector, "TLSA selector")?, matching: num(matching, "TLSA matching type")?, data: unhex(data, "TLSA data")? }
+        }
+        "SSHFP" => {
+            let f: Vec<&str> = c.splitn(3, char::is_whitespace).collect();
+            let [algorithm, fp_type, fingerprint] = f[..] else { return Err("SSHFP content must be 'algorithm type fingerprint'".into()) };
+            RData::Sshfp { algorithm: num(algorithm, "SSHFP algorithm")?, fp_type: num(fp_type, "SSHFP type")?, fingerprint: unhex(fingerprint, "SSHFP fingerprint")? }
+        }
+        "DS" => {
+            let f: Vec<&str> = c.splitn(4, char::is_whitespace).collect();
+            let [key_tag, algorithm, digest_type, digest] = f[..] else { return Err("DS content must be 'key-tag algorithm digest-type digest'".into()) };
+            RData::Ds { key_tag: num(key_tag, "DS key tag")?, algorithm: num(algorithm, "DS algorithm")?, digest_type: num(digest_type, "DS digest type")?, digest: unhex(digest, "DS digest")? }
+        }
+        "NAPTR" => {
+            let f = words(c)?;
+            let [order, preference, flags, services, regexp, replacement] = &f[..] else {
+                return Err("NAPTR content must be 'order preference \"flags\" \"services\" \"regexp\" replacement'".into());
+            };
+            if [flags, services, regexp].iter().any(|s| s.len() > 255) {
+                return Err("NAPTR flags, services and regexp are at most 255 bytes each".into());
+            }
+            RData::Naptr {
+                order: num(order, "NAPTR order")?,
+                preference: num(preference, "NAPTR preference")?,
+                flags: flags.clone(),
+                services: services.clone(),
+                regexp: regexp.clone(),
+                replacement: if replacement == "." { String::new() } else { normalize_name(replacement)? },
+            }
+        }
+        "URI" => {
+            let f = words(c)?;
+            let [priority, weight, target] = &f[..] else { return Err("URI content must be 'priority weight \"target\"'".into()) };
+            if target.is_empty() {
+                return Err("a URI record needs a target".into());
+            }
+            RData::Uri { priority: num(priority, "URI priority")?, weight: num(weight, "URI weight")?, target: target.clone() }
         }
         other => return Err(format!("unsupported record type '{other}'")),
     })
@@ -531,6 +716,36 @@ impl Writer {
                 self.u8(*digest_type);
                 self.buf.extend_from_slice(digest);
             }
+            RData::Svcb { priority, target, params, .. } => {
+                self.u16(*priority);
+                self.name(target, false);
+                for (key, value) in params {
+                    self.u16(*key);
+                    self.u16(value.len() as u16);
+                    self.buf.extend_from_slice(value);
+                }
+            }
+            RData::Tlsa { usage, selector, matching, data } => {
+                self.buf.extend_from_slice(&[*usage, *selector, *matching]);
+                self.buf.extend_from_slice(data);
+            }
+            RData::Sshfp { algorithm, fp_type, fingerprint } => {
+                self.buf.extend_from_slice(&[*algorithm, *fp_type]);
+                self.buf.extend_from_slice(fingerprint);
+            }
+            RData::Naptr { order, preference, flags, services, regexp, replacement } => {
+                self.u16(*order);
+                self.u16(*preference);
+                self.chars(flags.as_bytes());
+                self.chars(services.as_bytes());
+                self.chars(regexp.as_bytes());
+                self.name(replacement, false);
+            }
+            RData::Uri { priority, weight, target } => {
+                self.u16(*priority);
+                self.u16(*weight);
+                self.buf.extend_from_slice(target.as_bytes());
+            }
         }
         let rdlen = (self.buf.len() - len_pos - 2) as u16;
         self.buf[len_pos..len_pos + 2].copy_from_slice(&rdlen.to_be_bytes());
@@ -656,6 +871,36 @@ pub fn canonical_rdata(data: &RData) -> Vec<u8> {
             w.u8(*algorithm);
             w.u8(*digest_type);
             w.buf.extend_from_slice(digest);
+        }
+        RData::Svcb { priority, target, params, .. } => {
+            w.u16(*priority);
+            cname(&mut w, target);
+            for (key, value) in params {
+                w.u16(*key);
+                w.u16(value.len() as u16);
+                w.buf.extend_from_slice(value);
+            }
+        }
+        RData::Tlsa { usage, selector, matching, data } => {
+            w.buf.extend_from_slice(&[*usage, *selector, *matching]);
+            w.buf.extend_from_slice(data);
+        }
+        RData::Sshfp { algorithm, fp_type, fingerprint } => {
+            w.buf.extend_from_slice(&[*algorithm, *fp_type]);
+            w.buf.extend_from_slice(fingerprint);
+        }
+        RData::Naptr { order, preference, flags, services, regexp, replacement } => {
+            w.u16(*order);
+            w.u16(*preference);
+            w.chars(flags.as_bytes());
+            w.chars(services.as_bytes());
+            w.chars(regexp.as_bytes());
+            cname(&mut w, replacement);
+        }
+        RData::Uri { priority, weight, target } => {
+            w.u16(*priority);
+            w.u16(*weight);
+            w.buf.extend_from_slice(target.as_bytes());
         }
     }
     w.buf
@@ -808,6 +1053,33 @@ mod tests {
         let b = resp.encode(512);
         assert_eq!(b.len(), 12);
         assert_ne!(b[2] & 0x02, 0);
+    }
+
+    #[test]
+    fn the_newer_record_types_are_read_and_put_on_the_wire() {
+        let wire = |rtype: &str, content: &str| canonical_rdata(&parse_rdata(rtype, content, None).unwrap());
+        // RFC 9460: priority, target ".", alpn (key 1) then port (key 3), whatever the order they are given in
+        assert_eq!(wire("HTTPS", "1 . port=8443 alpn=h2,h3"), [0, 1, 0, 0, 1, 0, 6, 2, b'h', b'2', 2, b'h', b'3', 0, 3, 0, 2, 0x20, 0xfb]);
+        assert_eq!(wire("SVCB", "0 svc.example.net."), [&[0, 0][..], &canonical_name("svc.example.net")].concat());
+        assert_eq!(wire("HTTPS", "1 . ipv4hint=192.0.2.1,192.0.2.2 no-default-alpn alpn=h3")[3..], [0, 1, 0, 3, 2, b'h', b'3', 0, 2, 0, 0, 0, 4, 0, 8, 192, 0, 2, 1, 192, 0, 2, 2]);
+        for bad in ["1", "1 . alpn=h2 alpn=h3", "0 . alpn=h2", "1 . nonsense=1", "1 . port=", "1 . ipv4hint=2001:db8::1"] {
+            assert!(parse_rdata("HTTPS", bad, None).is_err(), "{bad}");
+        }
+        assert_eq!(parse_rdata("HTTPS", "1 .", None).unwrap().rtype(), rtype::HTTPS);
+        assert_eq!(parse_rdata("SVCB", "1 .", None).unwrap().rtype(), rtype::SVCB);
+        assert_eq!(wire("TLSA", "3 1 1 0A0b 0c"), [3, 1, 1, 0x0a, 0x0b, 0x0c]);
+        assert_eq!(wire("SSHFP", "4 2 ff00"), [4, 2, 0xff, 0x00]);
+        assert_eq!(wire("DS", "2371 13 2 abcd"), [0x09, 0x43, 13, 2, 0xab, 0xcd]);
+        assert!(parse_rdata("TLSA", "3 1 1 abc", None).is_err() && parse_rdata("DS", "1 13 2", None).is_err() && parse_rdata("SSHFP", "4 2 xyz1", None).is_err());
+        assert_eq!(wire("URI", "10 1 \"https://example.com/a b\""), [&[0, 10, 0, 1][..], b"https://example.com/a b"].concat());
+        assert_eq!(
+            wire("NAPTR", "100 10 \"u\" \"E2U+sip\" \"!^.*$!sip:info@example.com!\" ."),
+            [&[0, 100, 0, 10, 1, b'u', 7][..], b"E2U+sip", &[27], b"!^.*$!sip:info@example.com!", &[0]].concat()
+        );
+        assert!(parse_rdata("NAPTR", "100 10 \"u\" \"E2U+sip\" .", None).is_err() && parse_rdata("URI", "10 1 \"open", None).is_err());
+        for t in SUPPORTED_TYPES {
+            assert!(type_from_str(t).is_some(), "{t}");
+        }
     }
 
     #[test]

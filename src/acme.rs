@@ -1066,6 +1066,7 @@ mod tests {
             flat: Arc::default(),
             limits: Arc::default(),
             accelerate: false,
+            rtt: Arc::default(),
         });
 
         let ca_key = rcgen::KeyPair::generate().unwrap();
