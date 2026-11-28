@@ -431,7 +431,9 @@ test("Linux.do Connect OAuth2 login and account page Kumo UI + CSP", async () =>
     const html = await accRes.text();
     assert.ok(html.includes("LinuxDo User"));
     assert.ok(html.includes("data-mode"));
-    assert.ok(html.includes("#f6821f"));
+    assert.ok(html.includes("#d97757"), "the panel's clay accent");
+    assert.ok(html.includes('data-l="zh"') && html.includes('data-l="en"'), "both languages");
+    assert.ok(html.includes("通行密钥") && html.includes("Passkeys"));
   } finally {
     globalThis.fetch = origFetch;
   }

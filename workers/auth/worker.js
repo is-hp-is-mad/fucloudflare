@@ -764,332 +764,181 @@ async function listConfiguredOAuthProviders(env) {
   return providers;
 }
 
-// ---- Cloudflare @cloudflare/kumo Design System UI ----
+// ---- UI: the fucloudflare panel's look (warm neutrals, clay, serif titles) ----
 
-const KUMO_CSS = `
-:root {
-  --cf-canvas: #fafafa;
-  --cf-base: #ffffff;
-  --cf-elevated: #f7f7f7;
-  --cf-recessed: #f2f2f2;
-  --cf-control: #ffffff;
-  --cf-tint: #f5f5f5;
-  --cf-line: rgba(20, 20, 20, 0.12);
-  --cf-hairline: #e6e6e6;
-  --cf-text: #1d1d20;
-  --cf-text-strong: #0a0a0b;
-  --cf-text-subtle: #66666d;
-  --cf-brand-orange: #f6821f;
-  --cf-brand-blue: #056dff;
-  --cf-brand-blue-hover: #0051cc;
-  --cf-danger: #d92d20;
-  --cf-danger-tint: rgba(217, 45, 32, 0.08);
-  --cf-success: #079455;
-  --cf-success-tint: rgba(7, 148, 85, 0.1);
-  --cf-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
-}
-:root[data-mode="dark"] {
-  --cf-canvas: #121214;
-  --cf-base: #19191c;
-  --cf-elevated: #202024;
-  --cf-recessed: #141416;
-  --cf-control: #222227;
-  --cf-tint: #26262c;
-  --cf-line: rgba(255, 255, 255, 0.12);
-  --cf-hairline: #2a2a30;
-  --cf-text: #ededf0;
-  --cf-text-strong: #ffffff;
-  --cf-text-subtle: #9e9ea7;
-  --cf-brand-orange: #f6821f;
-  --cf-brand-blue: #3b82f6;
-  --cf-brand-blue-hover: #2563eb;
-  --cf-danger: #f87171;
-  --cf-danger-tint: rgba(248, 113, 113, 0.12);
-  --cf-success: #34d399;
-  --cf-success-tint: rgba(52, 211, 153, 0.12);
-  --cf-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  min-height: 100vh;
-  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background: var(--cf-canvas);
-  color: var(--cf-text);
-  font-size: 14px;
-  line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
-}
-.cf-topbar {
-  height: 56px;
-  background: var(--cf-base);
-  border-bottom: 1px solid var(--cf-line);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 20px;
-}
-.cf-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 600;
-  color: var(--cf-text-strong);
-  text-decoration: none;
-  font-size: 15px;
-}
-.cf-logo {
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
-  background: var(--cf-brand-orange);
-  display: grid;
-  place-items: center;
-  color: #fff;
-  font-weight: 700;
-  font-size: 13px;
-}
-.cf-theme-switch {
-  display: inline-flex;
-  background: var(--cf-recessed);
-  border: 1px solid var(--cf-line);
-  border-radius: 6px;
-  padding: 2px;
-  gap: 2px;
-}
-.cf-theme-switch button {
-  border: 0;
-  background: transparent;
-  color: var(--cf-text-subtle);
-  padding: 4px 9px;
-  border-radius: 4px;
-  font-size: 12px;
-  cursor: pointer;
-  font-weight: 500;
-}
-.cf-theme-switch button.active {
-  background: var(--cf-base);
-  color: var(--cf-text-strong);
-  box-shadow: var(--cf-shadow);
-}
-.cf-main {
-  max-width: 440px;
-  margin: 40px auto;
-  padding: 0 16px;
-}
-.cf-main.wide { max-width: 780px; }
-.cf-card {
-  background: var(--cf-base);
-  border: 1px solid var(--cf-line);
-  border-radius: 10px;
-  padding: 24px;
-  box-shadow: var(--cf-shadow);
-  margin-bottom: 16px;
-}
-.cf-title {
-  margin: 0 0 6px;
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--cf-text-strong);
-}
-.cf-sub {
-  margin: 0 0 20px;
-  color: var(--cf-text-subtle);
-  font-size: 13px;
-}
-.cf-label {
-  display: block;
-  font-size: 12px;
-  font-weight: 600;
-  margin-bottom: 6px;
-  color: var(--cf-text-strong);
-}
-.cf-input {
-  width: 100%;
-  height: 38px;
-  padding: 0 12px;
-  border: 1px solid var(--cf-line);
-  border-radius: 6px;
-  background: var(--cf-control);
-  color: var(--cf-text);
-  font-size: 14px;
-  margin-bottom: 14px;
-}
-.cf-input:focus {
-  outline: 2px solid var(--cf-brand-blue);
-  outline-offset: -1px;
-}
-.cf-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  height: 38px;
-  padding: 0 16px;
-  border-radius: 6px;
-  border: 1px solid var(--cf-line);
-  background: var(--cf-control);
-  color: var(--cf-text-strong);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  text-decoration: none;
-  width: 100%;
-  margin-bottom: 10px;
-}
-.cf-btn:hover { background: var(--cf-tint); }
-.cf-btn-primary {
-  background: var(--cf-brand-blue);
-  border-color: var(--cf-brand-blue);
-  color: #fff;
-}
-.cf-btn-primary:hover { background: var(--cf-brand-blue-hover); }
-.cf-btn-orange {
-  background: var(--cf-brand-orange);
-  border-color: var(--cf-brand-orange);
-  color: #fff;
-}
-.cf-btn-orange:hover { opacity: 0.92; }
-.cf-btn-danger {
-  color: var(--cf-danger);
-  border-color: var(--cf-line);
-  width: auto;
-  height: 32px;
-  padding: 0 12px;
-  font-size: 12px;
-  margin: 0;
-}
-.cf-btn-sm {
-  width: auto;
-  height: 32px;
-  padding: 0 12px;
-  font-size: 12px;
-  margin: 0;
-}
-.cf-divider {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--cf-text-subtle);
-  font-size: 12px;
-  margin: 14px 0;
-}
-.cf-divider::before, .cf-divider::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--cf-line);
-}
-.cf-alert {
-  padding: 10px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  margin-bottom: 14px;
-  background: var(--cf-danger-tint);
-  color: var(--cf-danger);
-  border: 1px solid var(--cf-line);
-}
-.cf-alert-ok {
-  background: var(--cf-success-tint);
-  color: var(--cf-success);
-}
-.cf-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--cf-hairline);
-  gap: 12px;
-}
-.cf-row:last-child { border-bottom: 0; }
-.cf-badge {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  background: var(--cf-tint);
-  border: 1px solid var(--cf-line);
-  color: var(--cf-text-subtle);
-}
-.cf-tabs {
-  display: flex;
-  gap: 4px;
-  border-bottom: 1px solid var(--cf-line);
-  margin-bottom: 16px;
-}
-.cf-tab {
-  border: 0;
-  background: transparent;
-  padding: 8px 12px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--cf-text-subtle);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-}
-.cf-tab.active {
-  color: var(--cf-brand-blue);
-  border-bottom-color: var(--cf-brand-blue);
-}
-.hidden { display: none !important; }
+const UI_CSS = `
+:root{color-scheme:light;
+  --g000:#fff;--g050:#faf9f5;--g100:#f5f4ed;--g150:#f0eee6;--g200:#e8e6dc;--g250:#dedcd1;--g300:#d1cfc5;--g400:#b0aea5;--g450:#9c9a92;
+  --g500:#87867f;--g600:#5e5d59;--g650:#4d4c48;--g700:#3d3d3a;--g750:#30302e;--g800:#262624;--g850:#1f1e1d;--g950:#141413;
+  --clay:#d97757;--clay-hover:#c6613f;--clay-dark:#c46849;--ease:cubic-bezier(.165,.85,.45,1);
+  --canvas:var(--g050);--base:var(--g000);--tint:var(--g150);--control:var(--g000);--interact:var(--g250);
+  --line:var(--g300);--hairline:var(--g200);--hover:var(--g150);
+  --fg:var(--g950);--strong:var(--g950);--sub:var(--g600);--placeholder:var(--g450);--link:#b4532e;
+  --pri-bg:var(--g950);--pri-fg:var(--g050);
+  --ok:#3f6b2a;--ok-tint:rgba(120,140,93,.16);--bad:#b53b30;--bad-fill:#bf4d43;--bad-tint:rgba(191,77,67,.1);
+  --info-tint:rgba(217,119,87,.12);
+  --shadow:0 2px 8px rgba(0,0,0,.04);
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Hiragino Sans GB","Noto Sans SC","Microsoft YaHei",sans-serif;
+  --serif:ui-serif,"Iowan Old Style","Palatino Linotype",Georgia,"Songti SC","Noto Serif SC","Source Han Serif SC",serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Consolas,monospace}
+:root[data-mode="dark"]{color-scheme:dark;
+  --canvas:var(--g800);--base:var(--g750);--tint:var(--g700);--control:var(--g750);--interact:var(--g650);
+  --line:var(--g650);--hairline:var(--g700);--hover:var(--g800);
+  --fg:var(--g100);--strong:var(--g050);--sub:var(--g400);--placeholder:var(--g500);--link:#e5937a;
+  --pri-bg:var(--g050);--pri-fg:var(--g950);
+  --ok:#a9c48a;--ok-tint:rgba(143,174,110,.18);--bad:#f0877b;--bad-fill:#c9574c;--bad-tint:rgba(201,87,76,.2);
+  --info-tint:rgba(217,119,87,.18);--shadow:0 2px 8px rgba(0,0,0,.2)}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100dvh;overflow-x:clip}
+body{font:14px/1.55 var(--sans);background:var(--canvas);color:var(--fg);-webkit-font-smoothing:antialiased}
+html[data-lang=zh] [data-l=en],html[data-lang=en] [data-l=zh]{display:none}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline;text-underline-offset:3px}
+.hidden{display:none!important}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;height:56px;padding:0 20px;border-bottom:1px solid var(--hairline)}
+.brand{display:flex;align-items:center;gap:10px;color:var(--strong);font:500 17px/1 var(--serif);letter-spacing:-.01em;text-decoration:none}
+.brand:hover{text-decoration:none}
+.mark{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:var(--clay);color:#fff;flex:none}
+.tools{display:flex;align-items:center;gap:4px}
+main{width:min(30rem,100%);margin:0 auto;padding:40px 16px 64px}
+main.wide{width:min(46rem,100%)}
+h1{font:500 28px/1.2 var(--serif);letter-spacing:-.015em;color:var(--strong);margin:0 0 6px}
+h2{font:500 19px/1.3 var(--serif);letter-spacing:-.01em;color:var(--strong);margin:0}
+.sub{color:var(--sub);font-size:13.5px;margin:0 0 20px}
+.card{background:var(--base);border:1px solid var(--hairline);border-radius:16px;box-shadow:var(--shadow);margin-bottom:18px}
+.card>.hd{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid var(--hairline)}
+.card>.bd{padding:6px 20px}
+.login{background:var(--base);border:.5px solid var(--line);border-radius:32px;padding:32px 28px;
+  box-shadow:0 4px 24px rgba(0,0,0,.016),0 4px 32px rgba(0,0,0,.016),0 2px 64px rgba(0,0,0,.012),0 16px 32px rgba(0,0,0,.012)}
+.stack{display:grid;gap:10px}
+button,.btn{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;height:36px;padding:0 16px;border:0;border-radius:.6rem;
+  background:var(--control);color:var(--fg);font:500 14px/1 var(--sans);cursor:pointer;white-space:nowrap;text-decoration:none;-webkit-user-select:none;user-select:none;
+  backface-visibility:hidden;box-shadow:0 0 0 0 var(--control),0 0 0 1px var(--line);
+  transition:color .1s ease-in-out,background-color .2s ease-in-out,box-shadow .2s ease-in-out,transform .15s var(--ease)}
+button:hover,.btn:hover{text-decoration:none;color:var(--strong);box-shadow:0 0 0 1px var(--control),0 0 0 2px var(--line)}
+button:active:not(:disabled),.btn:active{transform:scale(.985)}
+button:focus-visible,.btn:focus-visible{outline:2px solid var(--clay-dark);outline-offset:3px}
+button:disabled{opacity:.5;cursor:not-allowed}
+.pri,.danger{overflow:hidden;background:var(--pri-bg);color:var(--pri-fg);box-shadow:none;will-change:transform}
+.pri::after,.danger::after{content:"";position:absolute;inset:0;opacity:0;transform:translateY(8px);background:radial-gradient(at bottom,rgba(255,255,255,.2),transparent);transition:opacity .2s,transform .2s;pointer-events:none}
+.pri:hover:not(:disabled),.danger:hover:not(:disabled){color:var(--pri-fg);box-shadow:none;transform:scaleY(1.015) scaleX(1.005)}
+.pri:hover::after,.danger:hover::after{opacity:1;transform:translateY(0)}
+.danger,.danger:hover:not(:disabled){background:var(--bad-fill);color:#fff}
+.outbad{background:transparent;color:var(--bad);box-shadow:0 0 0 1px color-mix(in srgb,var(--bad-fill) 55%,transparent)}
+.outbad:hover:not(:disabled){color:var(--bad);background:var(--bad-tint);box-shadow:0 0 0 2px color-mix(in srgb,var(--bad-fill) 55%,transparent)}
+.ghost{background:transparent;box-shadow:none;color:var(--sub);padding:0 10px}
+.ghost:hover:not(:disabled){background:var(--hover);box-shadow:none;color:var(--strong)}
+.sm{height:30px;padding:0 12px;font-size:13px;border-radius:8px}
+.wide-btn{width:100%;height:44px;font-size:15px}
+.brandbtn{background:var(--clay-hover);color:#fff;box-shadow:none;overflow:hidden}
+.brandbtn:hover:not(:disabled){color:#fff;box-shadow:0 0 0 2px var(--clay-hover)}
+.divider{display:flex;align-items:center;gap:12px;margin:20px 0;color:var(--placeholder);font-size:12.5px}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--hairline)}
+.tabs{display:flex;gap:4px;padding:4px;border-radius:12px;background:var(--tint);margin-bottom:16px}
+.tab{flex:1;height:32px;background:transparent;box-shadow:none;color:var(--sub);font-size:13.5px;border-radius:9px}
+.tab:hover:not(:disabled){background:transparent;box-shadow:none;color:var(--strong)}
+.tab.on,.tab.on:hover{background:var(--base);color:var(--strong);box-shadow:0 1px 3px rgba(0,0,0,.08),0 0 0 .5px var(--line)}
+label{display:block;font-size:13px;font-weight:500;color:var(--strong);margin:12px 0 6px}
+input{width:100%;height:40px;padding:0 12px;border:1px solid var(--line);border-radius:.6rem;background:var(--control);color:var(--fg);font:14px/1.4 var(--sans);transition:border-color .2s}
+input::placeholder{color:var(--placeholder)}
+input:hover:not(:focus){border-color:var(--interact)}
+input:focus{outline:1px solid var(--clay-dark);outline-offset:2px;border-color:var(--clay-dark)}
+form .wide-btn{margin-top:18px}
+.alert{padding:11px 14px;border-radius:12px;margin-bottom:14px;font-size:13.5px;background:var(--bad-tint);color:var(--bad);border:1px solid color-mix(in srgb,var(--bad-fill) 30%,transparent)}
+.alert.ok{background:var(--ok-tint);color:var(--ok);border-color:color-mix(in srgb,var(--ok) 30%,transparent)}
+.tag{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:500;background:var(--tint);color:var(--sub);white-space:nowrap;vertical-align:1px}
+.tag.ok{background:var(--ok-tint);color:var(--ok)}
+.tag.pri{background:color-mix(in srgb,var(--clay) 14%,transparent);color:var(--clay-hover)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;border-bottom:1px solid var(--hairline)}
+.row:last-child{border-bottom:0}
+.row b{display:block;font-weight:500;color:var(--strong)}
+.row small{display:block;margin-top:2px;color:var(--sub);font-size:12.5px;overflow-wrap:anywhere}
+.mono{font-family:var(--mono);font-size:12px}
+.empty{padding:18px 0;color:var(--sub);font-size:13.5px}
+.who{display:flex;align-items:center;gap:14px}
+.avatar{display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:color-mix(in srgb,var(--clay) 16%,transparent);color:var(--clay-hover);font:500 18px/1 var(--serif);flex:none}
+.scopes{list-style:none;margin:0 0 22px;padding:0;border:1px solid var(--hairline);border-radius:12px}
+.scopes li{padding:12px 14px;border-bottom:1px solid var(--hairline)}
+.scopes li:last-child{border-bottom:0}
+.scopes code{font-family:var(--mono);font-size:12px;color:var(--sub)}
+.actions{display:flex;gap:10px}.actions button{flex:1;height:42px}
+.app{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.app i{display:grid;place-items:center;width:40px;height:40px;border-radius:10px;background:var(--tint);color:var(--sub);font:500 16px/1 var(--serif);font-style:normal}
+.foot{margin-top:18px;text-align:center;font-size:12.5px;color:var(--placeholder)}
+@media (max-width:520px){.login{border-radius:24px;padding:26px 20px}main{padding-top:24px}.top{padding:0 12px}.hide-sm{display:none}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 `;
 
-const THEME_SCRIPT = `
-(function() {
-  function applyTheme(mode) {
-    var m = mode || localStorage.getItem("cf_theme") || "auto";
-    var dark = m === "dark" || (m === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
-    document.documentElement.setAttribute("data-mode", dark ? "dark" : "light");
-    document.querySelectorAll(".cf-theme-switch button").forEach(function(b) {
-      b.classList.toggle("active", b.getAttribute("data-theme") === m);
-    });
-  }
-  window.__setTheme = function(m) {
-    localStorage.setItem("cf_theme", m);
-    applyTheme(m);
-  };
-  applyTheme();
-  if (window.matchMedia) {
-    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function() {
-      if ((localStorage.getItem("cf_theme") || "auto") === "auto") applyTheme("auto");
-    });
-  }
-})();
-`;
+// Both languages; CSS shows the chosen one.
+function t(zh, en) {
+  return `<span data-l="zh">${escapeHtml(zh)}</span><span data-l="en">${escapeHtml(en)}</span>`;
+}
+
+const MARK_SVG = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true"><path d="M6.5 18h11a3.2 3.2 0 0 0 .4-6.37A4.8 4.8 0 0 0 8.8 10.2a3.5 3.5 0 0 0-3.4 2.75A2.7 2.7 0 0 0 6.5 18z"/></svg>';
+const KEY_SVG = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3M14 9l2 2"/></svg>';
+
+// Theme and language before first paint; then the switches.
+const HEAD_SCRIPT = `(function(){var d=document.documentElement;
+try{var m=localStorage.getItem("cf_theme")||"auto";var dk=m==="dark"||(m==="auto"&&matchMedia("(prefers-color-scheme:dark)").matches);d.setAttribute("data-mode",dk?"dark":"light");
+var l=localStorage.getItem("fucf_lang");if(l!=="zh"&&l!=="en")l=/^zh/i.test(navigator.language||"zh")?"zh":"en";d.setAttribute("data-lang",l);d.lang=l==="en"?"en":"zh-CN";}catch(e){d.setAttribute("data-mode","light");d.setAttribute("data-lang","zh");}})();`;
+
+const SWITCH_SCRIPT = `(function(){var d=document.documentElement;
+var order=["auto","light","dark"],names={auto:["跟随系统","Auto"],light:["浅色","Light"],dark:["深色","Dark"]};
+function mode(){try{return localStorage.getItem("cf_theme")||"auto"}catch(e){return "auto"}}
+function paint(){var m=mode(),dk=m==="dark"||(m==="auto"&&matchMedia("(prefers-color-scheme:dark)").matches);d.setAttribute("data-mode",dk?"dark":"light");
+var b=document.getElementById("theme");if(b)b.innerHTML='<span data-l="zh">'+names[m][0]+'</span><span data-l="en">'+names[m][1]+'</span>';}
+window.__setTheme=function(m){try{localStorage.setItem("cf_theme",m)}catch(e){}paint()};
+var tb=document.getElementById("theme");if(tb)tb.onclick=function(){__setTheme(order[(order.indexOf(mode())+1)%3])};
+var lb=document.getElementById("lang");if(lb)lb.onclick=function(){var n=d.getAttribute("data-lang")==="en"?"zh":"en";d.setAttribute("data-lang",n);d.lang=n==="en"?"en":"zh-CN";try{localStorage.setItem("fucf_lang",n)}catch(e){}};
+matchMedia("(prefers-color-scheme:dark)").addEventListener("change",function(){if(mode()==="auto")paint()});paint();
+window.L=function(zh,en){return d.getAttribute("data-lang")==="en"?en:zh};})();`;
 
 function renderShell(title, bodyHtml, { wide = false, navRight = "" } = {}) {
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN" data-lang="zh" data-mode="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(title)} — fucloudflare Auth</title>
-<style>${KUMO_CSS}</style>
-<script>(function(){var m=localStorage.getItem("cf_theme")||"auto";var d=m==="dark"||(m==="auto"&&window.matchMedia&&window.matchMedia("(prefers-color-scheme:dark)").matches);document.documentElement.setAttribute("data-mode",d?"dark":"light");})();</script>
+<meta name="color-scheme" content="light dark">
+<title>${escapeHtml(title)} · fucloudflare</title>
+<style>${UI_CSS}</style>
+<script>${HEAD_SCRIPT}</script>
 </head>
 <body>
-<header class="cf-topbar">
-  <a class="cf-brand" href="/account">
-    <span class="cf-logo">fc</span>
-    <span>fucloudflare Auth</span>
-  </a>
-  <div style="display:flex;align-items:center;gap:12px;">
+<header class="top">
+  <a class="brand" href="/account"><span class="mark">${MARK_SVG}</span><span>fucloudflare <span class="hide-sm" style="color:var(--sub)">${t("账户", "Account")}</span></span></a>
+  <div class="tools">
     ${navRight}
-    <div class="cf-theme-switch" role="group" aria-label="Theme">
-      <button type="button" data-theme="light" onclick="__setTheme('light')">Light</button>
-      <button type="button" data-theme="dark" onclick="__setTheme('dark')">Dark</button>
-      <button type="button" data-theme="auto" onclick="__setTheme('auto')">Auto</button>
-    </div>
+    <button type="button" class="ghost sm" id="lang" aria-label="Language / 语言"><span data-l="zh">English</span><span data-l="en">中文</span></button>
+    <button type="button" class="ghost sm" id="theme" aria-label="Theme / 主题">${t("跟随系统", "Auto")}</button>
   </div>
 </header>
-<main class="cf-main${wide ? " wide" : ""}">
-  ${bodyHtml}
+<main class="${wide ? "wide" : ""}">
+${bodyHtml}
 </main>
-<script>${THEME_SCRIPT}</script>
+<script>${SWITCH_SCRIPT}</script>
 </body>
 </html>`;
 }
+
+// What the browser side of WebAuthn needs on every page that uses it.
+const B64U_SCRIPT = `
+  function b64uToBuf(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    var bin = atob(s), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  function bufToB64u(buf) {
+    var u8 = new Uint8Array(buf), s = "";
+    for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+  }
+  // a challenge is either base64url bytes or a text token
+  function challengeBuf(c) {
+    if (/^[A-Za-z0-9_-]+$/.test(c)) { try { return b64uToBuf(c); } catch (e) {} }
+    return new TextEncoder().encode(c).buffer;
+  }`;
 
 function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
   const nextTarget = pendingId
@@ -1097,48 +946,51 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
     : safeReturnTo(returnTo, "/account");
 
   const oauthButtons = providers.map((p) => {
-    const cls = p.id === "linuxdo" ? "cf-btn cf-btn-orange" : "cf-btn";
     const qs = new URLSearchParams();
     qs.set("return_to", nextTarget);
-    return `<a class="${cls}" href="/login/oauth/${encodeURIComponent(p.id)}?${qs.toString()}">Continue with ${escapeHtml(p.name)}</a>`;
+    const cls = p.id === "linuxdo" ? "btn wide-btn brandbtn" : "btn wide-btn";
+    return `<a class="${cls}" href="/login/oauth/${encodeURIComponent(p.id)}?${qs.toString()}">${t(`使用 ${p.name} 继续`, `Continue with ${p.name}`)}</a>`;
   }).join("\n");
 
   const body = `
-<div class="cf-card">
-  <h1 class="cf-title">Sign in to fucloudflare</h1>
-  <p class="cf-sub">Single Sign-On &amp; OAuth 2.0 Identity Provider</p>
-  <div id="auth-err" class="cf-alert${errorMsg ? "" : " hidden"}">${escapeHtml(errorMsg || "")}</div>
+<div class="login">
+  <h1>${t("登录 fucloudflare", "Sign in to fucloudflare")}</h1>
+  <p class="sub">${t("一个账户登录面板及所有接入的应用。", "One account for the dashboard and every connected app.")}</p>
+  <div id="auth-err" class="alert${errorMsg ? "" : " hidden"}" role="alert">${escapeHtml(errorMsg || "")}</div>
 
-  <button type="button" id="btn-passkey" class="cf-btn cf-btn-primary">Sign in with Passkey</button>
-  ${oauthButtons}
+  <div class="stack">
+    <button type="button" id="btn-passkey" class="pri wide-btn">${KEY_SVG}${t("使用通行密钥登录", "Sign in with a passkey")}</button>
+    ${oauthButtons}
+  </div>
 
-  <div class="cf-divider">or use email &amp; password</div>
+  <div class="divider">${t("或使用邮箱和密码", "or use email and password")}</div>
 
-  <div class="cf-tabs">
-    <button type="button" class="cf-tab active" id="tab-login">Sign In</button>
-    <button type="button" class="cf-tab" id="tab-register">Create Account</button>
+  <div class="tabs" role="tablist">
+    <button type="button" class="tab on" id="tab-login" role="tab">${t("登录", "Sign in")}</button>
+    <button type="button" class="tab" id="tab-register" role="tab">${t("注册", "Create account")}</button>
   </div>
 
   <form id="form-login">
-    <label class="cf-label" for="login-id">Email or Username</label>
-    <input class="cf-input" id="login-id" name="identifier" required autocomplete="username">
-    <label class="cf-label" for="login-pw">Password</label>
-    <input class="cf-input" id="login-pw" name="password" type="password" required autocomplete="current-password">
-    <button type="submit" class="cf-btn cf-btn-primary">Sign In</button>
+    <label for="login-id">${t("邮箱或用户名", "Email or username")}</label>
+    <input id="login-id" name="identifier" required autocomplete="username webauthn">
+    <label for="login-pw">${t("密码", "Password")}</label>
+    <input id="login-pw" name="password" type="password" required autocomplete="current-password">
+    <button type="submit" class="pri wide-btn">${t("登录", "Sign in")}</button>
   </form>
 
   <form id="form-register" class="hidden">
-    <label class="cf-label" for="reg-email">Email</label>
-    <input class="cf-input" id="reg-email" name="email" type="email" required autocomplete="email">
-    <label class="cf-label" for="reg-user">Username</label>
-    <input class="cf-input" id="reg-user" name="username" required autocomplete="username">
-    <label class="cf-label" for="reg-name">Display Name</label>
-    <input class="cf-input" id="reg-name" name="name" autocomplete="name">
-    <label class="cf-label" for="reg-pw">Password (min 8 chars)</label>
-    <input class="cf-input" id="reg-pw" name="password" type="password" minlength="8" required autocomplete="new-password">
-    <button type="submit" class="cf-btn cf-btn-primary">Create Account</button>
+    <label for="reg-email">${t("邮箱", "Email")}</label>
+    <input id="reg-email" name="email" type="email" required autocomplete="email">
+    <label for="reg-user">${t("用户名", "Username")}</label>
+    <input id="reg-user" name="username" required autocomplete="username">
+    <label for="reg-name">${t("显示名称（可选）", "Display name (optional)")}</label>
+    <input id="reg-name" name="name" autocomplete="name">
+    <label for="reg-pw">${t("密码（至少 8 位）", "Password (at least 8 characters)")}</label>
+    <input id="reg-pw" name="password" type="password" minlength="8" required autocomplete="new-password">
+    <button type="submit" class="pri wide-btn">${t("创建账户", "Create account")}</button>
   </form>
 </div>
+<p class="foot">${t("由 fucloudflare 提供的 OAuth 2.0 / OpenID Connect 登录", "OAuth 2.0 / OpenID Connect sign-in by fucloudflare")}</p>
 <script>
 (function() {
   var nextUrl = ${JSON.stringify(nextTarget)};
@@ -1147,143 +999,129 @@ function renderLoginPage({ providers, returnTo, pendingId, errorMsg }) {
     errBox.textContent = msg;
     errBox.classList.remove("hidden");
   }
-  function b64uToBuf(s) {
-    s = s.replace(/-/g, "+").replace(/_/g, "/");
-    while (s.length % 4) s += "=";
-    var bin = atob(s), out = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out.buffer;
-  }
-  function bufToB64u(buf) {
-    var u8 = new Uint8Array(buf), s = "";
-    for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-    return btoa(s).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
-  }
+  ${B64U_SCRIPT}
+  function busy(btn, on) { btn.disabled = on; }
 
-  document.getElementById("tab-login").onclick = function() {
-    this.classList.add("active");
-    document.getElementById("tab-register").classList.remove("active");
-    document.getElementById("form-login").classList.remove("hidden");
-    document.getElementById("form-register").classList.add("hidden");
-  };
-  document.getElementById("tab-register").onclick = function() {
-    this.classList.add("active");
-    document.getElementById("tab-login").classList.remove("active");
-    document.getElementById("form-register").classList.remove("hidden");
-    document.getElementById("form-login").classList.add("hidden");
-  };
+  function pick(login) {
+    document.getElementById("tab-login").classList.toggle("on", login);
+    document.getElementById("tab-register").classList.toggle("on", !login);
+    document.getElementById("form-login").classList.toggle("hidden", !login);
+    document.getElementById("form-register").classList.toggle("hidden", login);
+    errBox.classList.add("hidden");
+  }
+  document.getElementById("tab-login").onclick = function() { pick(true); };
+  document.getElementById("tab-register").onclick = function() { pick(false); };
+
+  async function post(path, data) {
+    var r = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(data) });
+    var d = {};
+    try { d = await r.json(); } catch (e) {}
+    return { ok: r.ok, d: d };
+  }
 
   document.getElementById("form-login").onsubmit = async function(e) {
     e.preventDefault();
     errBox.classList.add("hidden");
-    var r = await fetch("/login/password", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+    var btn = this.querySelector("button[type=submit]"); busy(btn, true);
+    try {
+      var res = await post("/login/password", {
         identifier: document.getElementById("login-id").value,
         password: document.getElementById("login-pw").value,
         return_to: nextUrl
-      })
-    });
-    var d = await r.json();
-    if (!r.ok) return showErr(d.error || "Sign in failed");
-    location.href = d.redirect || nextUrl;
+      });
+      if (!res.ok) return showErr(res.d.error || L("登录失败", "Sign in failed"));
+      location.href = res.d.redirect || nextUrl;
+    } finally { busy(btn, false); }
   };
 
   document.getElementById("form-register").onsubmit = async function(e) {
     e.preventDefault();
     errBox.classList.add("hidden");
-    var r = await fetch("/register", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+    var btn = this.querySelector("button[type=submit]"); busy(btn, true);
+    try {
+      var res = await post("/register", {
         email: document.getElementById("reg-email").value,
         username: document.getElementById("reg-user").value,
         name: document.getElementById("reg-name").value,
         password: document.getElementById("reg-pw").value,
         return_to: nextUrl
-      })
-    });
-    var d = await r.json();
-    if (!r.ok) return showErr(d.error || "Registration failed");
-    location.href = d.redirect || nextUrl;
+      });
+      if (!res.ok) return showErr(res.d.error || L("注册失败", "Registration failed"));
+      location.href = res.d.redirect || nextUrl;
+    } finally { busy(btn, false); }
   };
 
   document.getElementById("btn-passkey").onclick = async function() {
     errBox.classList.add("hidden");
-    if (!window.PublicKeyCredential) return showErr("Passkeys are not supported in this browser.");
+    if (!window.PublicKeyCredential) return showErr(L("这个浏览器不支持通行密钥。", "This browser does not support passkeys."));
+    var btn = this; busy(btn, true);
     try {
-      var beginRes = await fetch("/login/passkey/begin", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({})
-      });
-      var beginData = await beginRes.json();
-      if (!beginRes.ok) return showErr(beginData.error || "Passkey init failed");
+      var begin = await post("/login/passkey/begin", {});
+      if (!begin.ok) return showErr(begin.d.error || L("无法开始通行密钥登录", "Could not start passkey sign-in"));
+      var beginData = begin.d;
       var pk = beginData.publicKey;
-      pk.challenge = b64uToBuf(pk.challenge);
+      pk.challenge = challengeBuf(pk.challenge);
       if (pk.allowCredentials) {
         pk.allowCredentials = pk.allowCredentials.map(function(c) {
           return Object.assign({}, c, { id: b64uToBuf(c.id) });
         });
       }
       var cred = await navigator.credentials.get({ publicKey: pk });
-      var finRes = await fetch("/login/passkey/finish", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          challenge_id: beginData.challenge_id,
-          id: cred.id,
-          rawId: bufToB64u(cred.rawId),
-          response: {
-            clientDataJSON: bufToB64u(cred.response.clientDataJSON),
-            authenticatorData: bufToB64u(cred.response.authenticatorData),
-            signature: bufToB64u(cred.response.signature),
-            userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null
-          },
-          return_to: nextUrl
-        })
+      var fin = await post("/login/passkey/finish", {
+        challenge_id: beginData.challenge_id,
+        id: cred.id,
+        rawId: bufToB64u(cred.rawId),
+        response: {
+          clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+          authenticatorData: bufToB64u(cred.response.authenticatorData),
+          signature: bufToB64u(cred.response.signature),
+          userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null
+        },
+        return_to: nextUrl
       });
-      var finData = await finRes.json();
-      if (!finRes.ok) return showErr(finData.error || "Passkey verification failed");
-      location.href = finData.redirect || nextUrl;
+      if (!fin.ok) return showErr(fin.d.error || L("通行密钥验证失败", "Passkey verification failed"));
+      location.href = fin.d.redirect || nextUrl;
     } catch (err) {
-      showErr(err && err.message ? err.message : "Passkey authentication cancelled");
-    }
+      showErr(err && err.name === "NotAllowedError" ? L("已取消或超时。", "Cancelled or timed out.") : (err && err.message) || L("通行密钥登录已取消", "Passkey sign-in cancelled"));
+    } finally { busy(btn, false); }
   };
 })();
 </script>
 `;
-  return renderShell("Sign In", body);
+  return renderShell("登录 Sign in", body);
 }
 
 function renderConsentPage({ client, user, scope, pendingId, csrfToken = "" }) {
   const scopes = scope.split(/\s+/).filter(Boolean);
   const scopeDesc = {
-    openid: "Verify your identity (OpenID)",
-    profile: "Read your name, username, and avatar",
-    email: "Read your email address",
-    offline_access: "Maintain access when you are offline (refresh token)",
+    openid: ["确认你的身份", "Confirm who you are (OpenID)"],
+    profile: ["读取你的名称、用户名和头像", "Read your name, username and avatar"],
+    email: ["读取你的邮箱地址", "Read your email address"],
+    offline_access: ["在你离线时保持访问（刷新令牌）", "Keep access while you are away (refresh token)"],
   };
-  const items = scopes.map((s) => `<li style="margin-bottom:6px;"><strong>${escapeHtml(s)}</strong> — ${escapeHtml(scopeDesc[s] || "Access requested scope")}</li>`).join("");
+  const items = scopes.map((s) => {
+    const [zh, en] = scopeDesc[s] || ["访问所请求的权限", "Access the requested scope"];
+    return `<li>${t(zh, en)}<br><code>${escapeHtml(s)}</code></li>`;
+  }).join("");
+  const initial = escapeHtml((client.name || "?").trim().slice(0, 1).toUpperCase());
 
   const body = `
-<div class="cf-card">
-  <h1 class="cf-title">Authorize ${escapeHtml(client.name)}</h1>
-  <p class="cf-sub">Signed in as <strong>${escapeHtml(user.email || user.username || user.id)}</strong></p>
-  <p style="font-size:13px;margin-bottom:10px;">This application is requesting permission to:</p>
-  <ul style="padding-left:18px;margin:0 0 20px;font-size:13px;color:var(--cf-text-subtle);">
-    ${items}
-  </ul>
-  <form method="POST" action="/authorize/consent">
+<div class="login">
+  <div class="app"><i>${initial}</i><div><b style="color:var(--strong);font-weight:500">${escapeHtml(client.name)}</b><br><small style="color:var(--sub)">${t("请求访问你的 fucloudflare 账户", "wants to access your fucloudflare account")}</small></div></div>
+  <h1>${t(`授权 ${client.name}`, `Authorize ${client.name}`)}</h1>
+  <p class="sub">${t("当前登录：", "Signed in as ")}<b style="color:var(--strong);font-weight:500">${escapeHtml(user.email || user.username || user.id)}</b></p>
+  <p style="margin:0 0 10px;font-size:13.5px">${t("它将能够：", "It will be able to:")}</p>
+  <ul class="scopes">${items}</ul>
+  <form method="POST" action="/authorize/consent" class="actions">
     <input type="hidden" name="pending_id" value="${escapeHtml(pendingId)}">
     <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
-    <button type="submit" name="decision" value="allow" class="cf-btn cf-btn-primary">Allow Access</button>
-    <button type="submit" name="decision" value="deny" class="cf-btn">Deny</button>
+    <button type="submit" name="decision" value="deny">${t("拒绝", "Deny")}</button>
+    <button type="submit" name="decision" value="allow" class="pri">${t("允许", "Allow")}</button>
   </form>
 </div>
+<p class="foot">${t("授权后可随时在账户页撤销会话。", "You can revoke access any time from your account page.")}</p>
 `;
-  return renderShell("Authorize Application", body);
+  return renderShell("授权 Authorize", body);
 }
 
 function renderAccountPage({ user, passkeys, identities, sessions, allProviders, csrfToken = "" }) {
@@ -1292,114 +1130,91 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
 
   const passkeyRows = passkeys.length
     ? passkeys.map((pk) => `
-      <div class="cf-row">
-        <div>
-          <div style="font-weight:600;">${escapeHtml(pk.name)}</div>
-          <div style="font-size:12px;color:var(--cf-text-subtle);">ID: ${escapeHtml(pk.id.slice(0, 16))}… · Uses: ${pk.sign_count}</div>
-        </div>
-        <button type="button" class="cf-btn cf-btn-danger" data-action="del-passkey" data-id="${escapeHtml(pk.id)}">Remove</button>
+      <div class="row">
+        <div><b>${escapeHtml(pk.name)}</b><small><span class="mono">${escapeHtml(pk.id.slice(0, 16))}…</span> · ${t(`已使用 ${pk.sign_count} 次`, `used ${pk.sign_count} times`)}</small></div>
+        <button type="button" class="outbad sm" data-action="del-passkey" data-id="${escapeHtml(pk.id)}">${t("删除", "Remove")}</button>
       </div>`).join("")
-    : `<p class="cf-sub" style="margin:0;">No passkeys registered yet.</p>`;
+    : `<p class="empty">${t("还没有通行密钥。添加一个，下次用指纹、面容或安全密钥直接登录。", "No passkeys yet. Add one to sign in with your fingerprint, face or security key.")}</p>`;
 
   const identityRows = allProviders.map((p) => {
     const linked = linkedMap[p.id];
     if (linked) {
       return `
-      <div class="cf-row">
-        <div>
-          <div style="font-weight:600;">${escapeHtml(p.name)} <span class="cf-badge">Connected</span></div>
-          <div style="font-size:12px;color:var(--cf-text-subtle);">${escapeHtml(linked.username || linked.email || linked.provider_user_id)}</div>
-        </div>
-        <button type="button" class="cf-btn cf-btn-danger" data-action="unlink-provider" data-id="${escapeHtml(p.id)}">Unlink</button>
+      <div class="row">
+        <div><b>${escapeHtml(p.name)} <span class="tag ok">${t("已连接", "Connected")}</span></b><small>${escapeHtml(linked.username || linked.email || linked.provider_user_id)}</small></div>
+        <button type="button" class="outbad sm" data-action="unlink-provider" data-id="${escapeHtml(p.id)}">${t("解除绑定", "Unlink")}</button>
       </div>`;
     }
     return `
-      <div class="cf-row">
-        <div><div style="font-weight:600;">${escapeHtml(p.name)}</div></div>
-        <a class="cf-btn cf-btn-sm" href="/login/oauth/${encodeURIComponent(p.id)}?return_to=%2Faccount">Connect</a>
+      <div class="row">
+        <div><b>${escapeHtml(p.name)}</b><small>${t("未连接", "Not connected")}</small></div>
+        <a class="btn sm" href="/login/oauth/${encodeURIComponent(p.id)}?return_to=%2Faccount">${t("连接", "Connect")}</a>
       </div>`;
-  }).join("") || `<p class="cf-sub" style="margin:0;">No external OAuth2 providers configured.</p>`;
+  }).join("") || `<p class="empty">${t("还没有配置第三方登录。", "No external sign-in providers are configured.")}</p>`;
 
   const sessionRows = sessions.map((s) => `
-    <div class="cf-row">
-      <div>
-        <div style="font-weight:600;">Session ${escapeHtml(s.sid.slice(0, 10))}… ${s.current ? '<span class="cf-badge">Current</span>' : ""}</div>
-        <div style="font-size:12px;color:var(--cf-text-subtle);">${escapeHtml(s.ip || "Unknown IP")} · ${escapeHtml((s.ua || "Browser").slice(0, 56))}</div>
-      </div>
-      <button type="button" class="cf-btn cf-btn-danger" data-action="revoke-session" data-id="${escapeHtml(s.sid)}">Revoke</button>
+    <div class="row">
+      <div><b><span class="mono">${escapeHtml(s.sid.slice(0, 10))}…</span> ${s.current ? `<span class="tag pri">${t("当前", "This device")}</span>` : ""}</b>
+        <small>${escapeHtml(s.ip || "?")} · ${escapeHtml((s.ua || "Browser").slice(0, 72))}</small></div>
+      <button type="button" class="outbad sm" data-action="revoke-session" data-id="${escapeHtml(s.sid)}">${s.current ? t("退出", "Sign out") : t("撤销", "Revoke")}</button>
     </div>
-  `).join("") || `<p class="cf-sub" style="margin:0;">No active sessions.</p>`;
+  `).join("") || `<p class="empty">${t("没有活动会话。", "No active sessions.")}</p>`;
 
+  const display = user.name || user.username || user.email || "";
   const body = `
-<div class="cf-card">
-  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-    <div>
-      <h1 class="cf-title">${escapeHtml(user.name || user.username || user.email)}</h1>
-      <p class="cf-sub" style="margin:0;">${escapeHtml(user.email || "")} · Role: <span class="cf-badge">${escapeHtml(user.role)}</span></p>
-    </div>
-    <form method="POST" action="/logout" style="margin:0;">
-      <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
-      <button type="submit" class="cf-btn cf-btn-sm">Sign Out</button>
-    </form>
-  </div>
+<div class="card"><div class="hd">
+  <div class="who"><span class="avatar">${escapeHtml(display.trim().slice(0, 1).toUpperCase() || "?")}</span>
+    <div><h1 style="font-size:24px;margin:0">${escapeHtml(display)}</h1>
+    <p class="sub" style="margin:2px 0 0">${escapeHtml(user.email || "")} <span class="tag">${escapeHtml(user.role)}</span></p></div></div>
+  <form method="POST" action="/logout" style="margin:0">
+    <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+    <button type="submit" class="sm">${t("退出登录", "Sign out")}</button>
+  </form>
+</div></div>
+
+<div class="card">
+  <div class="hd"><h2>${t("通行密钥", "Passkeys")}</h2><button type="button" id="btn-add-pk" class="pri sm">${t("添加通行密钥", "Add a passkey")}</button></div>
+  <div class="bd"><div id="pk-msg" class="alert hidden" style="margin-top:12px"></div>${passkeyRows}</div>
 </div>
 
-<div class="cf-card">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-    <h2 style="margin:0;font-size:16px;">Passkeys (WebAuthn)</h2>
-    <button type="button" id="btn-add-pk" class="cf-btn cf-btn-primary cf-btn-sm">Add Passkey</button>
-  </div>
-  <div id="pk-msg" class="cf-alert hidden"></div>
-  ${passkeyRows}
+<div class="card">
+  <div class="hd"><h2>${t("已连接的账户", "Connected accounts")}</h2></div>
+  <div class="bd">${identityRows}</div>
 </div>
 
-<div class="cf-card">
-  <h2 style="margin:0 0 12px;font-size:16px;">Connected Identities</h2>
-  ${identityRows}
-</div>
-
-<div class="cf-card">
-  <h2 style="margin:0 0 12px;font-size:16px;">Active Sessions</h2>
-  ${sessionRows}
+<div class="card">
+  <div class="hd"><h2>${t("登录会话", "Sessions")}</h2></div>
+  <div class="bd">${sessionRows}</div>
 </div>
 
 <script>
 (function() {
   var csrfToken = ${JSON.stringify(csrfToken)};
-  function b64uToBuf(s) {
-    s = s.replace(/-/g, "+").replace(/_/g, "/");
-    while (s.length % 4) s += "=";
-    var bin = atob(s), out = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out.buffer;
-  }
-  function bufToB64u(buf) {
-    var u8 = new Uint8Array(buf), s = "";
-    for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-    return btoa(s).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
-  }
+  ${B64U_SCRIPT}
   var msgEl = document.getElementById("pk-msg");
   function showMsg(txt, ok) {
     msgEl.textContent = txt;
-    msgEl.className = "cf-alert" + (ok ? " cf-alert-ok" : "");
+    msgEl.className = "alert" + (ok ? " ok" : "");
   }
 
   document.getElementById("btn-add-pk").onclick = async function() {
-    if (!window.PublicKeyCredential) return showMsg("WebAuthn not supported in this browser.");
+    if (!window.PublicKeyCredential) return showMsg(L("这个浏览器不支持通行密钥。", "This browser does not support passkeys."));
+    var btn = this; btn.disabled = true;
     try {
       var r1 = await fetch("/register/passkey/begin", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: "{}" });
       var d1 = await r1.json();
-      if (!r1.ok) return showMsg(d1.error || "Failed to start passkey registration");
+      if (!r1.ok) return showMsg(d1.error || L("无法开始添加通行密钥", "Could not start adding a passkey"));
       var pk = d1.publicKey;
-      pk.challenge = b64uToBuf(pk.challenge);
+      pk.challenge = challengeBuf(pk.challenge);
       pk.user.id = b64uToBuf(pk.user.id);
+      if (pk.excludeCredentials) pk.excludeCredentials = pk.excludeCredentials.map(function(c) { return Object.assign({}, c, { id: b64uToBuf(c.id) }); });
       var cred = await navigator.credentials.create({ publicKey: pk });
       var r2 = await fetch("/register/passkey/finish", {
         method: "POST",
         headers: { "content-type": "application/json", "x-csrf-token": csrfToken },
         body: JSON.stringify({
           challenge_id: d1.challenge_id,
-          name: "Passkey (" + new Date().toISOString().slice(0, 10) + ")",
+          name: L("通行密钥", "Passkey") + " (" + new Date().toISOString().slice(0, 10) + ")",
           id: cred.id,
           rawId: bufToB64u(cred.rawId),
           response: {
@@ -1409,33 +1224,33 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
         })
       });
       var d2 = await r2.json();
-      if (!r2.ok) return showMsg(d2.error || "Passkey registration failed");
+      if (!r2.ok) return showMsg(d2.error || L("添加通行密钥失败", "Adding the passkey failed"));
       location.reload();
     } catch (e) {
-      showMsg(e && e.message ? e.message : "Cancelled");
-    }
+      showMsg(e && e.name === "NotAllowedError" ? L("已取消或超时。", "Cancelled or timed out.") : (e && e.message) || L("已取消", "Cancelled"));
+    } finally { btn.disabled = false; }
   };
 
+  var confirmText = {
+    "del-passkey": ["删除这个通行密钥？", "Remove this passkey?"],
+    "unlink-provider": ["解除与这个账户的绑定？", "Unlink this account?"],
+    "revoke-session": ["撤销这个会话？", "Revoke this session?"]
+  };
+  var paths = { "del-passkey": ["/account/passkey/delete", "id"], "unlink-provider": ["/account/identity/unlink", "provider"], "revoke-session": ["/account/session/revoke", "sid"] };
   document.addEventListener("click", async function(e) {
     var btn = e.target && e.target.closest ? e.target.closest("[data-action]") : null;
     if (!btn) return;
     var act = btn.getAttribute("data-action");
-    var id = btn.getAttribute("data-id") || "";
-    if (act === "del-passkey") {
-      await fetch("/account/passkey/delete", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify({ id: id }) });
-      location.reload();
-    } else if (act === "unlink-provider") {
-      await fetch("/account/identity/unlink", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify({ provider: id }) });
-      location.reload();
-    } else if (act === "revoke-session") {
-      await fetch("/account/session/revoke", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify({ sid: id }) });
-      location.reload();
-    }
+    if (!paths[act] || !confirm(L(confirmText[act][0], confirmText[act][1]))) return;
+    var body = {}; body[paths[act][1]] = btn.getAttribute("data-id") || "";
+    btn.disabled = true;
+    await fetch(paths[act][0], { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrfToken }, body: JSON.stringify(body) });
+    location.reload();
   });
 })();
 </script>
 `;
-  return renderShell("Account", body, { wide: true });
+  return renderShell("账户 Account", body, { wide: true });
 }
 
 // ---- OAuth2 / OIDC Core Logic ----
