@@ -1194,7 +1194,7 @@ function renderAccountPage({ user, passkeys, identities, sessions, allProviders,
       <div class="row">
         <div><b>${escapeHtml(pk.name)}</b><small>${t(`创建于 ${fmtDate(pk.created_at)}`, `added ${fmtDate(pk.created_at)}`)} · ${pk.uses
           ? t(`登录 ${pk.uses} 次，上次 ${fmtDate(pk.last_used_at)}`, `${pk.uses} sign-in${pk.uses === 1 ? "" : "s"}, last ${fmtDate(pk.last_used_at)}`)
-          : t("还没用它登录过", "not used to sign in yet")}</small></div>
+          : pk.last_used_at > pk.created_at ? t(`上次使用 ${fmtDate(pk.last_used_at)}`, `last used ${fmtDate(pk.last_used_at)}`) : t("还没用它登录过", "not used to sign in yet")}</small></div>
         <button type="button" class="outbad sm" data-action="del-passkey" data-id="${escapeHtml(pk.id)}">${t("删除", "Remove")}</button>
       </div>`).join("")
     : `<p class="empty">${t("还没有通行密钥。添加一个，下次用指纹、面容或安全密钥直接登录。", "No passkeys yet. Add one to sign in with your fingerprint, face or security key.")}</p>`;
