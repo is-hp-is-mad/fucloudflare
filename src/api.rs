@@ -245,6 +245,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/zones/{zone_id}/page_shield", get(get_page_shield).patch(patch_page_shield).put(patch_page_shield))
         .route("/zones/{zone_id}/page_shield/scripts", get(list_page_shield_scripts))
         .route("/zones/{zone_id}/page_shield/scripts/{script_id}", get(get_page_shield_script))
+        .route("/zones/{zone_id}/leaked-credential-checks", get(get_leaked_credential_checks).post(set_leaked_credential_checks).patch(set_leaked_credential_checks))
         .route("/zones/{zone_id}/analytics", get(analytics))
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     let app: Router = Router::new()
@@ -3451,6 +3452,22 @@ async fn get_page_shield_script(State(st): St, Path((zone_id, script_id)): Path<
     ok(crate::edge::pageshield::script(&st.edge.page_shield, &zone_id, &script_id).ok_or(StoreError::NotFound)?)
 }
 
+/// A zone's leaked credential checks (crate::edge::credcheck), and the size
+/// of this node's table.
+async fn get_leaked_credential_checks(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
+    let settings = st.store.get_zone(&zone_id)?.settings.leaked_credential_checks;
+    ok(crate::edge::credcheck::view(&settings, st.edge.leaked_passwords.get().map(|t| &**t)))
+}
+
+/// Change them: the fields given (Cloudflare's `POST` sends `enabled` alone).
+async fn set_leaked_credential_checks(State(st): St, Path(zone_id): Path<String>, bytes: Bytes) -> ApiResult {
+    let current = st.store.get_zone(&zone_id)?.settings.leaked_credential_checks;
+    let next = crate::edge::credcheck::patch(&current, &body::<Value>(&bytes)?)?;
+    let value = serde_json::to_value(&next).map_err(|e| bad(e.to_string()))?;
+    let zone = st.store.update_setting_async(&zone_id, "leaked_credential_checks", value).await?;
+    ok(crate::edge::credcheck::view(&zone.settings.leaked_credential_checks, st.edge.leaked_passwords.get().map(|t| &**t)))
+}
+
 /// What this node's health checks say about the zone's origins (see crate::edge::origins).
 async fn origin_health(State(st): St, Path(zone_id): Path<String>) -> ApiResult {
     st.store.get_zone(&zone_id)?;
@@ -3749,6 +3766,91 @@ mod tests {
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
         (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn leaked_credential_checks_change_through_the_api_per_zone_and_need_the_firewall_permission() {
+        let dir = std::env::temp_dir().join(format!("fucf-api-lcc-{}", uuid::Uuid::new_v4().simple()));
+        let st = make_test_state(&dir, crate::sync::NodeRole::Peer);
+        st.accounts.create_user("admin@example.com", Role::Admin, Some("strong-pass-123"), "admin@example.com", &Client::default()).unwrap();
+        st.accounts.create_user("viewer@example.com", Role::Viewer, Some("strong-pass-123"), "viewer@example.com", &Client::default()).unwrap();
+        let session = |email: &str| match st.accounts.login(email, "strong-pass-123", &Client::default()).unwrap() {
+            Login::Session(token, _) => format!("Bearer {token}"),
+            _ => panic!("expected signed in"),
+        };
+        let (admin, viewer) = (session("admin@example.com"), session("viewer@example.com"));
+        let zone = st.store.create_zone("example.com").unwrap();
+        let other = st.store.create_zone("example.net").unwrap();
+        let z = zone.id.clone();
+        let mut app = router(st.clone());
+        let json_of = |b: &[u8]| serde_json::from_slice::<Value>(b).unwrap();
+        let base = format!("/client/v4/zones/{z}/leaked-credential-checks");
+
+        let (sc, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let r = json_of(&b)["result"].clone();
+        assert_eq!((r["enabled"].clone(), r["table_entries"].clone()), (json!(false), Value::Null), "off, and no table on this node");
+        assert_eq!(r["password_fields"], json!(["password", "pass", "passwd"]));
+
+        // Cloudflare's body, then fucf's fields; a trailing slash is the same path
+        let (sc, b) = call(&mut app, "POST", &base, br#"{"enabled": true}"#.to_vec()).await;
+        assert_eq!((sc, json_of(&b)["result"]["enabled"].clone()), (StatusCode::OK, json!(true)));
+        let (sc, b) = call(&mut app, "PATCH", &format!("{base}/"), br#"{"paths": ["/login", "/api/auth/*"], "username_fields": ["account"]}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let kept = st.store.get_zone(&z).unwrap().settings.leaked_credential_checks;
+        assert!(kept.enabled, "kept as a zone setting");
+        assert_eq!((kept.paths.len(), kept.username_fields.clone()), (2, vec!["account".to_string()]));
+        assert!(!st.store.get_zone(&other.id).unwrap().settings.leaked_credential_checks.enabled, "the other zone is untouched");
+        for bad in [&br#"{"enabled": "on"}"#[..], br#"{"paths": ["login"]}"#, br#"{"password_fields": []}"#, br#"{"detections": []}"#, br#"[]"#, b"not json"] {
+            let (sc, _) = call(&mut app, "POST", &base, bad.to_vec()).await;
+            assert_eq!(sc, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(st.store.get_zone(&z).unwrap().settings.leaked_credential_checks, kept, "a refused change changes nothing");
+        let (sc, _) = call(&mut app, "GET", "/client/v4/zones/0123456789abcdef0123456789abcdef/leaked-credential-checks", vec![]).await;
+        assert_eq!(sc, StatusCode::NOT_FOUND);
+
+        // the size of this node's table, never its entries
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("leaked.txt");
+        std::fs::write(&path, "5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8\n").unwrap();
+        st.edge.leaked_passwords.set(crate::edge::credcheck::LeakedPasswords::open(&path).unwrap()).unwrap();
+        let (_, b) = call(&mut app, "GET", &base, vec![]).await;
+        assert_eq!(json_of(&b)["result"]["table_entries"], 1);
+        assert!(!String::from_utf8_lossy(&b).to_ascii_uppercase().contains("5BAA61E4"));
+
+        // panel roles: a viewer reads, does not write
+        give(&st, &z, "viewer@example.com").await;
+        let h = vec![("authorization", viewer.as_str()), ("content-type", "application/json")];
+        let (sc, _, _) = call_raw(&mut app, "GET", &base, h.clone(), vec![]).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _, _) = call_raw(&mut app, "POST", &base, h, br#"{"enabled": false}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::FORBIDDEN);
+
+        // tokens: Firewall Services, as Cloudflare's Zone WAF; zone settings will not do; one zone is not another
+        let mut token = async |group: &str| {
+            let spec = json!({
+                "name": group,
+                "policies": [{ "effect": "allow", "resources": { format!("com.cloudflare.api.account.zone.{z}"): "*" }, "permission_groups": [{ "name": group }] }],
+            });
+            let h = vec![("authorization", admin.as_str()), ("content-type", "application/json")];
+            let (sc, _, b) = call_raw(&mut app, "POST", "/client/v4/user/tokens", h, spec.to_string().into_bytes()).await;
+            assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            format!("Bearer {}", json_of(&b)["result"]["value"].as_str().unwrap())
+        };
+        let zone_settings = token("Zone Settings Read").await;
+        let read = token("Firewall Services Read").await;
+        let write = token("Firewall Services Write").await;
+        let mut as_token = async |bearer: &str, method: &str, path: &str, body: Vec<u8>| {
+            call_raw(&mut app, method, path, vec![("authorization", bearer), ("content-type", "application/json")], body).await.0
+        };
+        assert_eq!(as_token(&zone_settings, "GET", &base, vec![]).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&read, "GET", &base, vec![]).await, StatusCode::OK);
+        assert_eq!(as_token(&read, "POST", &base, br#"{"enabled": false}"#.to_vec()).await, StatusCode::FORBIDDEN);
+        assert_eq!(as_token(&write, "GET", &format!("/client/v4/zones/{}/leaked-credential-checks", other.id), vec![]).await, StatusCode::FORBIDDEN, "another zone");
+        assert_eq!(as_token(&write, "POST", &base, br#"{"enabled": false}"#.to_vec()).await, StatusCode::OK);
+        assert!(!st.store.get_zone(&z).unwrap().settings.leaked_credential_checks.enabled);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -5604,7 +5706,8 @@ mod tests {
         // every kind of zone path answers another user's zone as if it were not there
         let reads = ["", "/dns_records", "/dns_records/export", "/settings", "/settings/ssl", "/dnssec", "/rulesets", "/firewall/rules", "/rate_limits",
             "/cache_rules", "/workers/routes", "/email", "/email/rules", "/waiting_rooms", "/ssl/certificate_packs", "/custom_certificates", "/custom_hostnames",
-            "/security/events", "/logs/requests", "/api_gateway/operations", "/api_gateway/settings/schema_validation"];
+            "/security/events", "/logs/requests", "/api_gateway/operations", "/api_gateway/settings/schema_validation",
+            "/leaked-credential-checks"];
         for path in reads {
             for zone in [&theirs, &unowned] {
                 let (sc, b) = ask("alice", "GET", &format!("/zones/{zone}{path}"), Value::Null).await;
@@ -5624,6 +5727,7 @@ mod tests {
             ("DELETE", "/api_gateway/operations", json!([])),
             ("PATCH", "/api_gateway/settings/schema_validation", json!({ "validation_default_mitigation_action": "block" })),
             ("POST", "/api_gateway/openapi", json!({ "openapi": "3.0.0", "paths": { "/": { "get": {} } } })),
+            ("POST", "/leaked-credential-checks", json!({ "enabled": true })),
             ("PATCH", "", json!({ "paused": true })),
             ("DELETE", "", Value::Null),
         ];

@@ -247,7 +247,7 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 新出现的脚本来源可接 T6 的告警。报告体有大小和频率上限，来源只记主机名和路径，不记查询串。
 - 测试：报告解析（两种 CSP 报告格式）、聚合、上限。
 
-### [ ] T17 泄露凭据检测
+### [x] T17 泄露凭据检测
 
 - 在登录类请求（可配置路径与表单字段名，默认识别常见的 `username`/`email` + `password`）里，把密码做 SHA-1 后取前缀，和本地的泄露哈希前缀表比对（表由运营者用文件提供，格式写清；不在请求路径上联网查询）。
 - 结果只作为规则字段 `cf.waf.credential_check.password_leaked` 暴露，由用户自己的规则决定拦截或加头；密码和哈希不进日志、不进 trace。
@@ -421,6 +421,14 @@ fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `
 - 列表在各节点内存里，随 reports 通道同步，各节点存 `page-shield.json`，不进配置库；计数是近似值，没有删除接口。
 - API：`/zones/{id}/page_shield`（GET/PATCH/PUT）和 `/scripts[/{id}]`，令牌组 Page Shield Read / Write；告警 `new_script` 需开启，每区域一小时最多通知一次；面板在 域名 → 安全。
 - 拿不准：伪造的报告能塞进假条目、触发告警（公开端点本身如此，只靠限速和淘汰减损）；令牌组 id 是自编的。
+
+### T17
+
+- 新文件 `src/edge/credcheck.rs`：区域设置 `leaked_credential_checks`（`enabled`、`paths`、`username_fields`、`password_fields`），只看已经整个缓冲在边缘的 POST/PUT/PATCH 请求体（表单和 JSON，JSON 看顶层或嵌套一层）。密码做 SHA-1 后取前 64 位，在 `--leaked-passwords` 给的本地表里二分查找，结果只作为规则字段 `cf.waf.credential_check.password_leaked`；在 API Shield 之前算。
+- 表格式：每行一个 SHA-1 十六进制，整 40 位（可带 `:次数`，即 HIBP Pwned Passwords 文件的格式）或前 16 位。上限 1 GiB、1000 万条、每行 128 字节。超出或有一行不对就整个拒绝：启动时直接退出，之后换文件时保留旧表，日志只写行号。每分钟按修改时间和大小重读。表不在节点间同步，每个节点各放一份。
+- 接口 `/zones/{id}/leaked-credential-checks`（GET/POST/PATCH），令牌用 Firewall Services Read / Write，面板在 域名 → 安全。路径比较前先解码、忽略大小写、合并 `/`、去掉 `;参数`。
+- 密码、哈希和前缀不进日志、trace、请求日志和安全事件，端到端测试抓了全部 tracing 输出来断言。
+- 拿不准：`username_and_password_leaked` 等字段没有成对的表，直接拒绝；Cloudflare 的 detections 接口和 multipart 表单没做；`paths` 为空时每个表单或 JSON 写请求都会解析一次；也能经 `/settings/leaked_credential_checks` 用 Zone Settings 令牌改。
 
 ## 5. 部署（通过 Komari）
 

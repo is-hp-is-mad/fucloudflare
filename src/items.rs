@@ -215,6 +215,10 @@ pub struct Settings {
     /// Page Shield (crate::edge::pageshield): a CSP on the zone's HTML
     /// answers, its reports gathered into the list of scripts its pages load.
     pub page_shield: crate::edge::pageshield::PageShieldSettings,
+    /// Leaked credential checks (crate::edge::credcheck): which requests are
+    /// logins, whose passwords the rule field
+    /// `cf.waf.credential_check.password_leaked` looks up.
+    pub leaked_credential_checks: crate::edge::credcheck::CredentialCheckSettings,
 }
 
 impl Default for Settings {
@@ -258,6 +262,7 @@ impl Default for Settings {
             api_shield_schema_action: "none".into(),
             api_shield_fallthrough_action: "none".into(),
             page_shield: Default::default(),
+            leaked_credential_checks: Default::default(),
         }
     }
 }
@@ -305,6 +310,7 @@ impl Settings {
         self.error_pages.validate()?;
         crate::edge::earlyhints::validate(&self.early_hints_links).map_err(StoreError::Invalid)?;
         self.page_shield.validate()?;
+        self.leaked_credential_checks.validate()?;
         Ok(())
     }
 }

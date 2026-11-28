@@ -306,6 +306,14 @@ struct Args {
     #[arg(long, env = "FUCF_IP_REPUTATION", default_value_t = true, action = clap::ArgAction::Set)]
     ip_reputation: bool,
 
+    /// Leaked password checks: a file of SHA-1 hashes of leaked passwords,
+    /// one per line in hex (whole, as in the Pwned Passwords files, or
+    /// their first 16 digits; see edge::credcheck), for the rule field
+    /// `cf.waf.credential_check.password_leaked`. At most 1 GiB and 10
+    /// million entries; looked at again every minute.
+    #[arg(long, env = "FUCF_LEAKED_PASSWORDS")]
+    leaked_passwords: Option<PathBuf>,
+
     /// Where this node keeps its backups (default: `<data dir>/backups`).
     #[arg(long, env = "FUCF_BACKUP_DIR")]
     backup_dir: Option<PathBuf>,
@@ -811,6 +819,16 @@ async fn main() -> anyhow::Result<()> {
         let rep = Arc::new(edge::reputation::Reputation::new(Some(args.data_dir.join("reputation"))));
         let _ = edge.reputation.set(rep.clone());
         rep.spawn_refresh(edge.clone());
+    }
+    if let Some(path) = args.leaked_passwords.clone() {
+        // a file that cannot be used stops the process rather than leave a check that finds nothing
+        let shown = path.display().to_string();
+        let table = tokio::task::spawn_blocking(move || edge::credcheck::LeakedPasswords::open(&path))
+            .await?
+            .map_err(|e| anyhow::anyhow!("--leaked-passwords {shown}: {e}"))?;
+        tracing::info!("leaked password table {shown}: {} entries", table.entries());
+        let _ = edge.leaked_passwords.set(table.clone());
+        tokio::spawn(table.watch());
     }
     tokio::spawn(gfw::run(gfw.clone(), geo.clone(), node_limits.clone(), args.edge_ips.clone()));
     let health = Arc::new(geo::Health::default());

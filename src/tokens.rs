@@ -121,8 +121,8 @@ groups! {
     "82e64a83756745bbbb1c9c2701bf816b" "DNS Read" Dns false "Read DNS records";
     "4755a26eedb94da69e1066d98aa820be" "DNS Write" Dns true "Change DNS records: proxying and per-record origin (port, SNI, Host, node) included";
     "e17beae8b8cb423a99b1730f21238bed" "Cache Purge" CachePurge true "Purge the cache";
-    "4ec32dfcb35641c5bb32d5ef1ab963b4" "Firewall Services Read" Firewall false "Read firewall rules, rate limits and security events";
-    "43137f8d07884d3198dc0ee77ca6e79b" "Firewall Services Write" Firewall true "Change firewall rules (human check included) and rate limits";
+    "4ec32dfcb35641c5bb32d5ef1ab963b4" "Firewall Services Read" Firewall false "Read firewall rules, rate limits, security events and leaked credential checks";
+    "43137f8d07884d3198dc0ee77ca6e79b" "Firewall Services Write" Firewall true "Change firewall rules (human check included), rate limits and leaked credential checks";
     "7b7216b327b04b8fbc8f524e1f9b7531" "SSL and Certificates Read" Ssl false "Read certificate packs, custom certificates and custom hostnames";
     "c03055bc037c4ea9afb9a9f104b7b721" "SSL and Certificates Write" Ssl true "Order, retry and upload certificates; add custom hostnames";
     "a6b3a2d2b9f04d7f8ad2f54b7b5bd1a1" "Origin Rules Read" OriginRules false "Read origin rules";
@@ -206,7 +206,7 @@ pub fn need(path: &str) -> Need {
                 "dns_records" => Area::Dns,
                 "settings" | "dnssec" => Area::ZoneSettings,
                 "purge_cache" => Area::CachePurge,
-                "firewall" | "rate_limits" | "security" => Area::Firewall,
+                "firewall" | "rate_limits" | "security" | "leaked-credential-checks" => Area::Firewall,
                 "ssl" | "custom_certificates" | "custom_hostnames" | "origin_ca" => Area::Ssl,
                 "origin_rules" => Area::OriginRules,
                 "redirect_rules" => Area::RedirectRules,
@@ -489,6 +489,8 @@ mod tests {
         assert_eq!(need("/zones/z1/waiting_rooms"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/zones/z1/waiting_rooms/w1"), Need::Zone(Area::WaitingRooms, Some("z1".into())));
         assert_eq!(need("/zones/z1/page_shield"), Need::Zone(Area::PageShield, Some("z1".into())));
+        assert_eq!(need("/zones/z1/leaked-credential-checks"), Need::Zone(Area::Firewall, Some("z1".into())));
+        assert_eq!(need("/zones/z1/leaked-credential-checks/detections"), Need::Zone(Area::Firewall, Some("z1".into())), "no route, but no other area either");
         assert_eq!(need("/zones/z1/page_shield/scripts/abc"), Need::Zone(Area::PageShield, Some("z1".into())));
         assert_eq!(need("/waiting_rooms"), Need::Closed);
         assert_eq!(need("/zones/z1/api_gateway/operations"), Need::Zone(Area::ApiGateway, Some("z1".into())));

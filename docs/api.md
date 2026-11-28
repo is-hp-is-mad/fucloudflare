@@ -188,6 +188,8 @@ CRUD   /zones/{id}/rate_limits                      {"expression", "threshold", 
 GET    /zones/{id}/security/events?limit=
 GET    /steering/test?ip=&ua=                       where an address is placed, and its threat score
 GET    /zones/{id}/page_shield  PATCH               which scripts the zone's pages load, see [Page Shield](#page-shield)
+GET    /zones/{id}/leaked-credential-checks  POST  which logins are checked against leaked passwords,
+                                                    see [Leaked credential checks](#leaked-credential-checks)
 ```
 
 Firewall actions: `block`, `js_challenge` (the human check; a click only when the browser looks
@@ -200,7 +202,8 @@ language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.use
 and HTTP/3; `/cdn-cgi/fucf-trace` shows it as `ja4=`), `cf.tls_client_auth.cert_verified` (also
 `fcf.client_cert_verified`: whether the visitor presented a client certificate the node verified,
 see [Visitor client certificates](#visitor-client-certificates-mtls)), `cf.api_gateway.request_violates_schema`
-and `cf.api_gateway.fallthrough_detected` (see [API Shield](#api-shield)), with `eq ne lt le gt ge contains
+and `cf.api_gateway.fallthrough_detected` (see [API Shield](#api-shield)), `cf.waf.credential_check.password_leaked`
+(see [Leaked credential checks](#leaked-credential-checks)), with `eq ne lt le gt ge contains
 matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
@@ -1206,6 +1209,94 @@ Other parameters are refused. `added_at` is the same as `first_seen_at`.
 curl -s -X PATCH $BASE/zones/$ZONE/page_shield -H "Authorization: Bearer $TOKEN" \
   -d '{"enabled": true, "alerts": true}'
 curl -s "$BASE/zones/$ZONE/page_shield/scripts?host=cdn.example.net&order_by=first_seen_at" -H "Authorization: Bearer $TOKEN"
+```
+
+### Leaked credential checks
+
+The rule field `cf.waf.credential_check.password_leaked` is true when the password of a login
+request is in a table of leaked password hashes that the operator gives each node. The edge does
+nothing with it by itself: the zone's own rules decide, such as a firewall rule that blocks or
+challenges, or a transform rule that adds a request header for the origin to act on (ask for a new
+password, say). Nothing is looked up on the network while a request waits.
+
+```
+GET    /zones/{id}/leaked-credential-checks       {"enabled", "paths", "username_fields",
+                                                   "password_fields", "table_entries"}
+POST   /zones/{id}/leaked-credential-checks  PATCH  the fields given change; answers as GET
+```
+
+| Field | Values (default first) |
+| --- | --- |
+| `enabled` | `false`, `true` |
+| `paths` | `[]` (every path), or up to 32 login paths such as `/login`, or prefixes ending in `*`: `/api/auth/*` covers `/api/auth` and everything under it, `/sign*` everything that starts so. Each starts with `/`, is at most 256 bytes, printable ASCII with no spaces, `?` or `#`. |
+| `username_fields` | `["username", "email", "user", "login"]`; up to 16 names of 1 to 64 printable characters. `[]`: a password field alone makes a login. |
+| `password_fields` | `["password", "pass", "passwd"]`; 1 to 16 names, as above |
+| `table_entries` | read only: the entries of the table of the node that answered, `null` when it has none |
+
+`null` for a list in a POST or PATCH puts its default back. Cloudflare's body is `{"enabled": true}`;
+the other fields are fucf's. Unknown fields are refused, and so is Cloudflare's
+`/leaked-credential-checks/detections` (custom detections are expressions there; here they are the
+field names above). The same value can also be written whole through
+`/zones/{id}/settings/leaked_credential_checks`.
+
+Which requests are checked: a `POST`, `PUT` or `PATCH` to one of `paths`, whose body the edge holds
+whole (at most 1 MiB, the security checks' buffer; a body still streaming is never read for this),
+that has a password field and, unless `username_fields` is empty, a username field, both non-empty:
+
+- `application/x-www-form-urlencoded`: the fields by name, `+` and percent escapes decoded;
+- JSON (`application/json`, `*/*+json`): the keys of the top-level object, or else of one object
+  nested in it (`{"user": {"email": "ann@example.com", "password": "…"}}`); the username and the
+  password are strings of the same object.
+
+Field names are compared without regard to case. Every password field of a request is looked up (an
+origin may read the first or the last of two), at most 8 of them, and none longer than 1024 bytes.
+Bodies with a `Content-Encoding` other than `identity`, multipart forms and other types are not
+checked. Paths are compared percent-decoded and without regard to case, with `\` read as `/`, empty
+and `.` segments dropped, `..` taking away the segment before it and `;params` cut from each segment,
+so `/%6Cogin/`, `//login` and `/login;jsessionid=1` are all `/login`.
+
+The table. A node started with `--leaked-passwords <file>` (`FUCF_LEAKED_PASSWORDS`) loads a file
+of SHA-1 hashes of leaked passwords, one per line in hexadecimal, either case:
+
+```
+# comments and empty lines are skipped
+5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8
+5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8:3861493
+5baa61e4c9b93f3f
+```
+
+A line is a whole hash (40 digits), optionally followed by `:count` as in the downloadable Pwned
+Passwords files of Have I Been Pwned (the count is not used), or its first 16 digits. Only those
+first 64 bits are kept, eight bytes an entry in one sorted array. Shorter prefixes (such as the five
+digits of k-anonymity range queries) are refused, because each would mark a millionth of all
+passwords as leaked, and so are other lengths, so that a file of NTLM hashes is not taken for SHA-1.
+A line, comments included, is at most 128 bytes. The file is at most 1 GiB and 10 million entries (80 MB of memory, twice that while a new table
+replaces the old one). The full Pwned Passwords list is far larger: use part of it, such as the
+lines with the highest counts.
+
+A file that is too large, has too many entries or has one line of another form is refused whole.
+At start, the node does not start; later, the table loaded before stays and the node logs a warning
+with the line number (never the line). The node looks at the file every minute and loads it again
+when its modification time or size changed. Every node needs its own copy: the table is not
+replicated. Without a table the field is always false.
+
+What is never kept: the password, its hash and the hash's prefix are not logged, traced, written to
+the request log or the security events, or kept with the request (only the boolean is). The decoded
+password is held only while it is hashed.
+
+Not supported: `cf.waf.credential_check.username_and_password_leaked`,
+`cf.waf.credential_check.username_leaked` and `cf.waf.credential_check.username_password_similar`.
+They need a table of username and password pairs (or of usernames), which no common public file
+provides; rules that use them are refused rather than never matching.
+
+Token permissions: Firewall Services Read for the GET, Firewall Services Write to change the
+settings (Cloudflare files this under Zone WAF).
+
+```sh
+curl -s -X POST $BASE/zones/$ZONE/leaked-credential-checks -H "Authorization: Bearer $TOKEN" \
+  -d '{"enabled": true, "paths": ["/login", "/api/auth/*"]}'
+curl -s -X POST $BASE/zones/$ZONE/firewall/rules -H "Authorization: Bearer $TOKEN" \
+  -d '{"expression": "cf.waf.credential_check.password_leaked", "action": "block"}'
 ```
 
 ### Workers

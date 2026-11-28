@@ -46,6 +46,10 @@ pub struct ReqInfo {
     /// What API Shield found (see crate::edge::apishield); all false where
     /// the host has no API operations.
     pub api_gateway: crate::edge::apishield::Outcome,
+    /// The password of this login request is in the leaked password table
+    /// (see crate::edge::credcheck). Only this answer is kept, never the
+    /// password or its hash.
+    pub password_leaked: bool,
 }
 
 impl ReqInfo {
@@ -86,6 +90,7 @@ enum Val {
     CertVerified,
     ApiSchemaViolation,
     ApiFallthrough,
+    PasswordLeaked,
     Lower(Box<Val>),
     Upper(Box<Val>),
     UrlDecode(Box<Val>),
@@ -237,7 +242,7 @@ impl Val {
     fn ty(&self) -> Ty {
         match self {
             Val::IpSrc => Ty::Ip,
-            Val::Ssl | Val::CertVerified | Val::ApiSchemaViolation | Val::ApiFallthrough | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
+            Val::Ssl | Val::CertVerified | Val::ApiSchemaViolation | Val::ApiFallthrough | Val::PasswordLeaked | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
             Val::Len(_) | Val::Asn | Val::Threat | Val::BotScore => Ty::Int,
             _ => Ty::Str,
         }
@@ -415,6 +420,7 @@ impl Parser<'_> {
             "cf.tls_client_auth.cert_verified" | "fcf.client_cert_verified" => Val::CertVerified,
             "cf.api_gateway.request_violates_schema" => Val::ApiSchemaViolation,
             "cf.api_gateway.fallthrough_detected" => Val::ApiFallthrough,
+            "cf.waf.credential_check.password_leaked" => Val::PasswordLeaked,
             _ => return Err(format!("unknown field '{word}'")),
         })
     }
@@ -499,6 +505,7 @@ impl Val {
             Val::CertVerified => V::B(r.client_cert_verified),
             Val::ApiSchemaViolation => V::B(r.api_gateway.violates_schema),
             Val::ApiFallthrough => V::B(r.api_gateway.fallthrough),
+            Val::PasswordLeaked => V::B(r.password_leaked),
             Val::Lower(v) => V::S(Cow::Owned(s(v).to_lowercase())),
             Val::Upper(v) => V::S(Cow::Owned(s(v).to_uppercase())),
             Val::UrlDecode(v) => V::S(Cow::Owned(url_decode(&s(v)))),
@@ -709,6 +716,30 @@ mod tests {
         assert!(at("not cf.api_gateway.request_violates_schema and not cf.api_gateway.fallthrough_detected", false, false));
         assert_eq!(req().api_gateway, Outcome::default(), "a request API Shield did not look at is neither");
         for bad in ["cf.api_gateway.request_violates_schema eq true", "cf.api_gateway.fallthrough_detected contains \"x\"", "cf.api_gateway.violates_schema", "cf.api_gateway"] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn the_leaked_password_field_is_a_boolean_and_its_neighbours_are_unknown() {
+        let at = |src: &str, password_leaked: bool| {
+            let e = Expr::parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            e.matches(&ReqInfo { password_leaked, ..req() })
+        };
+        assert!(at("cf.waf.credential_check.password_leaked", true));
+        assert!(!at("cf.waf.credential_check.password_leaked", false));
+        assert!(at("not cf.waf.credential_check.password_leaked", false));
+        assert!(at(r#"cf.waf.credential_check.password_leaked and http.request.uri.path contains "/Admin""#, true));
+        assert!(!req().password_leaked, "a request nobody checked is not leaked");
+        // fields fucf cannot compute are refused rather than always false
+        for bad in [
+            "cf.waf.credential_check.password_leaked eq true",
+            "cf.waf.credential_check.password_leaked contains \"x\"",
+            "cf.waf.credential_check.username_and_password_leaked",
+            "cf.waf.credential_check.username_leaked",
+            "cf.waf.credential_check.username_password_similar",
+            "cf.waf.credential_check",
+        ] {
             assert!(Expr::parse(bad).is_err(), "{bad} should fail");
         }
     }

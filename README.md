@@ -36,6 +36,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--ban-export` | 无 | 把自动防火墙封禁的地址写成 nftables 脚本的文件路径，见"DNS 响应限速与内核层封禁" |
 | `--origin-client-cert` / `--origin-client-key` | 无 | 回源时出示的客户端证书和私钥（PEM），两个要一起给，见"回源时出示客户端证书" |
 | `--mtls-ca` | 无 | 签发访客客户端证书的 CA（PEM，可多张）。配置后 HTTPS 和 HTTP/3 监听向访客要客户端证书（不强制），见"访客客户端证书（mTLS）" |
+| `--leaked-passwords` | 无 | 泄露密码的 SHA-1 哈希表文件（每行一个），给规则字段 `cf.waf.credential_check.password_leaked` 用，见"泄露凭据检测" |
 | `--release-key` | 无 | 发布公钥（见"滚动更新与自动回滚"）。配置后本节点接受机群滚动发布的新版本，新版本不能用时自动退回；不配置则只能手动替换二进制 |
 | `--proxy-protocol` | 关 | 边缘 TCP 连接必须以 PROXY protocol v1 头开始（仅用于只经可信四层代理可达的监听） |
 | `--api-listen` | `127.0.0.1:8787` | 管理 API 与面板 |
@@ -203,6 +204,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
   `cf.threat_score`（或 `fcf.threat_score`，见"安全级别、IP 纯净度与页面内人机验证"）`fcf.ja4`（或 `cf.bot_management.ja4`，见"TLS 指纹（JA4）"）
   `cf.tls_client_auth.cert_verified`（或 `fcf.client_cert_verified`，访客出示了经节点验证的客户端证书，见"访客客户端证书（mTLS）"）
   `cf.api_gateway.request_violates_schema` `cf.api_gateway.fallthrough_detected`（见"API Shield"）
+  `cf.waf.credential_check.password_leaked`（登录请求的密码在泄露密码表里，见"泄露凭据检测"）
 - 运算符：`eq ne contains matches in lt le gt ge`（及 `== != ~ < <= > >=`），`and or not`（及 `&& || !`）
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
 - IP 列表：`ip.src in $office`（见下面的"IP 列表"）。
@@ -485,7 +487,7 @@ ACME 账户密钥只保存在下单节点自己的数据目录里，不同步。
 
 ## 请求处理顺序
 
-区域设置 `mtls`（没有经验证的客户端证书则 403，到此为止）→ `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 防火墙规则 → API Shield → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
+区域设置 `mtls`（没有经验证的客户端证书则 403，到此为止）→ `/cdn-cgi/`（节点自己应答，到此为止）→ 节点硬限流（超限则到此为止）→ Host 匹配代理记录 → `always_use_https` → 泄露凭据检测（只算出规则字段）→ 防火墙规则 → API Shield → Under Attack 质询 → 限速 → 托管规则 → 重定向规则 → 等候室 → 改写规则（请求侧）→ Worker 路由 → 缓存（缓存规则）→ 回源规则 → 源站 → 区域设置的响应头（HSTS、浏览器缓存时间）→ 改写规则（响应侧）→ 压缩。
 
 - HTTP/3：与 HTTPS 同端口号的 UDP 上提供，HTTPS 响应带 `Alt-Svc` 头引导客户端升级；三种协议共用同一条处理链路。
 - 压缩：客户端支持时对 1 KiB–8 MiB 的文本类响应做 brotli、zstd 或 gzip（源站已压缩的不动）。固定按 brotli → zstd → gzip 的顺序选，`q=0` 的不用；同时支持 br 和 zstd 的浏览器照旧拿 brotli，只支持 zstd 不支持 br 的才拿 zstd（级别 3）。zstd 用的是 C 库（zstd-sys），编译要有 C 编译器，静态（musl）构建照 aws-lc-rs 的设置用 `musl-gcc` 就够。
@@ -914,6 +916,49 @@ GET    /zones/{id}/page_shield/scripts/{id}     单个脚本
 
 ```sh
 curl -s -X PATCH "http://127.0.0.1:8787/client/v4/zones/$ZONE/page_shield" -H "Authorization: Bearer $TOKEN" -d '{"enabled": true, "alerts": true}'
+```
+
+## 泄露凭据检测
+
+登录请求的密码做 SHA-1，和节点本地的泄露密码哈希表比对，结果只作为规则字段 `cf.waf.credential_check.password_leaked` 给规则用；
+边缘自己什么都不做，拦截、质询还是加个请求头让源站提醒用户改密码，由域名自己的规则决定。请求路径上不联网查询。
+面板：域名 → 安全 → 泄露凭据检测；接口 `/zones/{id}/leaked-credential-checks`（路径照 Cloudflare）。
+
+```
+GET    /zones/{id}/leaked-credential-checks     {"enabled", "paths", "username_fields", "password_fields", "table_entries"}
+POST   /zones/{id}/leaked-credential-checks     改给出的字段（PATCH 相同）；Cloudflare 只发 {"enabled": true}
+```
+
+| 字段 | 取值 |
+|------|------|
+| `enabled` | 默认关 |
+| `paths` | 默认空（所有路径）；最多 32 个登录路径，如 `/login`，或以 `*` 结尾的前缀：`/api/auth/*` 包括 `/api/auth` 和它下面的一切，`/sign*` 包括以它开头的一切 |
+| `username_fields` | 默认 `username` `email` `user` `login`，最多 16 个；设为空列表时只要有密码字段就算登录 |
+| `password_fields` | 默认 `password` `pass` `passwd`，1 到 16 个 |
+| `table_entries` | 只读：应答的那个节点的表有多少条，没有表为 `null` |
+
+- 什么算登录请求：`POST` / `PUT` / `PATCH`，路径在 `paths` 里，请求体已经整个缓冲在边缘（最多 1 MiB，就是安全检查用的那份；还在流式传输的请求体不会为此去读），
+  里面有非空的密码字段，并且（`username_fields` 不为空时）有非空的用户名字段。表单（`application/x-www-form-urlencoded`）按字段名找，先解码 `+` 和百分号转义；
+  JSON 看顶层对象的键，顶层没有就看嵌套一层的对象（如 `{"user": {"email": ..., "password": ...}}`），用户名和密码必须是同一个对象里的字符串。
+- 字段名不区分大小写；同一个请求里的密码字段都查（源站可能读两个里的第一个，也可能读最后一个），最多 8 个，超过 1024 字节的不查。
+  带 `Content-Encoding`（`identity` 除外）的请求体、multipart 表单和其他类型不检查。
+- 路径先解码、不区分大小写，`\` 当 `/`，去掉空段和 `.`，`..` 吃掉前一段，每段 `;` 之后的参数去掉，所以 `/%6Cogin/`、`//login`、`/login;jsessionid=1` 都算 `/login`。
+- 哈希表：节点用 `--leaked-passwords <文件>`（`FUCF_LEAKED_PASSWORDS`）启动，每行一个 SHA-1，十六进制、大小写都行：整个哈希（40 位，可以带 `:次数`，
+  就是 Have I Been Pwned 可下载的 Pwned Passwords 文件的格式，次数不用），或者它的前 16 位；`#` 开头的行和空行跳过。只保存、只比对前 64 位，每条 8 字节，
+  放在一个排好序的数组里二分查找。更短的前缀（如 k-匿名查询用的 5 位）拒绝，每个都会把百万分之一的密码误判成泄露；其他长度也拒绝，免得把 NTLM 哈希文件当成 SHA-1。
+- 上限：每行（注释也算）最多 128 字节，文件最大 1 GiB、最多 1000 万条（内存 80 MB，换新表时短暂翻倍）。完整的 Pwned Passwords 远比这大，请取一部分，比如次数最多的那些行。
+  文件太大、条数太多或有一行格式不对就整个拒绝：启动时节点不启动；之后换文件时继续用原来的表，日志里只写行号，不写那一行的内容。
+  每分钟看一次文件，修改时间或大小变了就重新读。每个节点要有自己的一份，表不在节点之间同步；没有表的节点上这个字段永远为假。
+- 密码、它的哈希和哈希前缀都不进日志、trace、请求日志和安全事件，请求上只留一个布尔值；解码出来的密码只在算哈希时存在。
+- 不支持 `cf.waf.credential_check.username_and_password_leaked`、`username_leaked`、`username_password_similar`：它们要用户名和密码成对的泄露表，常见的公开文件里没有；
+  用了这些字段的规则保存时直接报错，而不是永远不匹配。也没有 Cloudflare 的 `/leaked-credential-checks/detections`（那里用表达式自定义检测，这里用上面的字段名）。
+- 令牌权限是 Firewall Services Read / Write（Cloudflare 归在 Zone WAF 下）；也可以用 `/zones/{id}/settings/leaked_credential_checks` 整个写入。
+
+```sh
+curl -s -X POST "http://127.0.0.1:8787/client/v4/zones/$ZONE/leaked-credential-checks" -H "Authorization: Bearer $TOKEN" -d '{"enabled": true, "paths": ["/login"]}'
+# 规则：泄露的密码给源站加个头，由源站提示用户改密码
+curl -s -X POST "http://127.0.0.1:8787/client/v4/zones/$ZONE/transform_rules" -H "Authorization: Bearer $TOKEN" \
+  -d '{"expression": "cf.waf.credential_check.password_leaked", "set_request_headers": {"Exposed-Credential-Check": "1"}}'
 ```
 
 ## 滚动更新与自动回滚

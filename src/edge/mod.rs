@@ -11,6 +11,7 @@ pub mod autofw;
 pub mod banset;
 pub mod botscore;
 pub mod challenge;
+pub mod credcheck;
 pub mod errpages;
 pub mod origins;
 pub mod reputation;
@@ -1032,6 +1033,8 @@ pub struct Edge {
     pub geo: std::sync::OnceLock<Arc<crate::geo::Geo>>,
     /// How bad visitors' addresses look (threat scores).
     pub reputation: std::sync::OnceLock<Arc<reputation::Reputation>>,
+    /// Hashes of leaked passwords (`--leaked-passwords`, see [`credcheck`]).
+    pub leaked_passwords: std::sync::OnceLock<Arc<credcheck::LeakedPasswords>>,
     pub stats: Arc<stats::Stats>,
     /// The newest requests this node answered, for the API and the log jobs.
     pub reqlog: reqlog::RequestLog,
@@ -1327,6 +1330,7 @@ impl Edge {
             internal_listeners: Default::default(),
             geo: Default::default(),
             reputation: Default::default(),
+            leaked_passwords: Default::default(),
             stats: Default::default(),
             reqlog: Default::default(),
             waiting: Default::default(),
@@ -2288,6 +2292,8 @@ impl Edge {
         let mut worker = None;
         let mut admitted = Vec::new();
         if !zone.zone.paused {
+            // cf.waf.credential_check.password_leaked, from the body held whole only
+            info.password_leaked = credcheck::assess(self.leaked_passwords.get().map(|t| &**t), &settings.leaked_credential_checks, &info, &headers, &body);
             // API Shield's findings, for the rules and its own actions in waf.check
             if !zone.api_shield.is_empty() {
                 let seen = apishield::Body::of(&body, &headers, declared, &info.method);

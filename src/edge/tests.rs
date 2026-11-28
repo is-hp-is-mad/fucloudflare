@@ -3223,3 +3223,86 @@ async fn api_shield_checks_bodies_and_unknown_endpoints_by_the_zone_settings() {
     }
     assert_eq!(send(&env, "POST", "example.com", "/api/users", json_ct, "{}").await.status, 200);
 }
+
+/// What a tracing subscriber writes, kept for a test to search.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_leaked_password_reaches_the_rules_and_never_the_logs_or_traces() {
+    // everything the process traces while the requests go through, at every level
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).with_ansi(false).with_writer(move || writer.clone()).finish();
+    let _traced = tracing::subscriber::set_default(subscriber);
+
+    let env = setup().await;
+    let leaked = "hunter2-example-leak";
+    let fresh = "correct-horse-example-fresh";
+    let hex: String = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, leaked.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let path = std::env::temp_dir().join(format!("fucf-leaked-edge-{}.txt", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, format!("# test table\n{}:12\n", hex.to_ascii_uppercase())).unwrap();
+    env.edge.leaked_passwords.set(credcheck::LeakedPasswords::open(&path).unwrap()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    // the rules decide: blocked on /login, a header for the origin on the API
+    env.store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "cf.waf.credential_check.password_leaked and not http.request.uri.path contains \"/api/\"", "action": "block" }), true)
+        .unwrap();
+    env.store
+        .save_item::<TransformRule>(&env.zone, None, json!({ "expression": "cf.waf.credential_check.password_leaked", "set_request_headers": { "X-Added": "leaked" } }), true)
+        .unwrap();
+    let form = "Content-Type: application/x-www-form-urlencoded\r\n";
+    let json_ct = "Content-Type: application/json\r\n";
+    let login = |pw: &str| format!("username=ann%40example.com&password={pw}");
+
+    // the zone has not opted in yet: nothing is looked up
+    assert_eq!(send(&env, "POST", "example.com", "/login", form, &login(leaked)).await.status, 200);
+    // Tests running beside this one may have registered the edge's log lines
+    // while no subscriber wanted them; now that they are registered, have
+    // them ask again, so that this subscriber sees every one from here on.
+    tracing::callsite::rebuild_interest_cache();
+    env.store.update_setting(&env.zone, "leaked_credential_checks", json!({ "enabled": true, "paths": ["/login", "/api/session"] })).unwrap();
+
+    assert_eq!(send(&env, "POST", "example.com", "/login", form, &login(leaked)).await.status, 403);
+    // the way an origin reads a path does not walk past the check
+    assert_eq!(send(&env, "POST", "example.com", "/%6Cogin/", form, &login(leaked)).await.status, 403);
+    let r = send(&env, "POST", "example.com", "/login", form, &login(fresh)).await;
+    assert!(r.status == 200 && r.body.contains("added=-"), "{}", r.body);
+    let r = send(&env, "POST", "example.com", "/api/session", json_ct, &format!(r#"{{"user": {{"email": "ann@example.com", "password": "{leaked}"}}}}"#)).await;
+    assert!(r.status == 200 && r.body.contains("added=leaked"), "{}", r.body);
+    // paths the zone did not list, and requests that are no login, are not looked at
+    let r = send(&env, "POST", "example.com", "/comment", form, &login(leaked)).await;
+    assert!(r.status == 200 && r.body.contains("added=-"), "{}", r.body);
+    let r = send(&env, "POST", "example.com", "/api/session", json_ct, &format!(r#"{{"password": "{leaked}"}}"#)).await;
+    assert!(r.body.contains("added=-"), "{}", r.body);
+    let trace = get(&env, "example.com", "/cdn-cgi/fucf-trace").await;
+    assert_eq!(trace.status, 200);
+
+    // nothing the edge keeps or writes holds the password, its hash or the hash's prefix
+    let filter = reqlog::Filter { zone_id: env.zone.clone(), ..Default::default() };
+    let page = env.edge.reqlog.query(None, 100, &filter);
+    assert!(page.entries.len() >= 7, "the requests are in the log");
+    let log = String::from_utf8(reqlog::ndjson(&page.entries).to_vec()).unwrap();
+    let api_log = env.edge.reqlog.answer(&reqlog::LogQuery::parse(&env.zone, &Default::default()).unwrap(), "test").to_string();
+    let events = env.edge.waf.events(&env.zone, 100);
+    assert!(events.iter().any(|e| e.action == "block"), "the block is a security event");
+    let events = serde_json::to_string(&events).unwrap();
+    let traced = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(traced.contains("/api/session"), "the subscriber saw the requests:\n{traced}");
+    for (what, text) in [("request log", &log), ("request log API", &api_log), ("security events", &events), ("tracing", &traced), ("fucf-trace", &trace.body)] {
+        let lower = text.to_ascii_lowercase();
+        assert!(!text.contains(leaked) && !text.contains(&login(leaked)), "the password is in the {what}");
+        assert!(!lower.contains(&hex) && !lower.contains(&hex[..credcheck::PREFIX_HEX]), "its hash is in the {what}");
+    }
+}
