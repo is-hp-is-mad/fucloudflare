@@ -1636,7 +1636,7 @@ const A = {
   recEdit: d => {
     const r = byId("records", d.id), o = r.origin || {};
     openForm(d.id ? "编辑记录" : "添加记录", [
-      { k: "type", label: "类型", type: "select", options: ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR"] },
+      { k: "type", label: "类型", type: "select", options: ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR", "HTTPS", "SVCB", "TLSA", "SSHFP", "DS", "NAPTR", "URI"] },
       { k: "name", label: "名称", hint: "@ 表示根域；可写前缀（www）或完整域名；支持 *.前缀" },
       { k: "content", label: "内容", hint: "A/AAAA 填 IP；已代理时这里是源站地址" },
       { k: "proxied", label: "经 CDN 代理（仅 A / AAAA / CNAME）", type: "check" },

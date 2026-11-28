@@ -78,6 +78,17 @@ async fn tcp_conn(mut stream: TcpStream, resolver: Arc<Resolver>) -> std::io::Re
             Ok(r) => r?,
             Err(_) => return Ok(()),
         };
+        // a zone transfer is several messages
+        if let Some(messages) = super::transfer::axfr(&resolver, &buf, peer) {
+            for m in messages {
+                let framed = [&(m.len() as u16).to_be_bytes()[..], &m].concat();
+                match tokio::time::timeout(TCP_IDLE, stream.write_all(&framed)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Ok(()),
+                }
+            }
+            continue;
+        }
         let Some(reply) = resolver.handle(&buf, false, peer) else { return Ok(()) };
         let mut out = Vec::with_capacity(reply.len() + 2);
         out.extend_from_slice(&(reply.len() as u16).to_be_bytes());

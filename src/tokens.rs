@@ -183,7 +183,7 @@ pub fn need(path: &str) -> Need {
                 "workers" => Area::WorkersRoutes,
                 "email" => Area::EmailRouting,
                 "spectrum" => Area::Spectrum,
-                "analytics" | "origins" => Area::Analytics,
+                "analytics" | "origins" | "dns_analytics" => Area::Analytics,
                 _ => return Need::Closed,
             };
             Need::Zone(area, Some(z.to_string()))

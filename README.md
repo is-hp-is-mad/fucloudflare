@@ -184,6 +184,14 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 **协议选择**：区域设置 `http2` / `http3` 控制向访客提供哪些协议。HTTP/3 开启时，代理主机名的 HTTPS 记录（type 65）
 先通告 `h3`（及其端口），再通告 `h2`，支持的客户端首次连接就能直接走 QUIC。
 
+### DNS：更多记录类型、辅助名称服务器、查询统计
+
+- 记录类型增加 `HTTPS`、`SVCB`（内容如 `1 . alpn=h2,h3 port=443 ipv4hint=192.0.2.1`）、`TLSA`、`SSHFP`、`DS`（委派出去的子域的 DS）、`NAPTR`、`URI`。
+- 区域设置 `dns_transfer_to`：允许做区域传送（AXFR，仅 TCP）的辅助名称服务器地址或网段；区域变更时向其中的单个地址发 NOTIFY。
+  传给辅助服务器的内容同样隐藏源站：代理的名字给出全部边缘节点的地址（辅助服务器上没有按访客调度）。开启了 DNSSEC 的区域不传送（签名是按查询在线做的）。
+  把辅助服务器放在别的服务商，整个机群不在时域名仍可解析。
+- `GET /zones/{id}/dns_analytics`：本节点自启动以来为该区域应答的查询数，按类型和应答码拆分。
+
 ### 限速的计数方式
 
 - `characteristics`：区分客户端的依据，默认只按 `ip`；可选 `asn`、`country`、`host`、`path`、`header:名称`、`cookie:名称`，最多 4 个，组合成一个计数键（例如 `["header:x-api-key"]` 按 API 密钥限速）。

@@ -178,6 +178,9 @@ pub struct Settings {
     pub origin_check_interval: u32,
     /// A visitor keeps going to the same origin address of a name with several.
     pub session_affinity: bool,
+    /// Secondary name servers (addresses, or networks as `address/prefix`) that may
+    /// transfer the zone (AXFR); the single addresses are sent a NOTIFY when it changes.
+    pub dns_transfer_to: Vec<String>,
 }
 
 impl Default for Settings {
@@ -211,6 +214,7 @@ impl Default for Settings {
             origin_check_path: String::new(),
             origin_check_interval: 30,
             session_affinity: false,
+            dns_transfer_to: Vec::new(),
         }
     }
 }
@@ -236,6 +240,9 @@ impl Settings {
         let path = &self.origin_check_path;
         if !path.is_empty() && (!path.starts_with('/') || path.len() > 256 || path.bytes().any(|b| b <= b' ' || b == 0x7f)) {
             return invalid("origin_check_path is a path like /healthz (at most 256 bytes), or empty for no checks");
+        }
+        if self.dns_transfer_to.len() > 16 || self.dns_transfer_to.iter().any(|e| !crate::dns::transfer::valid(e)) {
+            return invalid("dns_transfer_to holds at most 16 addresses or networks (address/prefix)");
         }
         if !(10..=3600).contains(&self.origin_check_interval) {
             return invalid("origin_check_interval is 10 to 3600 seconds");

@@ -157,6 +157,36 @@ pub struct Resolver {
     pub rtt: Arc<crate::rtt::Rtt>,
 }
 
+/// The queries this node answered for a zone since it started.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct QueryCount {
+    pub total: u64,
+    pub by_type: std::collections::BTreeMap<String, u64>,
+    /// By answer: NOERROR, NXDOMAIN, REFUSED, ...
+    pub by_rcode: std::collections::BTreeMap<String, u64>,
+}
+
+static QUERIES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, QueryCount>>> = std::sync::LazyLock::new(Default::default);
+
+/// What [`QueryCount`] holds for a zone (by its id).
+pub fn query_count(zone_id: &str) -> QueryCount {
+    QUERIES.lock().unwrap().get(zone_id).cloned().unwrap_or_default()
+}
+
+fn counted(zone_id: &str, qtype: u16, rcode: u16) {
+    let answer = match rcode {
+        0 => "NOERROR".to_string(),
+        rcode::NXDOMAIN => "NXDOMAIN".to_string(),
+        rcode::REFUSED => "REFUSED".to_string(),
+        other => format!("RCODE{other}"),
+    };
+    let mut queries = QUERIES.lock().unwrap();
+    let count = queries.entry(zone_id.to_string()).or_default();
+    count.total += 1;
+    *count.by_type.entry(wire::type_name(qtype)).or_default() += 1;
+    *count.by_rcode.entry(answer).or_default() += 1;
+}
+
 /// Edge addresses to hand to one particular client.
 struct Edges {
     v4: Vec<Ipv4Addr>,
@@ -178,7 +208,7 @@ fn ttl_of(r: &Record) -> u32 {
     if r.ttl <= 1 { AUTO_TTL } else { r.ttl }
 }
 
-fn to_rr(r: &Record, owner: &str) -> Option<RR> {
+pub(super) fn to_rr(r: &Record, owner: &str) -> Option<RR> {
     let data = wire::parse_rdata(&r.rtype, &r.content, r.priority).ok()?;
     Some(RR { name: owner.to_string(), ttl: ttl_of(r), data })
 }
@@ -187,7 +217,7 @@ fn parent(name: &str) -> &str {
     name.split_once('.').map(|(_, p)| p).unwrap_or("")
 }
 
-fn soa(z: &ZoneSnap) -> RR {
+pub(super) fn soa(z: &ZoneSnap) -> RR {
     let zone = &z.zone;
     RR {
         name: zone.name.clone(),
@@ -248,6 +278,9 @@ impl Resolver {
             let client = q.ecs.map(|e| e.addr).unwrap_or(peer.to_canonical());
             let mut by_location = false;
             self.answer(&q.qname, q.qtype, client, &mut by_location, &mut resp);
+            if let Some(z) = self.store.snapshot().find_zone(&q.qname) {
+                counted(&z.zone.id, q.qtype, resp.rcode);
+            }
             if resp.do_bit && resp.aa {
                 let snap = self.store.snapshot();
                 if let Some(z) = snap.find_zone(&q.qname) {
@@ -562,6 +595,14 @@ impl Resolver {
         }
 
         if let Some(cut) = delegation(z, qname) {
+            if qtype == rtype::DS && cut == qname {
+                // the DS of a name this zone delegates is this zone's to answer
+                resp.answers = z.names[cut].iter().filter(|r| r.rtype == "DS").filter_map(|r| to_rr(r, cut)).collect();
+                if resp.answers.is_empty() {
+                    resp.authority.push(soa(z));
+                }
+                return;
+            }
             resp.aa = false;
             resp.authority = z.names[cut].iter().filter(|r| r.rtype == "NS").filter_map(|r| to_rr(r, cut)).collect();
             resp.additional = glue(z, &resp.authority);
