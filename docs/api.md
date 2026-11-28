@@ -221,29 +221,302 @@ Every node also writes one every 6 hours into `<data dir>/backups` (the last 28 
 `--restore-from <bundle>` (`FUCF_RESTORE_FROM`) merges one in (what is newer there stays).
 `.github/workflows/backup.yml` keeps an encrypted copy away from every node.
 
-## Everything else
+## Reference
+
+Every route below sits under `$BASE` (`/client/v4`). What a call needs beyond the route is given as
+its JSON body; fields not named are left alone by `PATCH` and take their defaults on `POST` / `PUT`.
+
+Conventions:
+
+- `CRUD /x` means `GET /x` (list), `POST /x` (create), and `GET`, `PUT` (replace), `PATCH` (change the
+  fields given), `DELETE` on `/x/{id}`. A delete answers `{"id": "…"}`.
+- Lists take `page` and `per_page` (1 to 5000) and answer `result_info`
+  (`page`, `per_page`, `count`, `total_count`, `total_pages`).
+- Objects that belong to a zone carry `id`, `zone_id`, `created_on` and `modified_on`.
+- Accelerate nodes (`--role accelerate`) answer every write with `409`.
+- Errors: `400` for a body that does not check out (the message says which field), `404` for an
+  unknown object, `409` for a conflict (a name taken, a node out of touch), `403` for what the
+  credentials may not do.
+
+### Signing in (no credentials needed)
 
 ```
-/system                                  this node, the fleet's sync state
-/analytics                               all zones' traffic; ?since=24h
-/nodes[/{id}]                            edge nodes
-/fleet, /fleet/{node}/actions            what nodes report; ask a node to do something
-/steering[/{id}]                         where visitors are sent, by place and network
-/proxy/rules[/{id}]                      the nodes' local reverse proxy
-/releases[/{sha256}]                     rolling releases
-/zones/{id}/purge_cache                  {"purge_everything": true} | {"files": […]} | {"prefixes": […]}
-/zones/{id}/ssl/certificate_packs[/{id}] {"hosts": […], "validation_method": "auto|dns|tls-alpn|http"}
-/zones/{id}/custom_certificates[/{id}]   {"certificate", "private_key", "hosts"}
-/zones/{id}/origin_rules[/{id}]          {"expression", "origin_host", "origin_port", "origin_scheme", "host_header", "sni"}
-/zones/{id}/redirect_rules[/{id}]        {"expression", "target_url", "status_code", "preserve_query_string"}
-/zones/{id}/transform_rules[/{id}]       {"expression", "rewrite_path", "set_request_headers", …}
-/zones/{id}/cache_rules[/{id}]           {"expression", "cache", "edge_ttl"}
-/zones/{id}/workers/routes[/{id}]        {"pattern", "script"}
-/zones/{id}/email, /email/rules[/{id}]   e-mail routing
-/zones/{id}/spectrum/apps[/{id}]         TCP / UDP proxying
-/zones/{id}/analytics                    ?since=24h&step=60
-/workers/scripts[/{name}]                PUT: the body is the script
-/workers/scripts/{name}/settings         {"vars": {…}}
-/kv/namespaces[/{id}[/keys|/values/{key}]]
-/d1/database[/{id}[/query|/raw]]
+GET    /auth/status                       {"initialized", "role", "writable", "panel_host"}
+POST   /auth/setup                        {"token", "email", "password"}: the first administrator; only while there is none,
+                                          and only with this node's API token
+POST   /auth/login                        {"email", "password"}: a session, or {"second_step": {"ticket", "methods"}}
+POST   /auth/second_step                  {"ticket", and one of "code" (TOTP), "backup_code", "passkey" (a WebAuthn assertion)}
+POST   /auth/passkey/begin                a challenge for signing in with a passkey alone
+POST   /auth/passkey/finish               the WebAuthn assertion
+GET    /auth/oauth/login                  starts single sign-on with the OIDC provider set in /oauth/config
+GET    /auth/oauth/callback               where the provider sends the browser back
+```
+
+### Your account (panel sessions only)
+
+```
+GET    /account                           who is signed in, sessions, passkeys, whether two-step verification is on
+POST   /account/logout
+POST   /account/password                  {"current", "new"}
+POST   /account/totp/begin                {"secret", "uri", "qr_svg"} for an authenticator app
+POST   /account/totp/enable               {"code"}: answers ten {"backup_codes"}
+POST   /account/two_factor/disable        {"password"}
+POST   /account/backup_codes              {"password"}: ten new codes, the old ones stop working
+POST   /account/passkeys/begin            registration options
+POST   /account/passkeys                  the WebAuthn registration
+DELETE /account/passkeys/{id}
+DELETE /account/sessions/{id}             sign one session out
+```
+
+### Users, single sign-on and the audit trail (admins)
+
+```
+GET    /users
+POST   /users                             {"email", "role": "admin|editor|viewer", "password"}; without "password" one is
+                                          made up and answered this once as "password"
+PATCH  /users/{id}                        {"role", "disabled", "reset_password": true, "reset_two_factor": true}
+DELETE /users/{id}                        the last administrator cannot be removed, demoted or disabled
+GET    /oauth/config                      the OIDC provider for single sign-on; "client_secret" comes back as "***"
+PUT    /oauth/config                      the whole configuration
+GET    /audit                             the last 300 sign-ins, account and user changes, node actions
+```
+
+### Zones
+
+See "Zones and DNS records" above. `PATCH /zones/{id}` takes `{"type": "full|partial"}` and
+`{"paused": true|false}`.
+
+### Zone settings
+
+```
+GET    /zones/{id}/settings               [{"id": name, "value": …, "editable": true}, …]
+GET    /zones/{id}/settings/{name}
+PATCH  /zones/{id}/settings/{name}        {"value": …}
+```
+
+| Setting | Values (default first) |
+| --- | --- |
+| `ssl` | `flexible` (HTTP to the origin), `full` (HTTPS, certificate not checked), `strict` (HTTPS, checked) |
+| `always_use_https` | `false`, `true`: 301 from HTTP to HTTPS |
+| `waf` | `block`, `log`, `off`: the managed ruleset |
+| `development_mode` | `false`, `true`: bypass the cache |
+| `http2`, `http3` | `true`, `false` |
+| `edge_nodes` | `[]` (every node) or node names |
+| `security_level` | `medium`, `off`, `essentially_off`, `low`, `high`, `under_attack` |
+| `challenge_script` | `true`, `false` |
+| `browser_cache_ttl` | `0` (leave the origin's headers alone) to `31536000` seconds |
+| `hsts_max_age` | `0` (no header) to `63072000` seconds; `hsts_include_subdomains`: `false`, `true` |
+| `grpc` | `true`, `false` |
+| `email_routing` | `false`, `true` |
+| `decoy_subdomains` | `false`, `true` |
+| `auto_firewall` | `false`, `true`, with `auto_firewall_threshold` (10), `auto_firewall_window` (600), `auto_firewall_ban` (86400), `auto_firewall_action` (`block`, `managed_challenge`, `js_challenge`), `auto_firewall_networks` (`true`), `auto_firewall_network_ips` (10), `auto_firewall_surge` (50; 0 off) |
+
+```sh
+curl -s -X PATCH $BASE/zones/$ZONE/settings/security_level -H "Authorization: Bearer $TOKEN" -d '{"value": "high"}'
+```
+
+### DNSSEC
+
+```
+GET    /zones/{id}/dnssec                 status, and the DS record to give the registrar
+PATCH  /zones/{id}/dnssec                 {"status": "active|disabled"}
+```
+
+Records are signed online (ECDSA P-256, algorithm 13) with minimal NSEC answers.
+
+### Cache
+
+```
+POST   /zones/{id}/purge_cache            {"purge_everything": true} | {"files": [url, …]} | {"prefixes": [url prefix, …]}
+POST   /warp/purge_cache                  the same, for the edge's own /cdn-cgi/fucf-warp cache
+```
+
+A purge reaches every node through the configuration.
+
+### Certificates
+
+```
+GET    /zones/{id}/ssl/certificate_packs
+POST   /zones/{id}/ssl/certificate_packs           {"hosts": [], "validation_method": "auto|dns|tls-alpn|http"}
+GET    /zones/{id}/ssl/certificate_packs/{id}
+PATCH  /zones/{id}/ssl/certificate_packs/{id}      try again now
+DELETE /zones/{id}/ssl/certificate_packs/{id}
+CRUD   /zones/{id}/custom_certificates             {"certificate": PEM, "private_key": PEM, "hosts": []}
+```
+
+Without `hosts`, a certificate is for the apex and its wildcard. A pack answers `status`
+(`pending`, `active`, `failed`), `error`, `issued_on`, `expires_on`, `attempts`, `next_attempt`, and,
+when the edge has a `--cname-base`, `dns_delegation`: the CNAME records a zone hosted elsewhere adds
+once so that DNS-01 can be answered here. Private keys are never answered.
+
+### Rules
+
+All rule lists take an `expression` (empty matches every request), `description`, `enabled` (true)
+and, where it applies, `priority` (lower first).
+
+```
+CRUD   /zones/{id}/firewall/rules         {"expression", "action", "priority", "enabled", "description"}
+CRUD   /zones/{id}/rate_limits            {"expression", "threshold", "period", "mitigation_timeout", "action", "enabled"}
+CRUD   /zones/{id}/redirect_rules         {"expression", "target_url", "status_code", "preserve_query_string", "priority"}
+CRUD   /zones/{id}/transform_rules        {"expression", "rewrite_path", "set_request_headers", "remove_request_headers",
+                                           "set_response_headers", "remove_response_headers", "priority"}
+CRUD   /zones/{id}/cache_rules            {"expression", "cache", "edge_ttl", "priority"}
+CRUD   /zones/{id}/origin_rules           {"expression", "origin_host", "origin_node", "origin_port", "origin_scheme",
+                                           "host_header", "sni", "priority"}
+```
+
+| List | Fields |
+| --- | --- |
+| firewall rules | `action`: `block`, `js_challenge`, `managed_challenge`, `log`, `skip`. Rules kept by the automatic firewall carry `managed_by`. |
+| rate limits | `threshold` (≥ 1) requests per client address per `period` (1 to 86400 s); `mitigation_timeout` 0 to 86400 s; `action`: `block` (default), `log` |
+| redirect rules | `target_url`: an `http(s)://` URL or a path; `status_code`: 301, 302 (default), 303, 307, 308 |
+| transform rules | at least one action; `rewrite_path` starts with `/` and has no query; `host`, `content-length`, `transfer-encoding`, `connection` and `upgrade` cannot be set or removed. Every matching rule applies. |
+| cache rules | `cache`: `true` caches whatever the file type, `false` never caches; `edge_ttl` 1 to 31536000 s. The first matching rule wins. |
+| origin rules | at least one of the overrides; `origin_scheme`: `http`, `https`; `origin_node`: an edge node to go through |
+
+```sh
+curl -s -X POST $BASE/zones/$ZONE/firewall/rules -H "Authorization: Bearer $TOKEN" -d '{
+  "expression": "http.request.uri.path contains \"/admin\" and not ip.src in {198.51.100.0/24}",
+  "action": "managed_challenge", "priority": 10, "description": "admin pages"
+}'
+curl -s -X POST $BASE/zones/$ZONE/redirect_rules -H "Authorization: Bearer $TOKEN" -d '{
+  "expression": "http.host eq \"old.example.com\"", "target_url": "https://www.example.com/", "status_code": 301,
+  "preserve_query_string": true
+}'
+```
+
+### Security events
+
+```
+GET    /zones/{id}/security/events?limit=100      newest first (at most 5000), from the whole fleet
+GET    /steering/test?ip=&ua=                     where an address is placed, and its threat score
+```
+
+### Workers
+
+```
+GET    /workers/scripts
+GET    /workers/scripts/{name}            the script (not for viewers)
+PUT    /workers/scripts/{name}            the body is the JavaScript source; it is syntax-checked
+DELETE /workers/scripts/{name}
+GET    /workers/scripts/{name}/settings   {"vars", "kv_bindings", "d1_bindings", "crons"}
+PATCH  /workers/scripts/{name}/settings   any of those; bindings map a name in env to a namespace / database id
+POST   /workers/scripts/{name}/scheduled  {"cron": "*/5 * * * *"}: run scheduled() now
+CRUD   /zones/{id}/workers/routes         {"pattern": "example.com/api/*", "script": "name"} ("script": null turns
+                                          Workers off for what matches)
+```
+
+`crons` are five-field UTC expressions.
+
+### Workers KV
+
+```
+GET    /kv/namespaces
+POST   /kv/namespaces                     {"title"}
+GET    /kv/namespaces/{id}
+PATCH  /kv/namespaces/{id}                {"title"}
+DELETE /kv/namespaces/{id}
+GET    /kv/namespaces/{id}/keys           ?prefix=&limit=&cursor=
+GET    /kv/namespaces/{id}/values/{key}   the value as it was stored
+PUT    /kv/namespaces/{id}/values/{key}   the body is the value; ?expiration= (unix seconds), ?expiration_ttl=, ?metadata= (JSON)
+DELETE /kv/namespaces/{id}/values/{key}
+```
+
+### D1
+
+```
+GET    /d1/database
+POST   /d1/database                       {"name"}
+GET    /d1/database/{id}
+DELETE /d1/database/{id}
+POST   /d1/database/{id}/query            {"sql", "params": [...]}: rows as objects
+POST   /d1/database/{id}/raw              the same; rows as arrays
+```
+
+```sh
+curl -s -X POST $BASE/d1/database/$DB/query -H "Authorization: Bearer $TOKEN" -d '{"sql": "SELECT * FROM users WHERE id = ?", "params": [1]}'
+```
+
+### E-mail routing
+
+```
+GET    /email/status                      this node's SMTP listener, host names, relay and recent activity
+GET    /zones/{id}/email                  whether routing is on, the rules, the zone's MX and SPF, and "needed_records"
+CRUD   /zones/{id}/email/rules            {"address", "action": "forward|drop|worker", "destinations": [...], "worker",
+                                           "enabled", "description"}
+```
+
+`address` is a local part (`postmaster`), a full address in the zone, or `*` for every address no
+other rule is for. A forwarding rule has 1 to 10 destinations outside the zones routed here.
+
+```json
+{ "address": "hello", "action": "forward", "destinations": ["someone@example.net"] }
+```
+
+### Spectrum
+
+```
+CRUD   /zones/{id}/spectrum/apps          {"protocol": "tcp/2222", "dns": {"name": "ssh"},
+                                           "origin_direct": ["tcp://192.0.2.1:22"], "proxy_protocol": "off|v1"}
+```
+
+One app per protocol and port across the fleet; `proxy_protocol` is for TCP only.
+
+### Analytics
+
+```
+GET    /analytics                         every zone: ?since=24h (90m, 24h, 7d, or minutes like -1440; at most 30d)
+GET    /zones/{id}/analytics              one zone: ?since= as above, ?step= minutes
+```
+
+### The fleet
+
+```
+GET    /system                            this node: role, build, configuration version, name servers, the peers' sync state
+GET    /fleet                             every node in detail (what it runs, its traffic, its sync and release state)
+POST   /fleet/{node}/actions              {"action": "restart|purge_cache"}: this node at once, a peer when it next gets in touch
+GET    /nodes
+POST   /nodes                             {"name", "ipv4", "ipv6", "continents", "enabled", "traffic_dns_gb", "traffic_throttle_gb",
+                                           "traffic_limit_gb", "traffic_period": "month|day", "traffic_reset_day", "rate_limit_mbps",
+                                           "dns_offload_mode": "drop|linear", "dns_silent_on_limit", "dc", "colo",
+                                           "role": "peer|accelerate", "accel_hosts"}
+GET    /nodes/{id}  PUT  PATCH  DELETE
+GET    /steering
+POST   /steering                          {"name", "priority", "countries", "regions", "continents", "asns", "as_orgs",
+                                           "action": "route|block", "nodes", "enabled"}
+PUT    /steering/{id}  PATCH  DELETE
+GET    /steering/test?ip=&ua=
+GET    /proxy/rules                       the nodes' local reverse proxy
+POST   /proxy/rules                       {"name", "nodes", "listen_port", "hosts", "path_prefix", "exact_path", "rewrite_path",
+                                           "strip_prefix", "redirect_url", "redirect_status", "upstreams": [{"url", "weight",
+                                           "tls_insecure"}], "respond": {"status", "body", "content_type"}, "file_root",
+                                           "index_files", "auto_https", "https_redirect", "preserve_host",
+                                           "set_request_headers", "set_response_headers", "strip_response_headers",
+                                           "is_fallback", "priority"}
+GET    /proxy/rules/{id}  PUT  PATCH  DELETE
+GET    /releases                          the binary each node runs, and the roll-out
+PUT    /releases/{sha256}?signature=      the body is the signed binary: start rolling it out
+DELETE /releases/{sha256}                 take it back (nodes return to what they ran); ?forget=true only drops it
+GET    /releases/{sha256}/binary          for peers
+GET    /backup                            see "Backups"
+```
+
+A node with traffic limits:
+
+```sh
+curl -s -X POST $BASE/nodes -H "Authorization: Bearer $TOKEN" -d '{
+  "name": "nrt1", "ipv4": "203.0.113.10", "continents": ["AS"],
+  "traffic_dns_gb": 1000, "traffic_throttle_gb": 1250, "traffic_limit_gb": 1400, "rate_limit_mbps": 10
+}'
+```
+
+### Between nodes
+
+These are for the fleet itself (the API token or a peer's credentials), not for tools:
+
+```
+GET    /replication/state                 what a node reports, and what it should run
+POST   /replication/report                a node's traffic, security events and status
+GET    /replication/sync                  ?since=&epoch=&since_accounts=&epoch_accounts=: what changed since then
+POST   /replication/sync                  changes pushed by a peer
 ```

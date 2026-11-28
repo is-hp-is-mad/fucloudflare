@@ -6,14 +6,14 @@
 |------|------|
 | DNS | 权威 DNS（UDP/TCP），代理记录解析到边缘 IP；按访客国家 / 大洲 / 运营商（ECS 感知）调度到节点，带健康检查与故障切换，可按地区屏蔽解析 |
 | 面板 | 内嵌的网页控制面板：DNS 记录、机群与节点（含分档限流）、调度规则、区域设置、规则、电子邮件路由、Workers；完全托管与 CNAME 接入两种模式 |
-| 多节点 | 主节点保存配置，其余节点作为只读副本数秒内自动同步（含缓存清除、证书、邮件规则）；副本把流量统计和安全事件上报给主节点 |
+| 多节点 | 无主对等同步（`--role peer --peers ...`）：每个对等节点都可读写，配置、面板账户、Workers KV / D1 和各节点的上报（流量统计、安全事件）在节点之间双向同步，冲突按混合逻辑时钟后写者胜；`--role accelerate` 节点只拉取配置、内存运行、拒绝写入 |
 | CDN | HTTP/1.1、HTTP/2、HTTP/3 (QUIC) 反向代理，WebSocket，gRPC，SNI 证书，边缘缓存与清除（Range、源站故障时回退到过期副本），brotli/gzip 压缩，源站故障转移 |
 | 节点限流 | 每个节点可设周期流量配额（摘除 DNS / 开始限速 / 硬限流三档）和限速；超限节点自动退出 DNS 应答，硬限流后只返回提示页 |
 | 证书 | 内置 ACME 客户端：向 Let's Encrypt 等 CA 自动签发并续期证书（DNS-01 / TLS-ALPN-01 / HTTP-01），也可上传自有证书 |
 | 规则 | 重定向规则、请求/响应改写规则、缓存规则 |
 | 电子邮件 | SMTP 收信与转发路由（不落盘）：按地址 / `+tag` / `*` 兜底转发或丢弃，SRS 发件人改写与退信回溯，支持外发中继（submission 587/465） |
 | 分析 | 全机群的时间序列（分钟级 1 天、小时级 30 天）：请求数、流量、状态码、缓存命中、拦截数、协议版本，按节点、国家、主机名、路径拆分；重启不丢 |
-| WAF | 自定义规则、限速、托管规则集、JS 质询、Under Attack 模式、安全事件日志（全机群汇总） |
+| WAF | 自定义规则、限速、托管规则集、人机验证（`js_challenge` / `managed_challenge`）、按 IP 威胁分的安全级别与 Under Attack 模式、自动防火墙、安全事件日志（全机群汇总） |
 | 回源规则 | 按表达式改写回源地址 / 端口 / 协议 / Host 头 / SNI |
 | Spectrum | 任意 TCP / UDP 端口转发，可选 PROXY protocol v1 |
 | Workers | 在边缘节点运行 JavaScript（Fetch API 子集） |
@@ -40,7 +40,8 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 | `--cname-base` | 无 | 该域名下的所有子名都解析到边缘（如 `cdn.example.com`，需委托给本服务）；CNAME 接入模式的区域把主机名 CNAME 到它 |
 | `--panel-host` | 无 | 在边缘上以该主机名对外发布面板和管理 API（HTTPS，仍需令牌） |
 | `--panel-origin` | 无 | 多节点承载面板：本节点把面板主机名的请求转给运行面板的节点（`ip[:port]`，HTTPS，按面板主机名校验证书），访客地址随 `X-Forwarded-For` 带过去；以面板主机名配置的同步对端也直连这里。这样面板的 DNS 记录可以开代理、解析到任意节点 |
-| `--primary` | 无 | 作为只读副本运行：主节点的面板主机名（走 HTTPS），或它的管理 API 地址 `http://host:port` |
+| `--role` | `peer` | `peer`：可读写的控制面，与 `--peers` 双向同步；`accelerate`：只读的纯加速节点（见"无主对等同步与纯加速节点"） |
+| `--peers` | 无 | 逗号分隔的同步对端：面板主机名或节点主机名（走 HTTPS），或 `http(s)://host:port`。旧的 `--primary` 仍被接受（并入 `--peers`），已不推荐 |
 | `--node-name` | 自动 | 本节点在机群里的名字；默认取 `--edge-ip` 所属的已登记节点 |
 | `--acme-directory` | Let's Encrypt | 签发托管证书的 CA 的 ACME 目录地址；`off` 关闭。使用即表示同意该 CA 的服务条款 |
 | `--acme-email` | 无 | 留给 CA 的联系邮箱（到期提醒） |
@@ -61,7 +62,7 @@ cargo run --release -- --ns ns1.yourdomain.com,ns2.yourdomain.com --edge-ip 203.
 zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是简化的自有结构。
 
 ```
-/system                                  GET              角色（primary / replica）、节点名、配置版本、NS、CNAME 基础域名；主节点上还有各副本的同步状态
+/system                                  GET              角色（peer / accelerate）、节点名、配置版本、NS、CNAME 基础域名，以及各对端的同步状态
 /analytics                               GET              所有区域的流量合计，?since= 同下
 /warp/purge_cache                        POST             清除预留端点 /cdn-cgi/fucf-warp 的缓存：{"purge_everything":true} | {"files":[键...]} | {"prefixes":[键前缀...]}
 /nodes[/{id}]                            CRUD             {"name", "ipv4", "ipv6", "continents": ["AS","OC"], "enabled", "traffic_dns_gb", "traffic_throttle_gb", "traffic_limit_gb", "traffic_period", "traffic_reset_day", "rate_limit_mbps"}；
@@ -130,11 +131,14 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 | `http2` | bool（默认开） | 向访客提供 HTTP/2；关闭后 TCP 上只有 HTTP/1.1 |
 | `http3` | bool（默认开） | 提供 HTTP/3 (QUIC)，通过 `Alt-Svc` 头和 HTTPS DNS 记录通告；关闭后两者都不再通告 |
 | `edge_nodes` | 节点名数组（默认空） | 只由这些节点服务该区域；空表示所有节点，按访客位置调度 |
-| `security_level` | `medium`(默认) / `under_attack` | Under Attack 模式：所有访客先过 JS 质询（防火墙的 `skip` 规则可豁免，如回调接口） |
+| `security_level` | `off` / `essentially_off` / `low` / `medium`(默认) / `high` / `under_attack` | 按访客 IP 的威胁分决定谁要先过人机验证（见"安全级别、IP 纯净度与页面内人机验证"）；`under_attack` 时所有访客都要过（防火墙的 `skip` 规则可豁免，如回调接口） |
+| `challenge_script` | bool（默认开） | 把 fucf 的验证脚本注入站点的 HTML 页面：后台静默完成验证，并就地处理被要求验证的 `fetch` 请求 |
 | `browser_cache_ttl` | 秒（默认 0） | 边缘会缓存的内容，浏览器缓存时间不足该值时提到该值；0 表示不改源站的 `Cache-Control` |
 | `hsts_max_age` / `hsts_include_subdomains` | 秒（默认 0）/ bool | HTTPS 响应带 `Strict-Transport-Security`；0 表示不发 |
 | `grpc` | bool（默认开） | 代理 gRPC：经 HTTP/2 或 HTTP/3 到达、`Content-Type` 为 `application/grpc` 的请求以 HTTP/2 回源 |
 | `email_routing` | bool（默认关） | 启用该区域的电子邮件路由（需配合开启 `--smtp-listen` 的节点与 MX 记录） |
+| `decoy_subdomains` | bool（默认关） | 伪装子域：没有记录的名字也能解析，但边缘不应答（见"伪装子域"） |
+| `auto_firewall` 及 `auto_firewall_*` | 见"自动防火墙" | 按近期安全事件自动封禁地址、网络，或切到受攻击模式 |
 
 ### 规则表达式
 
@@ -153,7 +157,7 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 - 函数：`lower() upper() url_decode() len() starts_with(x,"p") ends_with(x,"s")`
 - 空表达式匹配所有请求。
 
-防火墙动作：`block`、`js_challenge`、`log`、`skip`（放行并跳过限速与托管规则）。按 `priority` 升序执行。
+防火墙动作：`block`、`js_challenge`（人机验证，浏览器看起来可疑时才要点击）、`managed_challenge`（总是要点击一次）、`log`、`skip`（放行并跳过限速与托管规则）。按 `priority` 升序执行。
 
 ## 面板、节点与调度
 
@@ -262,7 +266,7 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 - Range：缓存里有完整对象时，单段 Range 请求直接切片返回 206（`If-Range` 不匹配或多段时返回整个对象）；缓存里没有时原样转给源站，其应答不入缓存。
 - 源站故障：源站连不上、超时或返回 500/502/503/504 时，过期不超过 24 小时的缓存副本照常返回（`STALE`）。
 - 没有 `Content-Length` 的响应（如源站边压缩边发送）在 8 MiB 以内时读完后入缓存，更大的照常流式透传。
-- 回源请求带 `CF-IPCountry`（访客国家，需要 GeoIP 库；客户端自带的同名头会被去掉）。
+- 回源请求带 `fcf-ipcountry` 和 `cf-ipcountry`（访客国家，需要 GeoIP 库；客户端自带的同名头会被去掉）。
 - gRPC：区域设置 `grpc` 开启时（默认），gRPC 请求以 HTTP/2 回源（源站用 TLS 时须支持 ALPN `h2`，明文时须支持 h2c），
   请求和响应都按消息流式透传（含双向流），响应 trailers（`grpc-status`）原样送达；一次调用没有时长上限，连接靠 HTTP/2 ping 保活。
   边缘自己拒绝或失败的请求（WAF、限流、源站不可达）以 gRPC 状态码返回而不是错误页。gRPC-Web 是普通 HTTP，不走这条路径。
@@ -270,7 +274,7 @@ ACME 账户密钥只保存在主节点的数据目录里。测试时可把 `--ac
 - 缓存规则：`cache: true` 让任意内容类型可缓存，`edge_ttl` 覆盖源站的 `Cache-Control`；`cache: false` 强制不缓存。首条匹配生效。
 
 - 缓存：默认只缓存静态扩展名（js/css/图片/字体等），或源站显式返回 `Cache-Control: public` / `s-maxage`；
-  遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `CF-Cache-Status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`。
+  遵守 `no-store/private/no-cache`、`Set-Cookie`、`Vary`。响应头 `fcf-cache-status`: `HIT / MISS / EXPIRED / REVALIDATED / STALE / BYPASS / DYNAMIC`（边缘自己应答的为 `NONE`）。
 - HTTPS：优先使用上传的证书，其次是自动签发的托管证书，都没有则为托管域名即时生成自签名证书（见"证书"一节）。
 - DNS：根域名可以建 CNAME（CNAME 拉平）：应答时不返回 CNAME，而是目标的 A/AAAA；目标在本服务托管的区域内时直接查，
   否则由后台每分钟用系统解析器解析一次。根域名的 CNAME 可以和 MX/TXT 等记录并存，但不能和 A/AAAA 并存。
@@ -305,8 +309,8 @@ export default {
 
 ## 面板账户、两步验证与通行密钥
 
-面板用账户登录。账户只存在提供面板的那个节点上（数据目录的 `accounts.json`，权限 0600），不属于配置，不会同步给副本。
-API 令牌照旧可用（运维脚本、副本同步、应急），拥有全部权限，不走两步验证。
+面板用账户登录。账户保存在数据目录的 `accounts.json`（权限 0600），不属于配置，但作为单独的一份在对等节点之间同步（纯加速节点不保存）。
+API 令牌照旧可用（运维脚本、节点间同步、应急），拥有全部权限，不走两步验证。
 
 - **初始化**：还没有任何账户时，面板要求填写邮箱、密码和本节点的 API 令牌，创建第一个管理员（`POST /auth/setup`）。
   也可以用令牌直接建：`POST /users {"email": "...", "role": "admin"}`，不带密码时系统随机生成一个并只返回这一次，对方首次登录必须改掉。
@@ -607,9 +611,10 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
 
 ## 已知限制
 
-- 多节点：配置单向同步（主节点 → 副本轮询）；缓存和限速计数是各节点各自的内存状态。分析数据和安全事件每 2 分钟及退出时落盘，
-  进程被强杀会丢最后这一段；副本联系不上主节点期间攒着待上报的数据，重启则丢失。
-  主节点不可用时副本继续按最后一次拿到的配置服务，但无法修改配置，证书也不会续期。
+- 多节点：对等节点之间双向同步，冲突按混合逻辑时钟后写者胜（同一对象几乎同时在两处修改时，只留下一处的修改）；缓存和限速计数是各节点各自的内存状态。
+  分析数据和安全事件每 2 分钟及退出时落盘，进程被强杀会丢最后这一段；对端保留各节点上报的时间有限（6 小时、16 MiB），离线更久的节点回来后拿不全。
+  纯加速节点不落盘、不能修改配置，所有对等节点都联系不上时按最后一次拿到的配置服务。
+  ACME 签发和续期由在线对等节点里选出的一个负责（租约），没有在线的对等节点时不会续期。
 - 调度：健康检查只到 TLS 握手为止，不发 HTTP 请求；GeoIP 精度到国家、ASN 和（中国大陆，需 ip2region 库）省份，没有城市级调度。
 - 证书：ACME 客户端只支持 ECDSA P-256 账户和证书密钥，不支持 External Account Binding（需要它的 CA 如 ZeroSSL 用不了）；
   对真实 CA 只实测过 Let's Encrypt（staging 和正式）的 TLS-ALPN-01；DNS-01 和 HTTP-01 目前只有模拟 CA 的自动化测试；HTTP/3 (QUIC) 监听不应答 TLS-ALPN-01（CA 只走 TCP，不影响签发）。
@@ -618,7 +623,7 @@ python scripts\dnsq.py 127.0.0.1 53 www.example.com A   # 手动查询 DNS
   发布的二进制在主节点内存里过一遍（上传和下载各一份），小内存机器上注意 `MemoryMax`。
 - HTTP/3 前置：经前置入口进来的 gRPC 不按 gRPC 处理（中间那一跳是 HTTP/1.1，带不了 trailers）；WebSocket 不经过它
   （HTTP/3 没有升级）；请求和响应都多一次本机转发。
-- DNS：没有 DNSSEC、AXFR；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
+- DNS：没有 AXFR；DNSSEC 只支持在线签名（ECDSA P-256，算法 13，NSEC 用最小否定应答）；CNAME 拉平的外部目标靠系统解析器，拿不到 TTL，固定每分钟刷新、以 60 秒 TTL 应答，刚建好的记录要等第一次解析完成才有应答。
 - 缓存：单个对象上限 32 MiB（未声明长度的 8 MiB）；Range 请求只在缓存里已有完整对象时由缓存应答，不会为它去源站拉完整对象；多段 Range 返回整个对象。
 - HTTP/3：不支持 0-RTT。回源除 gRPC 用 HTTP/2 外主要为 HTTP/1.1。
 - gRPC：经 Worker 路由的请求不走 gRPC 路径；请求侧的 trailers 不转发；WAF 不检查 gRPC 请求体。

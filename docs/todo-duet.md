@@ -1,0 +1,231 @@
+# todo-duet.md：Duet 的规则与任务
+
+先读完第 1、2 节再动手。任务在第 3 节，按顺序做；每做完一个，在本文件里勾选、在第 4 节写交接记录、然后提交。
+
+## 0. 背景
+
+fucf 是自托管的 Cloudflare 式边缘平台（Rust，单一二进制，见 `README.md`）。当前目标是继续对标 Cloudflare。
+本文件里的任务归你；调度、DNS、TLS、缓存、同步、Tunnel、Workers 引擎由别人同时在 `next` 分支上做。
+
+你只能操作这个 GitHub 仓库，没有编译器，也不能运行测试。所以要求是：**代码写到第一次就能编译**，测试照常写好，
+编译、运行测试和合并由别人最后统一做。不要为了"验证"去触发或等待 CI。
+
+## 1. 规则
+
+### 1.1 分支与提交
+
+- 只在 `duet` 分支上工作（不存在就从 `next` 创建）。**不要推送到 `master` 和 `next`**，不要强推，不要改写历史。
+- 一个任务一个提交（大任务可以两三个）。提交信息用英文，格式照 `git log`：`feat: 一句完整的小写英文句子`，正文用 `- ` 列要点。
+- 提交身份必须是仓库所有者的 GitHub noreply 身份
+  `is-hp-is-mad <127638251+is-hp-is-mad@users.noreply.github.com>`。提交里不得出现机器主机名或私人邮箱。
+
+### 1.2 这是公开仓库
+
+- 代码、测试、文档里只用示例数据：域名用 `example.com` / `example.net` / `*.test`，
+  地址用 `192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`、`2001:db8::/32`。不写任何真实 IP、真实域名、真实邮箱。
+- 不写任何密钥或令牌。测试夹具必须一眼看得出是假的（如 `test-token`）；CI 对全部历史做 gitleaks 扫描，
+  提交进去就永远留在历史里。
+
+### 1.3 没有编译器时怎么写 Rust
+
+- **不新增依赖**：不要改 `Cargo.toml` 和 `Cargo.lock`（CI 用 `--locked`，锁文件对不上就整个编译失败）。
+  现有的够用：tokio、axum 0.8、serde / serde_json、uuid、chrono、regex、ring、rustls、hyper 1、bytes、base64、flate2、brotli、rusqlite 等。
+- **签名照抄，不凭记忆**：调用任何已有函数、类型、字段之前，先在仓库里搜到它的定义，按定义写。每个 `use` 路径都要搜得到。
+- **`await` 与借用**（之前最常见的编译失败）：`.await` 之前把要用的值克隆成自有值；`std::sync::Mutex` 的锁不得跨 `.await`；
+  处理函数的 future 必须是 `Send`。新的处理函数照抄同文件里最相近的那个的写法。
+- **零警告**：`cargo check --tests` 在 Windows 和 Linux 上都必须没有警告。不留未使用的 import、变量、函数；
+  不用 `#[allow(dead_code)]` 掩盖。只在 Unix 上能做的事放在 `#[cfg(unix)]` 后面，并给其他平台一个对应实现。
+- **axum 0.8**：路径参数写 `{zone_id}`；处理函数的请求体参数（`Bytes`）放最后；返回 `ApiResult`。
+- **风格**：照所在文件的现有风格。每个新的类型和函数写英文文档注释，说明"为什么"；测试名用整句
+  （如 `a_report_counts_once_whichever_ways_it_comes`）。不写 emoji。
+- **读大文件用搜索**：`src/panel.html`、`src/api.rs`、`src/edge/mod.rs`、`src/store.rs`、`src/auth.rs` 都在 100 KB 以上，
+  按下面给的锚点字符串搜索后读片段，不要整文件读。
+- 拿不准的地方不要猜着写一大片：写最小可行的实现，把疑问记进交接记录。
+
+### 1.4 不要碰的文件
+
+`Cargo.toml`、`Cargo.lock`、`.gitignore`、`.github/workflows/ci.yml`、`scripts/deploy/`、
+`src/dns/`、`src/sync/`、`src/reports.rs`、`src/fleet.rs`、`src/release.rs`、`src/limits.rs`、`src/handoff*.rs`、
+`src/edge/{cache,tls,upstream,proxy,h3,quic_mux,front}.rs`、`src/workers/`。
+这些有人在同时修改。任务需要它们配合时，只调用其现有的公开接口；需要它们改动的，写进交接记录。
+
+### 1.5 每个任务的固定产出
+
+1. 功能本体尽量放**新文件**；对热点文件（`api.rs`、`main.rs`、`store.rs`、`items.rs`、`edge/mod.rs`、`panel.html`）只做最小的接线改动。
+2. 同文件内的单元测试（`#[cfg(test)] mod tests`），不依赖网络。
+3. `docs/api.md`（英文，示例域名）补上新接口；`README.md`（中文）补一小节。
+4. 面板里能配置它（照相邻功能的写法，用现有的 `btn(...)`、`openForm(...)`、`api(...)`）。
+5. 本文件：勾选任务，第 4 节写 3 到 5 行交接记录。
+
+## 2. 代码地图（接线位置，都用搜索定位）
+
+| 要做的事 | 位置与锚点 |
+|---|---|
+| 加一个模块 | `src/main.rs` 顶部的 `mod` 列表；边缘相关的放 `src/edge/`，在 `src/edge/mod.rs` 顶部 `pub mod` 列表登记 |
+| 加 API 路由 | `src/api.rs`，在 `.route("/zones/{zone_id}/analytics", get(analytics))` 之前。通用增删改查用 `crud::<T>("/zones/{zone_id}/…")` |
+| API 辅助 | `src/api.rs`：`St`、`Params`、`Who`、`Caller`、`ApiResult`、`ok(...)`、`bad(...)`、`body(&bytes)`、`paginated(...)`、`ApiError` |
+| 令牌权限 | `src/tokens.rs` 的 `pub fn need(path: &str) -> Need`：**没登记的路径一律拒绝令牌访问**。新路径要在这里映射到 `Area`；新 `Area` 要在 `groups!` 表里加读、写两个权限组（id 任取 32 位十六进制，不与已有重复） |
+| Cloudflare 的账户级路径 | `src/api.rs` 的 `fn account_path`：把 `/accounts/{id}/…` 映射到内部路径 |
+| 域名下的配置对象 | `src/items.rs`：实现 `Item`（照 `CacheRule`，含 `item_boilerplate!`）。`src/store.rs` 里搜 `cache_rules`，它出现的每一处都要给新字段照做一份 |
+| 全局配置对象 | 照 `steering`：`src/items.rs` 的 `SteerRule`；`src/store.rs` 里搜 `steering`，每一处照做；API 照 `list_steering` / `create_steering` / `update_steering` / `delete_steering` |
+| 区域设置项 | `src/items.rs` 的 `Settings`（搜 `browser_cache_ttl`，定义、默认值、校验各一处），README 的"区域设置"表 |
+| 规则表达式 | `src/expr.rs`：`Expr::parse`、`ReqInfo`、`matches(&info)` |
+| 请求处理链 | `src/edge/mod.rs` 的 `async fn process(`：`/cdn-cgi/` → 面板 → 节点限流 → 主机匹配 → `ReqInfo {` → `self.waf.check(` → 重定向 → 改写 → Worker → 缓存与回源 |
+| 响应出口 | `src/edge/mod.rs` 的 `pub async fn respond(`：错误页（`fn page(`、`fn page_with(`、`PageCtx`、`EdgeError`）、统计（`edge.stats.record(`） |
+| 人机验证 | `src/edge/challenge.rs`（`VERIFY_PATH`、`config`、`assess_at`、`verify`），脚本在 `src/edge/challenge-*.js`；签名用 `Waf::mac` / `mac_ok`（全机群同一密钥） |
+| 只在面板所在节点跑的后台任务 | `src/main.rs` 里搜 `edge::autofw::spawn(`，新任务挂在同一个条件下 |
+| 机群状态 | `st.fleet.status(node, version)`（含 `online`、`in_sync`）、`st.fleet.usage(node)`、`st.health.is_up(node)`、`st.store.list_nodes()` |
+| 向外发 HTTP 请求 | 照 `src/edge/reputation.rs` 里 `async fn fetch(` 的做法（`Target::from_url` 加 `edge.upstream.send`） |
+| API 测试 | `src/api.rs` 测试模块的 `make_test_state` 和 `call` |
+| 边缘测试 | `src/edge/tests.rs` 的 `setup()`、`get(&env, host, uri)`、`send(&env, method, host, uri, extra_headers, body)` |
+
+## 3. 任务
+
+### [x] T1 文档与现状对齐（不改代码）
+
+- `README.md` 的"已知限制"和开头的模块表已经过时。逐条对照代码核实后改正，不确定的不要改。已知过时的例子：
+  写着没有 DNSSEC（实际有，`src/dns/dnssec.rs`）；写着配置单向同步（实际是对等同步，`src/sync/`）；
+  响应头写的是 `CF-Cache-Status`（实际是 `fcf-cache-status`）；防火墙动作缺 `managed_challenge`；`security_level` 的取值不全。
+- `docs/api.md` 只覆盖了一部分接口。对照 `src/api.rs` 里全部 `.route(` 和 `crud::<`，补成完整的接口参考（方法、路径、请求体字段、示例）。
+
+### [ ] T2 e2e 分层测试的静态对齐
+
+- `scripts/e2e_tiers/`（T1 到 T4）里的接口路径和代码不一致，例如 `harness.py` 的
+  `KV_NAMESPACES_PATH = "/workers/kv/namespaces"`（实际是 `/kv/namespaces`）、D1 的路径（实际是 `/d1/database`）。
+- 只做能静态确定的修正：对照 `src/api.rs` 改路径常量；响应头名 `cf-*` 改成 `fcf-*`（`cf-connecting-ip` 除外，它仍然发给源站）。
+- 不要动 `scripts/e2e.py` 里的 baseline 部分。其余失败原因留给能运行的人，在交接记录里列出你看到的疑点。
+
+### [ ] T3 Rulesets API（Terraform / cf-terraforming 兼容）
+
+- 目标：在现有规则类型上加一层 Cloudflare Rulesets API 的映射，不引入新的存储。新文件 `src/rulesets.rs`。
+- 阶段与现有类型的对应（字段以 `src/items.rs` 里的结构体为准）：
+
+  | phase | 现有类型 | Cloudflare 规则里的字段 |
+  |---|---|---|
+  | `http_request_firewall_custom` | `FirewallRule` | `action`：block / js_challenge / managed_challenge / log / skip |
+  | `http_ratelimit` | `RateLimit` | `ratelimit.requests_per_period`、`period`、`mitigation_timeout` |
+  | `http_request_dynamic_redirect` | `RedirectRule` | `action_parameters.from_value.{target_url.value, status_code, preserve_query_string}` |
+  | `http_request_transform` | `TransformRule` 的路径改写 | `action_parameters.uri.path.value` |
+  | `http_request_late_transform` | `TransformRule` 的请求头 | `action_parameters.headers.{name}.{operation, value}` |
+  | `http_response_headers_transform` | `TransformRule` 的响应头 | 同上 |
+  | `http_request_cache_settings` | `CacheRule` | `action_parameters.cache`、`edge_ttl.default` |
+  | `http_request_origin` | `OriginRule` | `action_parameters.{host_header, origin.host, origin.port, sni.value}` |
+
+- 接口（都在 `/zones/{zone_id}/rulesets` 下）：列出各阶段的入口规则集；按 id 读取；
+  `GET` / `PUT …/phases/{phase}/entrypoint`（`PUT` 整体替换该阶段的规则，顺序即优先级）；
+  `POST …/{ruleset_id}/rules`；`PATCH` / `DELETE …/{ruleset_id}/rules/{rule_id}`。
+  规则集 id 由域名 id 和阶段确定性地生成；规则 id 就是现有对象的 id。
+- 一条 `TransformRule` 同时有路径、请求头、响应头时，它在三个阶段里各出现一次；经某个阶段修改时只动那一部分。
+- 遇到映射不了的字段或动作，返回 400 并说明是哪个字段，不要静默丢弃。
+- 权限：`need()` 里按 `phase` 映射到对应的现有 `Area`；不带阶段的路径用 `Area::Firewall`。
+- 测试：每个阶段"Cloudflare JSON → 现有对象 → Cloudflare JSON"往返一致；`PUT` 替换后的顺序与删除；未知动作被拒绝。
+
+### [ ] T4 IP 列表
+
+- 目标：可复用的地址列表，规则里写 `ip.src in $office`。
+- 存储：全局对象 `IpList { id, name, description, items: [{ id, ip, comment }] }`，`ip` 是单个地址或 CIDR。名字只允许小写字母、数字、下划线。
+- 接口（内部路径，并在 `account_path` 里把 Cloudflare 的 `/accounts/{id}/rules/lists…` 映射过来）：
+  `/rules/lists` 列出、创建；`/rules/lists/{list_id}` 读、改、删；`/rules/lists/{list_id}/items` 列出、追加、整体替换、按 id 删除。
+- 表达式：`src/expr.rs` 让 `in` 的右边可以是 `$名字`。规则在快照构建时编译，名字在那时解析成地址集合；
+  找不到的名字不匹配任何地址。被规则引用的列表不许删除（返回冲突）。
+- 权限：新 `Area::Lists`（账户级），读、写两个权限组。
+- 测试：解析与匹配（IPv4、IPv6、CIDR）；列表改了以后规则跟着变；删除被引用的列表被拒绝。
+
+### [ ] T5 自定义错误页
+
+- 目标：域名可以替换边缘自己产生的错误页。
+- 区域设置 `error_pages`：键为 `5xx`、`block`、`ratelimit`、`1xxx`（节点自身的 4xx/5xx 提示）的映射，值是 HTML，每个不超过 64 KiB。
+- 模板里可用占位符：`::RAY_ID::`、`::STATUS::`、`::CLIENT_IP::`、`::HOST::`、`::NODE::`、`::ERROR_BOX::`（替换成默认页的主体）。
+  占位符的值要做 HTML 转义。
+- 只替换给浏览器看的页面：gRPC、非页面请求（参见 `challenge::is_navigation`）、人机验证页保持原样。
+- 测试：占位符替换与转义；没配置时与现在完全一致；超长被拒绝。
+
+### [ ] T6 告警
+
+- 目标：出事时主动通知。新文件 `src/alerts.rs`。
+- 通道：全局对象 `AlertChannel { id, name, kind, enabled, events, … }`，`kind` 为 `webhook`（POST JSON）或 `telegram`（机器人令牌加 chat id）。
+  接口输出里把令牌和带密钥的 URL 打码（做法参见 `src/auth.rs` 里 `oauth_config` 对 `client_secret` 的处理）。
+- 事件（第一版）：`node_offline`（节点连续 3 次检查不在线）、`sync_lagging`（在线但超过 5 分钟未同步）、
+  `certificate_failing`（证书包签发失败，或 14 天内到期）、`traffic_limit`（节点流量到档）、
+  `under_attack`（域名被自动切到受攻击模式）、`origin_errors`（某域名 5 分钟内回源错误事件达到阈值）。
+- 行为：只在面板所在节点评估和发送；状态变化时发（触发和恢复各一次），持续触发时每 6 小时重发；进程启动后 2 分钟内不发 `node_offline`。
+  状态只放内存。
+- 接口：`/alerts/channels` 增删改查；`POST /alerts/channels/{id}/test` 发一条测试；`GET /alerts/active` 当前触发中的告警。
+- 评估逻辑写成不依赖时钟和网络的纯函数（输入机群状态，输出告警集合），便于测试。
+- 测试：各事件的触发与恢复；重发间隔；启动宽限期；打码。
+
+### [ ] T7 请求日志
+
+- 目标：能看到最近的每一个请求，并能推送到外部。新文件 `src/edge/reqlog.rs`。
+- 每个节点在内存里保留最近 5000 条：时间、ray、节点、域名、主机、方法、路径（不含查询串，最长 512 字节）、状态码、
+  缓存标签、字节数、耗时、访客地址、国家、ASN、User-Agent（最长 256 字节）、协议版本、被拦截的动作。在 `respond(` 里 `edge.stats.record(` 旁边记录。
+- 接口：`GET /zones/{zone_id}/logs/requests`，参数 `since`（序号游标）、`limit`、`status`、`host`、`path`、`ip`；只返回应答的这个节点上的日志。
+- 面板：域名下加"实时日志"页，每 2 秒用游标拉取，可按状态码和路径过滤。
+- 推送：全局对象 `LogJob { id, name, zone_id, destination, enabled, status_min, batch_seconds }`，每个节点把自己的日志按批以 NDJSON POST 到 `destination`；
+  失败丢弃该批并记一条警告，不无限重试。
+- README 里说明日志含访客地址，以及保留条数。
+- 测试：环形缓冲的容量与游标；过滤；路径和 UA 的截断。
+
+### [ ] T8 Waiting Room
+
+- 目标：源站扛不住时让访客排队。新文件 `src/edge/waiting.rs`，在 `process(` 里回源之前检查。
+- 域名下的对象 `WaitingRoom { host, path_prefix, total_active_users, new_users_per_minute, session_minutes, enabled, … }`。
+- 行为：已放行的访客带签名 Cookie（`Waf::mac`），在 `session_minutes` 内直接通过；名额满或进入速率超限时返回排队页
+  （自动刷新，显示大致位置），先到的先放行。计数是每个节点各自的，文档里写明。
+- 只对页面请求排队；`/cdn-cgi/`、已有 Cookie 的后续请求、防火墙 `skip` 的请求不排队。
+- 测试：名额与速率；Cookie 的签名与过期；先到先放行；伪造 Cookie 无效。
+
+### [ ] T9 人机验证对外开放
+
+- 目标：让任意页面嵌入我们的人机验证，并由后端校验结果（相当于 Turnstile）。
+- 全局对象 `ChallengeWidget { id（即 sitekey）, name, domains, secret, … }`，`secret` 只在创建时返回一次。
+- 前端：`/cdn-cgi/challenge-platform/widget.js`，在带 `data-sitekey` 的容器里渲染，复用现有的检测与计算逻辑，
+  通过后把令牌写进隐藏字段 `fcf-challenge-response`。
+- 后端：`POST /cdn-cgi/challenge-platform/siteverify`（表单或 JSON：`secret`、`response`、`remoteip`），
+  返回 `{ success, challenge_ts, hostname, error-codes }`。令牌无状态、带签名、5 分钟有效、绑定 sitekey 与主机名；
+  同一节点上同一令牌只接受一次。
+- 测试：令牌的签发与校验；过期；主机名不在 `domains`；`secret` 错误；重复提交。
+
+### [ ] T10 转发邮件的 DKIM 签名
+
+- 目标：经邮件路由转发出去的信带上本域名的 DKIM 签名。新文件 `src/dkim.rs`。
+- 密钥由用户提供：域名的邮件设置里加 `dkim_selector` 和 `dkim_private_key`（RSA，PKCS#8 PEM），用 `ring` 的 `RsaKeyPair` 做 rsa-sha256 签名。
+  面板显示用户需要添加的 TXT 记录内容。接口输出不返回私钥。
+- 规范化用 relaxed/relaxed；签名的头至少包括 From、To、Subject、Date、Message-ID；在 `src/mail.rs` 转发出去之前加签。
+- ARC 封装作为第二步，DKIM 部分完成并记录后再做。
+- 测试：两种规范化对照 RFC 6376 的例子；用测试密钥签名后再用 `ring` 验证通过；没配置密钥时邮件不变。
+
+### [ ] T11 Access
+
+- 目标：在站点前面加登录。**这是安全功能：宁可少做，不可放宽任何现有检查。**
+- 域名下的对象 `AccessApp { host, path_prefix, allow_emails, allow_email_domains, session_hours, enabled, … }`。
+- 流程：未登录的请求被重定向到面板主机的登录页，用现有的面板账户（含通行密钥）登录，邮箱在允许范围内则签发短期令牌，
+  带回站点后由边缘换成该主机的签名 Cookie。源站收到 `fcf-access-authenticated-user-email` 头；访客自带的同名头必须先去掉。
+- 回跳地址只允许回到该应用自己的主机；令牌绑定应用 id 与主机，单次使用。
+- 测试：未登录被重定向；不在名单被拒；Cookie 伪造和过期；回跳地址被篡改；访客伪造身份头被去掉。
+
+### [ ] T12 多租户：域名归属用户
+
+- 目标：域名属于创建它的用户，普通用户只能看到和修改自己的域名。**同样是安全功能，规则同 T11。**
+- `Zone` 加 `owner`（用户 id）；已有的域名归属为空，只有管理员可见，管理员可以改归属。
+- 用一处统一的检查覆盖所有 `/zones/{zone_id}/…` 路径（在 `src/api.rs` 的 `auth` 中间件里，参见 `tokens.rs` 的 `sees_zone`），
+  不要在每个处理函数里各写一遍。域名列表按归属过滤。账户级的对象（节点、调度、Workers、KV、D1 等）第一版仍只有管理员可写。
+- 测试：两个普通用户互相看不到、改不了对方的域名（逐类接口各测一个）；管理员都能看到；令牌不能越过归属。
+
+### [ ] T13 兼容性验证的 CI 工作流（草稿）
+
+- 新文件 `.github/workflows/compat.yml`，只在 `workflow_dispatch` 时运行：启动一个本地 fucf（做法照 `ci.yml` 的 UI 作业），
+  然后用真实工具指向它：Terraform 的 cloudflare provider（建域名、记录、T3 的规则）、wrangler（部署一个 Worker）、
+  一个 DNS-01 插件、一个 DDNS 客户端。每个工具一个作业，互不影响。
+- 这份工作流需要实际运行后再调整，写清楚每一步预期什么即可。
+
+## 4. 交接记录
+
+每个任务完成后追加一段：加了什么文件、在哪里接的线、哪些地方没把握或需要第 1.4 节那些文件配合。
+
+### T1
+
+- 改了 `README.md`：模块表的多节点与 WAF 两行、`--role` / `--peers`（`--primary` 记为已不推荐）、`/system`、区域设置表（`security_level` 全部取值、`challenge_script`、`decoy_subdomains`、`auto_firewall*`）、防火墙动作加 `managed_challenge`、`fcf-cache-status` / `fcf-ipcountry`、账户在对等节点间同步、"已知限制"的多节点和 DNS 两条。
+- `docs/api.md` 新增"Reference"一节，覆盖 `src/api.rs` 里全部 `.route(` 和 `crud::<`，含字段、取值范围和示例；节点之间用的 `/replication/*` 单列。
+- 没把握所以没改：README 里"证书""滚动更新""节点限流""三节点部署"几节仍按主节点 / 副本描述（发布由哪个节点协调、限流状态由谁写入配置，需要看 `src/release.rs`、`src/fleet.rs` 的人确认）；`src/auth.rs` 顶部注释也还写着账户不同步给副本。
+
