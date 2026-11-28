@@ -2062,6 +2062,9 @@ struct PurgeBody {
     files: Vec<String>,
     #[serde(default)]
     prefixes: Vec<String>,
+    /// What the origin tagged with one of these in its `Cache-Tag` header.
+    #[serde(default)]
+    tags: Vec<String>,
     /// Everything of these host names (Cloudflare's `hosts`).
     #[serde(default)]
     hosts: Vec<String>,
@@ -2084,14 +2087,15 @@ async fn purge(st: &ApiState, scope: &str, mut b: PurgeBody) -> ApiResult {
     // a host is the prefix that ends where its paths begin
     let hosts = std::mem::take(&mut b.hosts);
     b.prefixes.extend(hosts.iter().map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase()).filter(|h| !h.is_empty()).map(|h| format!("{h}/")));
-    if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() {
-        return Err(bad("specify purge_everything, files, prefixes or hosts"));
+    b.tags = b.tags.iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if !b.purge_everything && b.files.is_empty() && b.prefixes.is_empty() && b.tags.is_empty() {
+        return Err(bad("specify purge_everything, files, prefixes, hosts or tags"));
     }
-    st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone()).await?;
+    st.store.add_purge_async(scope, b.purge_everything, b.files.clone(), b.prefixes.clone(), b.tags.clone()).await?;
     let purged = if b.purge_everything {
         st.cache.purge_zone(scope)
     } else {
-        st.cache.purge_urls(scope, &b.files, false) + st.cache.purge_urls(scope, &b.prefixes, true)
+        st.cache.purge_urls(scope, &b.files, false) + st.cache.purge_urls(scope, &b.prefixes, true) + st.cache.purge_tags(scope, &b.tags)
     };
     ok(json!({ "id": scope, "purged": purged }))
 }

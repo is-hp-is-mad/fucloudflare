@@ -89,6 +89,15 @@ pub fn stale_while_revalidate(headers: &HeaderMap) -> Duration {
     Duration::from_secs(secs.unwrap_or(0).min(86400))
 }
 
+fn split_tags<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values.flat_map(|v| v.split(',')).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+}
+
+/// The tags the origin put on an answer (`Cache-Tag: a, b`): what is kept can be purged by them.
+pub fn tags_of(headers: &HeaderMap) -> Vec<String> {
+    split_tags(headers.get_all("cache-tag").iter().filter_map(|v| v.to_str().ok()))
+}
+
 /// May this request be answered from / stored into the cache?
 pub fn request_cacheable(method: &Method, headers: &HeaderMap) -> bool {
     (method == Method::GET || method == Method::HEAD)
@@ -346,7 +355,25 @@ impl Cache {
         let mut gone = before - inner.map.len();
         drop(inner);
         if let Some(disk) = &self.disk {
-            gone = gone.max(disk.remove_where(&pred));
+            gone = gone.max(disk.remove_where(&|m| pred(&m.zone_id, &m.url)));
+        }
+        gone
+    }
+
+    /// Purge what the origin tagged (its `Cache-Tag` header) with one of `tags`.
+    pub fn purge_tags(&self, zone_id: &str, tags: &[String]) -> usize {
+        if tags.is_empty() {
+            return 0;
+        }
+        let hit = |have: &[String]| have.iter().any(|t| tags.contains(t));
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.map.len();
+        inner.map.retain(|_, (e, _)| !(e.zone_id == zone_id && hit(&tags_of(&e.headers))));
+        inner.bytes = inner.map.values().map(|(e, _)| e.size()).sum();
+        let mut gone = before - inner.map.len();
+        drop(inner);
+        if let Some(disk) = &self.disk {
+            gone = gone.max(disk.remove_where(&|m| m.zone_id == zone_id && hit(&m.tags)));
         }
         gone
     }
@@ -395,6 +422,8 @@ struct Meta {
     size: usize,
     zone_id: String,
     url: String,
+    /// The origin's `Cache-Tag`s.
+    tags: Vec<String>,
     used: u64,
 }
 
@@ -441,7 +470,7 @@ impl Disk {
             }
             match Disk::head(&path) {
                 Some((head, size)) if keep_until(head.stored_ms, head.ttl_ms) > now => {
-                    found.push((head.stored_ms, head.key, Meta { file: path, size, zone_id: head.zone_id, url: head.url, used: 0 }));
+                    found.push((head.stored_ms, head.key, Meta { file: path, size, tags: split_tags(head.headers.iter().filter(|(n, _)| n == "cache-tag").map(|(_, v)| v.as_str())), zone_id: head.zone_id, url: head.url, used: 0 }));
                 }
                 _ => {
                     let _ = std::fs::remove_file(&path);
@@ -536,9 +565,9 @@ impl Disk {
         let _ = self.jobs.lock().unwrap().send(Job::Write(key, entry));
     }
 
-    fn remove_where(&self, pred: &dyn Fn(&str, &str) -> bool) -> usize {
+    fn remove_where(&self, pred: &dyn Fn(&Meta) -> bool) -> usize {
         let mut index = self.index.lock().unwrap();
-        let doomed: Vec<String> = index.map.iter().filter(|(_, m)| pred(&m.zone_id, &m.url)).map(|(k, _)| k.clone()).collect();
+        let doomed: Vec<String> = index.map.iter().filter(|(_, m)| pred(m)).map(|(k, _)| k.clone()).collect();
         let mut files = Vec::new();
         for k in &doomed {
             if let Some(m) = index.map.remove(k) {
@@ -554,7 +583,7 @@ impl Disk {
     }
 
     fn clear(&self) {
-        self.remove_where(&|_, _| true);
+        self.remove_where(&|_| true);
     }
 
     /// Drop the least recently used until the tier fits again (10% to spare).
@@ -630,7 +659,7 @@ impl Disk {
                         let mut index = index.lock().unwrap();
                         index.clock += 1;
                         let used = index.clock;
-                        let meta = Meta { file: path, size, zone_id: entry.zone_id.clone(), url: entry.url.clone(), used };
+                        let meta = Meta { file: path, size, zone_id: entry.zone_id.clone(), url: entry.url.clone(), tags: tags_of(&entry.headers), used };
                         if let Some(old) = index.map.insert(key, meta) {
                             index.bytes -= old.size;
                         }
@@ -708,6 +737,25 @@ mod tests {
         assert_eq!(date("Thu, 01 Jan 1970 00:01:00 GMT"), Some(60));
         assert!(date("Wed, 21 Oct 2015 07:28:00 GMT") < date("Wed, 21 Oct 2015 07:28:01 GMT"));
         assert_eq!(date("yesterday"), None);
+    }
+
+    #[test]
+    fn what_the_origin_tagged_is_purged_by_tag() {
+        let cache = Cache::new(1 << 20);
+        let entry = |zone: &str, tags: &str| {
+            let mut headers = HeaderMap::new();
+            if !tags.is_empty() {
+                headers.insert("cache-tag", tags.parse().unwrap());
+            }
+            Entry { status: StatusCode::OK, headers, body: Bytes::from_static(b"x"), stored: Instant::now(), ttl: Duration::from_secs(60), zone_id: zone.into(), url: "u".into() }
+        };
+        cache.put("a".into(), entry("z", "product-1, listing"));
+        cache.put("b".into(), entry("z", "listing"));
+        cache.put("c".into(), entry("z", ""));
+        cache.put("d".into(), entry("other", "listing"));
+        assert_eq!(cache.purge_tags("z", &["product-1".into()]), 1);
+        assert_eq!(cache.purge_tags("z", &["listing".into(), "nothing".into()]), 1);
+        assert!(cache.get("c").is_some() && cache.get("d").is_some() && cache.get("a").is_none() && cache.get("b").is_none());
     }
 
     #[test]

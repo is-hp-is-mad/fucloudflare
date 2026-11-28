@@ -1273,12 +1273,12 @@ impl Store {
     #[allow(dead_code)]
     pub fn add_purge(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>) -> Result<String, StoreError> {
         let z = zone_id.to_string();
-        self.mutate(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes))
+        self.mutate(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes, Vec::new()))
     }
 
-    pub async fn add_purge_async(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>) -> Result<String, StoreError> {
+    pub async fn add_purge_async(&self, zone_id: &str, everything: bool, files: Vec<String>, prefixes: Vec<String>, tags: Vec<String>) -> Result<String, StoreError> {
         let z = zone_id.to_string();
-        self.mutate_async(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes))
+        self.mutate_async(move |d, clock, sync_node| apply_add_purge(d, clock, sync_node, &z, everything, files, prefixes, tags))
             .await
     }
 
@@ -1767,9 +1767,10 @@ fn apply_add_purge(
     everything: bool,
     files: Vec<String>,
     prefixes: Vec<String>,
+    tags: Vec<String>,
 ) -> Result<String, StoreError> {
     let sync = stamp_next(d, clock, sync_node, false);
-    let op = PurgeOp { id: new_id(), zone_id: zone_id.to_string(), everything, files, prefixes, sync };
+    let op = PurgeOp { id: new_id(), zone_id: zone_id.to_string(), everything, files, prefixes, tags, sync };
     d.purges.push(op.clone());
     let excess = d.purges.len().saturating_sub(50);
     d.purges.drain(..excess);

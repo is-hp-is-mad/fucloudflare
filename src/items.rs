@@ -1256,6 +1256,9 @@ pub struct PurgeOp {
     pub files: Vec<String>,
     #[serde(default)]
     pub prefixes: Vec<String>,
+    /// What the origin tagged with one of these (`Cache-Tag`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "SyncMeta::is_unset")]
     pub sync: SyncMeta,
 }

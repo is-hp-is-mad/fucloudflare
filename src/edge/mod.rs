@@ -2562,6 +2562,8 @@ pub async fn respond(edge: Arc<Edge>, peer: SocketAddr, ssl: bool, req: Request<
     resp.headers_mut().insert(header::SERVER, HeaderValue::from_static("fucf"));
     mark_cache(&mut resp, &edge.here().colo);
     if let Ok(v) = HeaderValue::from_str(&ray) {
+        // the origin's tags are for purging here, not for visitors
+        resp.headers_mut().remove("cache-tag");
         resp.headers_mut().insert("fucf-ray", v);
     }
     // An origin's Alt-Svc is about the origin's own endpoints (it may sit

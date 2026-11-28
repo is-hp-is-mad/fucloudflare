@@ -1176,6 +1176,7 @@ async fn apply_purges(store: Arc<store::Store>, cache: Arc<edge::cache::Cache>) 
             } else {
                 cache.purge_urls(&op.zone_id, &op.files, false);
                 cache.purge_urls(&op.zone_id, &op.prefixes, true);
+                cache.purge_tags(&op.zone_id, &op.tags);
             }
         }
     }
