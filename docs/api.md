@@ -164,7 +164,8 @@ Firewall actions: `block`, `js_challenge` (the human check; a click only when th
 doubtful), `managed_challenge` (always one click), `log`, `skip`. Expressions use Cloudflare's rules
 language: `http.host`, `http.request.uri.path`, `http.request.method`, `http.user_agent`,
 `http.request.headers["x"]`, `ip.src`, `ip.geoip.country`, `ip.geoip.continent`, `ip.geoip.asnum`,
-`ip.geoip.as_org`, `cf.threat_score` (also `fcf.threat_score`), with `eq ne lt le gt ge contains
+`ip.geoip.as_org`, `cf.threat_score` (also `fcf.threat_score`), `cf.bot_management.score` (also
+`fcf.bot_score`), `cf.bot_management.ja4` (also `fcf.ja4`), with `eq ne lt le gt ge contains
 matches in {…} and or not`. `ip.src in $name` asks an IP list (see [IP lists](#ip-lists)).
 
 Settings that belong here:
@@ -181,6 +182,19 @@ The threat score (0 to 100) comes from public lists every node fetches twice a d
 and 2, Tor exit nodes, VPN and data centre ranges), hosting networks by name, and what the fleet itself
 banned lately. Private addresses, the fleet's own and search engine crawlers coming from their own
 networks score 0.
+
+The bot score (1 to 99, Cloudflare's direction: 1 is almost certainly automated, 99 almost certainly
+a human) adds up a few signals of each request: a TLS connection whose ClientHello gave no JA4
+fingerprint, the shape of the fingerprint (TLS 1.3 with a server name and ALPN, or older), the
+threat score, the HTTP version, whether `User-Agent`, `Accept`, `Accept-Language`,
+`Accept-Encoding` and `Sec-Fetch-Mode` are there and whether the User-Agent names a tool or
+crawler. It involves no randomness: a request gets the same score on every node that gives its
+address the same threat score.
+Search engine crawlers coming from their own networks always score 50, so that a rule like
+`fcf.bot_score lt 30` (block or challenge likely bots) leaves them alone; one that only claims to be
+a crawler scores like any script. `/cdn-cgi/fucf-trace` shows the score of the request as `bot=`.
+Unlike Cloudflare there is no `cf.bot_management.verified_bot` field and no machine learning:
+treat the score as a heuristic and prefer challenging to blocking.
 
 A challenged request that is not a page load (`Sec-Fetch-Mode` other than `navigate`, or an `Accept`
 without `text/html`) gets JSON rather than a page:

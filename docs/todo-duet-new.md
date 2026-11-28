@@ -28,7 +28,7 @@
 
 ## 1. 追加任务（第一批，风险低）
 
-### [ ] N1 Bot 综合评分（`fcf.bot_score`）
+### [x] N1 Bot 综合评分（`fcf.bot_score`）
 
 - 新文件 `src/edge/botscore.rs`：一个纯函数，把请求特征合成 1–99 的分数（1 = 几乎确定是机器人，99 = 几乎确定是人；和 Cloudflare 方向一致），附评分因素表（代码注释）。输入至少考虑：走了 TLS 却拿不出 JA4（指纹缺失可疑）、`info.threat` 纯净度分、HTTP 版本、常见浏览器头是否存在（`User-Agent`/`Accept`/`Accept-Language`）、是否已知爬虫（`reputation` 的爬虫判定；已知爬虫得稳定的中等分而非随机低分）。每个因素一个小函数，便于以后加 JA3、HTTP/2 指纹。
 - 接线：`src/edge/mod.rs` 搜 `info.threat = rep.assess`，同处算出 bot 分存进 `ReqInfo` 新字段 `bot_score`；`src/edge/cgi.rs` 的 trace 加 `bot=`；`src/expr.rs` 加 `Val::BotScore`（照抄 `Val::Threat` 的全部出现处：枚举、`parse`、`eval`、`ty()`），`fcf.bot_score` 和 `cf.bot_management.score` 都识别。
@@ -127,3 +127,9 @@
 - 全部任务完成后：通读 `docs/todo-duet.md` 与本文档，逐项核对交接记录；把 `docs/api.md`、README 与代码最终对齐一遍；交接里列出"集成阶段最可能编译失败的 5 个地方"供另一方优先修。
 
 ## 3. 交接记录（每个任务做完在此追加一段，格式同原任务单第 3 节）
+
+### N1
+- 新文件 `src/edge/botscore.rs`：纯函数 `score(&Signals)` 把请求特征合成 1–99 的 Bot 分（1=机器人，99=真人，同 Cloudflare 方向），每个因素一个小函数，评分表写在模块注释里；从 50 起加减：TCP 上的 TLS 却无 JA4 -25、JA4 头形状（t13d+ALPN +10，其余 -10）、威胁分、HTTP 版本、UA 是否工具/爬虫、Accept/Accept-Language/Accept-Encoding 缺失、Sec-Fetch-Mode 存在 +10。
+- 接线：`src/edge/mod.rs` 在 `rep.assess` 处一次取得威胁分和"已验证爬虫"（`reputation.rs` 新增 `Assessment::verified_crawler()`），算出 `ReqInfo.bot_score`；trace 加 `bot=`；`src/expr.rs` 的 `Val::BotScore` 识别 `fcf.bot_score` / `cf.bot_management.score`。已验证爬虫固定 50 分，自称爬虫但不在自家网络的按脚本算；边缘自己发的请求（Worker 子请求、健康检查）为 0。
+- JA3 没做：要手写 MD5 和第二套 ClientHello 解析，而且 Chrome 打乱扩展顺序后 JA3 不稳定，JA4 已经够用。面板只在防火墙页的示例说明里加了一行（面板没有字段列表）。
+- 留待能跑真实流量的人核对：权重是经验值；`ja4::peek` 对分片到达的大 ClientHello 只等约 30 ms，慢链路上的真浏览器可能拿不到指纹、被扣 25 分（仍在 50 以上）。

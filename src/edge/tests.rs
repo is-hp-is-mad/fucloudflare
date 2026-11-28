@@ -335,6 +335,27 @@ async fn caches_static_content() {
 }
 
 #[tokio::test]
+async fn a_rule_on_the_bot_score_stops_scripts_and_lets_browsers_through() {
+    let env = setup().await;
+    let rule = env
+        .store
+        .save_item::<FirewallRule>(&env.zone, None, json!({ "expression": "fcf.bot_score lt 30", "action": "block" }), true)
+        .unwrap();
+    let browser = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0\r\nAccept: text/html\r\nAccept-Language: en\r\nAccept-Encoding: gzip\r\n";
+    assert_eq!(send(&env, "GET", "example.com", "/", browser, "").await.status, 200);
+    assert_eq!(send(&env, "GET", "example.com", "/", "User-Agent: curl/8.5.0\r\nAccept: */*\r\n", "").await.status, 403);
+    assert_eq!(get(&env, "example.com", "/").await.status, 403, "no headers at all");
+    assert_eq!(env.hits.load(Ordering::SeqCst), 1, "only the browser reached the origin");
+
+    // the Cloudflare name works the same, here the other way round
+    env.store
+        .save_item::<FirewallRule>(&env.zone, Some(&rule.meta.id), json!({ "expression": "cf.bot_management.score gt 50" }), false)
+        .unwrap();
+    assert_eq!(send(&env, "GET", "example.com", "/", browser, "").await.status, 403);
+    assert_eq!(get(&env, "example.com", "/").await.status, 200);
+}
+
+#[tokio::test]
 async fn waf_blocks_and_logs() {
     let env = setup().await;
     let fw = |v| env.store.save_item::<FirewallRule>(&env.zone, None, v, true).unwrap();
@@ -1271,6 +1292,8 @@ async fn cdn_cgi_is_the_edge_itself() {
         assert_eq!(t.get(key).map(String::as_str), Some(value), "{key} in {}", r.body);
     }
     assert_eq!(t["ray"], r.header("fucf-ray").unwrap());
+    // a tool's User-Agent and no browser headers: the bot side of the score
+    assert!(t["bot"].parse::<i64>().is_ok_and(|bot| (1..30).contains(&bot)), "{}", r.body);
     assert!(t["ts"].split_once('.').is_some_and(|(secs, millis)| secs.len() == 10 && millis.len() == 3), "{}", t["ts"]);
     assert!(t["fl"].split_once('f').is_some_and(|(a, b)| !a.is_empty() && !b.is_empty() && a.bytes().all(|c| c.is_ascii_digit()) && b.bytes().all(|c| c.is_ascii_digit())), "{}", t["fl"]);
     assert!(r.body.starts_with(&format!("fl={}\nh=example.com\nip=127.0.0.1\nts=", t["fl"])), "Cloudflare's keys come first, in its order: {}", r.body);
@@ -1295,6 +1318,8 @@ async fn cdn_cgi_is_the_edge_itself() {
         assert_eq!(t.get(key).map(String::as_str), Some(value), "{key} in {body}");
     }
     assert!(!t["kex"].is_empty(), "{body}");
+    let bot: i64 = t["bot"].parse().unwrap();
+    assert!((1..=99).contains(&bot), "{body}");
 
     // and over HTTP/3
     use bytes::Buf;

@@ -6,6 +6,7 @@ pub mod certdir;
 pub mod cgi;
 pub mod autofw;
 pub mod banset;
+pub mod botscore;
 pub mod challenge;
 pub mod errpages;
 pub mod origins;
@@ -2145,9 +2146,12 @@ impl Edge {
             info.asn = loc.asn.unwrap_or(0) as i64;
             info.as_org = loc.as_org.unwrap_or_default();
         }
+        let mut verified_crawler = false;
         if let Some(rep) = self.reputation.get() {
-            info.threat = rep.assess(ip, info.asn, &info.as_org, info.header("user-agent")).score as i64;
+            let assessment = rep.assess(ip, info.asn, &info.as_org, info.header("user-agent"));
+            (info.threat, verified_crawler) = (assessment.score as i64, assessment.verified_crawler());
         }
+        info.bot_score = botscore::score(&botscore::Signals::of(&req, &info, verified_crawler));
         *seen = Some(Seen {
             zone_id: zone.zone.id.clone(),
             http3: settings.http3,

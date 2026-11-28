@@ -38,6 +38,9 @@ pub struct ReqInfo {
     pub threat: i64,
     /// The JA4 fingerprint of the visitor's TLS ClientHello (see crate::edge::ja4); empty when not known.
     pub ja4: String,
+    /// How human the request looks, 1 (a bot) to 99 (a human); 0 where it
+    /// was not scored, on requests the edge makes itself (see crate::edge::botscore).
+    pub bot_score: i64,
 }
 
 impl ReqInfo {
@@ -74,6 +77,7 @@ enum Val {
     AsOrg,
     Ja4,
     Threat,
+    BotScore,
     Lower(Box<Val>),
     Upper(Box<Val>),
     UrlDecode(Box<Val>),
@@ -226,7 +230,7 @@ impl Val {
         match self {
             Val::IpSrc => Ty::Ip,
             Val::Ssl | Val::StartsWith(..) | Val::EndsWith(..) => Ty::Bool,
-            Val::Len(_) | Val::Asn | Val::Threat => Ty::Int,
+            Val::Len(_) | Val::Asn | Val::Threat | Val::BotScore => Ty::Int,
             _ => Ty::Str,
         }
     }
@@ -398,6 +402,7 @@ impl Parser<'_> {
             "ip.geoip.as_org" => Val::AsOrg,
             "fcf.ja4" | "cf.bot_management.ja4" => Val::Ja4,
             "fcf.threat_score" | "cf.threat_score" | "ip.threat_score" => Val::Threat,
+            "fcf.bot_score" | "cf.bot_management.score" => Val::BotScore,
             "ssl" => Val::Ssl,
             _ => return Err(format!("unknown field '{word}'")),
         })
@@ -476,6 +481,7 @@ impl Val {
             Val::Continent => V::S(Cow::Borrowed(&r.continent)),
             Val::Asn => V::I(r.asn),
             Val::Threat => V::I(r.threat),
+            Val::BotScore => V::I(r.bot_score),
             Val::AsOrg => V::S(Cow::Borrowed(&r.as_org)),
             Val::Ja4 => V::S(Cow::Borrowed(&r.ja4)),
             Val::Ssl => V::B(r.ssl),
@@ -637,6 +643,24 @@ mod tests {
             "http.host eq \"a\" garbage",
             "len(http.host) contains \"a\"",
         ] {
+            assert!(Expr::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn the_bot_score_is_a_number_under_either_name() {
+        let at = |src: &str, score: i64| {
+            let e = Expr::parse(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            e.matches(&ReqInfo { bot_score: score, ..req() })
+        };
+        assert!(at("fcf.bot_score lt 30", 12));
+        assert!(!at("fcf.bot_score lt 30", 30));
+        assert!(at("cf.bot_management.score lt 30", 1));
+        assert!(!at("cf.bot_management.score lt 30", 99));
+        assert!(at("fcf.bot_score ge 30 and fcf.bot_score le 70", 50));
+        assert!(at("cf.bot_management.score in {1 2 3}", 2));
+        assert!(at(r#"fcf.bot_score lt 30 and not http.request.uri.path contains "/robots.txt""#, 5));
+        for bad in ["fcf.bot_score eq \"1\"", "fcf.bot_score contains \"1\"", "fcf.bot_score", "cf.bot_management.scores lt 30", "fcf.bot_score lt"] {
             assert!(Expr::parse(bad).is_err(), "{bad} should fail");
         }
     }

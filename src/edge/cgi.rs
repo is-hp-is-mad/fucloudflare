@@ -107,6 +107,17 @@ impl Edge {
         let agent = req.headers().get(header::USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).unwrap_or_default();
         let warp = warp_status(ip, &snap.nodes, location.asn);
         let Here { colo, dc, fl } = self.here();
+        let user_agent = req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let assessment = self.reputation.get().map(|r| r.assess(ip, location.asn.unwrap_or(0) as i64, location.as_org.as_deref().unwrap_or(""), user_agent)).unwrap_or_default();
+        // scored as the rules would score it
+        let scored = crate::expr::ReqInfo {
+            ssl,
+            headers: super::header_pairs(req.headers()),
+            ja4: tls.map(|t| t.ja4.clone()).unwrap_or_default(),
+            threat: assessment.score as i64,
+            ..Default::default()
+        };
+        let bot = super::botscore::score(&super::botscore::Signals::of(req, &scored, assessment.verified_crawler()));
         // The first keys are Cloudflare's, with their meaning; ours follow.
         let lines = [
             ("fl", fl),
@@ -128,7 +139,8 @@ impl Edge {
             ("asn", location.asn.map(|n| n.to_string()).unwrap_or_default()),
             ("zone", zone.to_string()),
             ("limit", limit.as_str().to_string()),
-            ("threat", self.reputation.get().map(|r| r.assess(ip, location.asn.unwrap_or(0) as i64, location.as_org.as_deref().unwrap_or(""), req.headers().get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("")).score).unwrap_or(0).to_string()),
+            ("threat", assessment.score.to_string()),
+            ("bot", bot.to_string()),
             ("region", location.region.unwrap_or_default()),
         ];
         let body: String = lines.iter().map(|(key, value)| format!("{key}={value}\n")).collect();

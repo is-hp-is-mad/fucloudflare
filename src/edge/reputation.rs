@@ -128,6 +128,17 @@ pub struct Assessment {
     pub reasons: Vec<String>,
 }
 
+impl Assessment {
+    /// A search engine crawler coming from its own network (what the bot
+    /// score, crate::edge::botscore, treats as wanted automation).
+    pub fn verified_crawler(&self) -> bool {
+        self.reasons.iter().any(|r| r == VERIFIED_CRAWLER)
+    }
+}
+
+/// The reason given for a crawler that is who it says it is.
+const VERIFIED_CRAWLER: &str = "verified_crawler";
+
 #[derive(Default)]
 pub struct Reputation {
     lists: RwLock<HashMap<&'static str, Arc<List>>>,
@@ -202,7 +213,7 @@ impl Reputation {
         }
         let ua = user_agent.to_ascii_lowercase();
         if CRAWLERS.iter().any(|(word, asns)| ua.contains(word) && asns.contains(&asn)) {
-            out.reasons.push("verified_crawler".into());
+            out.reasons.push(VERIFIED_CRAWLER.into());
             return out;
         }
         fn hit(out: &mut Assessment, score: u8, why: &str) {
@@ -321,6 +332,9 @@ mod tests {
         assert_eq!(at("66.249.66.1", 15169, "Google LLC", "Mozilla/5.0 (compatible; Googlebot/2.1)").score, 0);
         assert_eq!(at("66.249.66.1", 15169, "Google LLC", "Mozilla/5.0").score, 30);
         assert_eq!(at("203.0.113.10", 4134, "", "Googlebot").score, 80, "a crawler only by its own network");
+        assert!(at("66.249.66.1", 15169, "Google LLC", "Mozilla/5.0 (compatible; Googlebot/2.1)").verified_crawler());
+        assert!(!at("203.0.113.10", 4134, "", "Googlebot").verified_crawler());
+        assert!(!at("66.249.66.1", 15169, "Google LLC", "Mozilla/5.0").verified_crawler());
         rep.set_fleet(["203.0.113.9".parse().unwrap()].into());
         assert_eq!(at("203.0.113.9", 0, "", "").score, 0);
         rep.set_banned([("9.9.9.9".to_string(), unix_now() + 60), ("2001:db8:1:2::/64".to_string(), unix_now() + 60)]);

@@ -213,6 +213,15 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 规则表达式里用 `fcf.ja4`（或 `cf.bot_management.ja4`）匹配，例如 `fcf.ja4 eq "t13d1516h2_8daaf6152771_02713d6af862"`；`/cdn-cgi/fucf-trace` 的 `ja4=` 显示当前连接的指纹。
 经 HTTP/3 或 HTTP/3 前置进来的连接没有指纹（为空）。
 
+### Bot 分
+
+每个请求都有一个 1–99 的 Bot 分，方向和 Cloudflare 一样：1 几乎肯定是程序，99 几乎肯定是真人。规则里写 `fcf.bot_score`（或 `cf.bot_management.score`），
+例如 `fcf.bot_score lt 30` 配人机验证或拦截；`/cdn-cgi/fucf-trace` 的 `bot=` 显示当前请求的分数。
+分数由几项特征加减而来（评分表在 `src/edge/botscore.rs` 开头）：走了 TCP 上的 TLS 却拿不到 JA4 指纹、指纹是不是 TLS 1.3 + SNI + ALPN 的现代客户端、
+威胁分、HTTP 版本、`User-Agent` / `Accept` / `Accept-Language` / `Accept-Encoding` / `Sec-Fetch-Mode` 在不在、UA 是不是 curl、python 之类的工具或爬虫。
+分数里没有随机成分：威胁分相同，同一个请求在哪个节点都得同一个分。来自自家网络的搜索引擎爬虫固定 50 分（是程序，但别把它挡在外面）；只在 UA 里自称爬虫的按普通脚本算。
+这只是经验规则，没有 Cloudflare 那样的机器学习，也没有 `verified_bot` 字段：拿不准时用人机验证，别直接拦截。
+
 ### DNS 响应限速与内核层封禁
 
 - `--dns-rrl`（`FUCF_DNS_RRL`，默认 100，0 为关闭）：UDP 上对同一网络（/24、/56）同一名字每秒最多应答这么多次；超出的部分一半以截断（TC）应答，
@@ -254,8 +263,8 @@ zones 与 dns_records 的路径和字段与 Cloudflare 兼容；其余资源是�
 
 `fucf-trace` 的字段：前面是 Cloudflare 的键，含义相同——`fl`（`fucf-<节点名>`）、`h`（主机名）、`ip`、`ts`、`visit_scheme`、`uag`、
 `colo`（节点名大写）、`http`（`http/1.1` / `http/2` / `http/3`）、`loc`（国家，未知为 `XX`）、`tls`（`TLSv1.3` / `TLSv1.2` / `off`）、
-`sni`（`plaintext` / `off`）、`warp`（恒为 `off`）、`kex`；后面是自有的——`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
-`limit`（本节点的限流状态）。
+`sni`（`plaintext` / `off`）、`warp`（恒为 `off`）、`kex`；后面是自有的——`ja4`（TLS 指纹）、`ray`、`asn`、`zone`（该主机名所属且已代理的区域，否则 `-`）、
+`limit`（本节点的限流状态）、`threat`（威胁分）、`bot`（Bot 分）、`region`（省 / 州，未知为空）。
 
 ```bash
 curl https://<任意接入的主机名>/cdn-cgi/fucf-trace      # 看请求落在哪个节点、节点看到的 IP / 协议 / 地区
