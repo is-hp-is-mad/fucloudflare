@@ -830,6 +830,7 @@ async fn main() -> anyhow::Result<()> {
         mail,
         role,
         sync,
+        providers: vec![kv_store.clone(), d1_store.clone()],
         edge,
     }));
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;

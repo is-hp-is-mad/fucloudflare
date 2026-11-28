@@ -54,6 +54,9 @@ pub struct ApiState {
     pub role: crate::sync::NodeRole,
     /// Optional peer-to-peer sync coordinator.
     pub sync: Option<Arc<crate::sync::PeerSync>>,
+    /// Replicated storage besides the configuration (Workers KV, D1): served
+    /// to and merged from peers whether or not this node pulls from any itself.
+    pub providers: Vec<Arc<dyn crate::sync::SyncProvider>>,
     /// Edge runtime (for Workers KV / D1 / scheduled execution).
     pub edge: Arc<crate::edge::Edge>,
 }
@@ -1963,10 +1966,9 @@ async fn replication_sync(State(st): St, headers: axum::http::HeaderMap, Query(q
     };
 
     let mut domains_out: Vec<crate::sync::DomainDelta> = Vec::new();
-    if let (Some(sync), Some(dom_json)) = (&st.sync, q.get("domains")) {
+    if let Some(dom_json) = q.get("domains") {
         if let Ok(cursors) = serde_json::from_str::<HashMap<String, (String, u64)>>(dom_json) {
-            let providers = sync.providers.read().unwrap().clone();
-            for p in providers {
+            for p in st.providers.iter().cloned() {
                 let (ep, since) = cursors.get(p.domain()).map(|(e, r)| (Some(e.clone()), *r)).unwrap_or((None, 0));
                 if p.current_rev() > since || ep.as_deref() != Some(p.epoch().as_str()) {
                     let delta = tokio::task::spawn_blocking(move || p.export_since(since, ep.as_deref()))
@@ -1979,11 +1981,7 @@ async fn replication_sync(State(st): St, headers: axum::http::HeaderMap, Query(q
         }
     }
 
-    let (hlc_ms, hlc_seq) = st
-        .sync
-        .as_ref()
-        .map(|s| s.clock.current())
-        .unwrap_or_else(|| (crate::sync::clock::unix_ms(), 0));
+    let (hlc_ms, hlc_seq) = st.sync.as_ref().map(|s| s.clock.current()).unwrap_or_else(|| st.store.clock().current());
     ok(json!({
         "node": st.node(),
         "role": st.role.as_str(),
@@ -2057,11 +2055,7 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
             "accelerate nodes cannot push config, accounts, or domain state".into(),
         ));
     }
-    let clock = st
-        .sync
-        .as_ref()
-        .map(|s| s.clock.clone())
-        .unwrap_or_else(|| Arc::new(crate::sync::HlcClock::default()));
+    let clock = st.sync.as_ref().map(|s| s.clock.clone()).unwrap_or_else(|| st.store.clock());
     if let Some(h) = &req.hlc {
         clock.observe(h.ms, h.seq);
     }
@@ -2093,18 +2087,13 @@ async fn replication_sync_push(State(st): St, headers: axum::http::HeaderMap, by
         let clk = clock.clone();
         adopted |= accounts_blocking(&st, move |accounts| accounts.merge_delta(&acc, &clk).map_err(bad)).await?;
     }
-    if !req.domains.is_empty() {
-        if let Some(sync) = &st.sync {
-            let providers = sync.providers.read().unwrap().clone();
-            for d in req.domains {
-                if let Some(p) = providers.iter().find(|p| p.domain() == d.domain).cloned() {
-                    let clk = clock.clone();
-                    adopted |= tokio::task::spawn_blocking(move || p.merge_delta(&d, &clk))
-                        .await
-                        .map_err(|e| bad(e.to_string()))?
-                        .map_err(bad)?;
-                }
-            }
+    for d in req.domains {
+        if let Some(p) = st.providers.iter().find(|p| p.domain() == d.domain).cloned() {
+            let clk = clock.clone();
+            adopted |= tokio::task::spawn_blocking(move || p.merge_delta(&d, &clk))
+                .await
+                .map_err(|e| bad(e.to_string()))?
+                .map_err(bad)?;
         }
     }
 
@@ -2369,6 +2358,7 @@ mod tests {
             mail: None,
             role,
             sync: None,
+            providers: vec![edge.kv.get().unwrap().clone(), edge.d1.get().unwrap().clone()],
             edge,
         })
     }
@@ -2595,6 +2585,58 @@ mod tests {
         assert_eq!(me["result"]["email"], "sso@example.com");
         assert_eq!(me["result"]["role"], "editor");
 
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// A node without peers of its own (the hub the others pull from) still
+    /// serves and accepts Workers KV and D1.
+    #[tokio::test]
+    async fn kv_and_d1_replicate_through_a_hub_without_peers() {
+        let (dir_a, dir_b) = (
+            std::env::temp_dir().join(format!("fucf-api-hub-a-{}", uuid::Uuid::new_v4().simple())),
+            std::env::temp_dir().join(format!("fucf-api-hub-b-{}", uuid::Uuid::new_v4().simple())),
+        );
+        let (a, b) = (make_test_state(&dir_a, crate::sync::NodeRole::Peer), make_test_state(&dir_b, crate::sync::NodeRole::Peer));
+        assert!(a.sync.is_none() && b.sync.is_none());
+        let (mut app_a, mut app_b) = (router(a.clone()), router(b.clone()));
+        let (sc, body) = call(&mut app_a, "POST", "/client/v4/kv/namespaces", br#"{"title":"AUTH_KV"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let ns = serde_json::from_slice::<Value>(&body).unwrap()["result"]["id"].as_str().unwrap().to_string();
+        let (sc, _) = call(&mut app_a, "PUT", &format!("/client/v4/kv/namespaces/{ns}/values/k"), b"v".to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+        let (sc, _) = call(&mut app_a, "POST", "/client/v4/d1/database", br#"{"name":"auth"}"#.to_vec()).await;
+        assert_eq!(sc, StatusCode::OK);
+
+        let (sc, _, body) = call_raw(
+            &mut app_a,
+            "GET",
+            "/client/v4/replication/sync?since=0&since_accounts=0&domains=%7B%7D",
+            vec![("authorization", "Bearer test-token")],
+            vec![],
+        )
+        .await;
+        assert_eq!(sc, StatusCode::OK);
+        let pulled: Value = serde_json::from_slice(&body).unwrap();
+        let domains = pulled["result"]["domains"].as_array().cloned().unwrap_or_default();
+        assert_eq!(domains.len(), 2, "both KV and D1 are served: {pulled}");
+
+        let push = serde_json::to_vec(&json!({ "node": "a", "role": "peer", "domains": domains })).unwrap();
+        let (sc, _, body) = call_raw(
+            &mut app_b,
+            "POST",
+            "/client/v4/replication/sync",
+            vec![("authorization", "Bearer test-token"), ("content-type", "application/json")],
+            push,
+        )
+        .await;
+        assert_eq!(sc, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let (_, body) = call(&mut app_b, "GET", "/client/v4/kv/namespaces", vec![]).await;
+        assert!(String::from_utf8_lossy(&body).contains("AUTH_KV"), "{}", String::from_utf8_lossy(&body));
+        let (_, body) = call(&mut app_b, "GET", &format!("/client/v4/kv/namespaces/{ns}/values/k"), vec![]).await;
+        assert_eq!(body, b"v");
+        let (_, body) = call(&mut app_b, "GET", "/client/v4/d1/database", vec![]).await;
+        assert!(String::from_utf8_lossy(&body).contains("\"auth\""), "{}", String::from_utf8_lossy(&body));
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
     }
