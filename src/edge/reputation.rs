@@ -205,21 +205,21 @@ impl Reputation {
             out.reasons.push("verified_crawler".into());
             return out;
         }
-        let mut hit = |score: u8, why: &str| {
+        fn hit(out: &mut Assessment, score: u8, why: &str) {
             out.score = out.score.max(score);
             out.reasons.push(why.to_string());
-        };
+        }
         {
             let lists = self.lists.read().unwrap();
             for s in SOURCES {
                 if lists.get(s.name).is_some_and(|l| l.contains(ip)) {
-                    hit(s.score, s.label);
+                    hit(&mut out, s.score, s.label);
                 }
             }
         }
         let org = as_org.to_ascii_lowercase();
         if !org.is_empty() && HOSTING.iter().any(|h| org.contains(h)) && !out.reasons.iter().any(|r| r == "datacenter") {
-            hit(30, "datacenter");
+            hit(&mut out, 30, "datacenter");
         }
         let key = match ip {
             IpAddr::V4(a) => a.to_string(),
@@ -229,7 +229,7 @@ impl Reputation {
             }
         };
         if self.banned.read().unwrap().get(&key).is_some_and(|until| *until > unix_now()) {
-            hit(70, "banned_here");
+            hit(&mut out, 70, "banned_here");
         }
         out
     }
